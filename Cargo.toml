@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/office-core",
+    "crates/office-calc",
+    "crates/office-impress",
+    "crates/office-format",
+    "crates/office-render",
+    "crates/office-ui",
+]
+default-members = ["crates/office-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/rust-office"
+authors = ["rust-office contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+office-core = { path = "crates/office-core" }
+office-calc = { path = "crates/office-calc" }
+office-impress = { path = "crates/office-impress" }
+office-format = { path = "crates/office-format" }
+office-render = { path = "crates/office-render" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+eframe = { version = "0.36", default-features = true, features = ["default_fonts", "glow"] }
+egui = "0.36"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+rfd = "0.17"
+arboard = "3"
+open = "5"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+printpdf = { version = "0.7", default-features = true, features = ["embedded_images"] }
+quick-xml = "0.37"
+calamine = "0.26"
+rust_xlsxwriter = "0.79"

@@ -1,0 +1,14 @@
+[package]
+name = "office-impress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Presentation model, themes, and PPTX read/write for rust-office Impress"
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }

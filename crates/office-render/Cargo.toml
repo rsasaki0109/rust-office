@@ -1,0 +1,13 @@
+[package]
+name = "office-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Page layout and text measurement helpers for rust-office"
+rust-version.workspace = true
+
+[dependencies]
+office-core = { workspace = true }
+egui = { workspace = true }
+image = { workspace = true }
+printpdf = { workspace = true }

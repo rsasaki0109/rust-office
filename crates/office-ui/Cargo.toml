@@ -1,0 +1,23 @@
+[package]
+name = "office-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "egui front-end for rust-office (Writer + Calc + Impress)"
+rust-version.workspace = true
+
+[[bin]]
+name = "rust-office"
+path = "src/main.rs"
+
+[dependencies]
+office-core = { workspace = true }
+office-calc = { workspace = true }
+office-impress = { workspace = true }
+office-format = { workspace = true }
+office-render = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rfd = { workspace = true }
+arboard = { workspace = true }
+open = { workspace = true }
