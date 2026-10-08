@@ -22,6 +22,12 @@ Run these checks before submitting changes:
 * Calc saves include text still being edited in the formula bar. Imported XLS, XLSM,
   and ODS files require Save As to an explicit XLSX/CSV destination.
   Multi-sheet workbooks must use XLSX so CSV cannot silently discard other sheets.
+* Calc imports fail if any sheet's values or formulas cannot be read. The error
+  identifies the sheet and read stage; the existing workbook remains open.
+  A formula read failure never silently substitutes its cached result.
+* XLSX round-trip tests require exact formula text, including absolute/mixed/range
+  references and `#REF!`. Imported numbers retain the available `f64` precision
+  rather than being rounded for display before storage.
 * After importing a PPTX, Impress Save opens Save As for a native JSON file, preserving
   the source PPTX. Export PPTX remains a separate operation with MVP format coverage.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
@@ -88,6 +94,8 @@ Not yet:
 * Named styles beyond Normal/Heading 1–3; custom user style registry
 * Layout PDF glyph metrics still approximate (egui ≠ embedded PDF fonts)
 * Calc: charting / pivot not started; formula set still limited vs Excel
+* Calc stores numbers as `f64`; XLSX number formatting and cell styling are not
+  preserved. Numeric text may be normalized on import, and display uses rounded values.
 * Calc copies raw values/formulas as tab-separated text. Formatting is not
   exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.

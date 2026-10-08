@@ -21,6 +21,7 @@ pub enum XlsxError {
 }
 
 /// Load a workbook from an `.xlsx` / `.xlsm` / `.xls` / `.ods` path.
+/// A values or formulas read error on any sheet rejects the entire import.
 pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
     let mut excel = open_workbook_auto(path).map_err(|e| XlsxError::Read(e.to_string()))?;
     let names = excel.sheet_names().to_vec();
@@ -31,27 +32,31 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
     let mut sheets = Vec::new();
     for name in names {
         let mut sheet = Sheet::new(name.clone());
-        if let Ok(range) = excel.worksheet_range(&name) {
-            let (sr, sc) = range.start().unwrap_or((0, 0));
-            for (r, c, value) in range.used_cells() {
-                let raw = data_to_raw(value);
-                if !raw.is_empty() {
-                    sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), raw);
-                }
+        let range = excel.worksheet_range(&name).map_err(|error| {
+            XlsxError::Read(format!("cannot read values of worksheet {name:?}: {error}"))
+        })?;
+        let (sr, sc) = range.start().unwrap_or((0, 0));
+        for (r, c, value) in range.used_cells() {
+            let raw = data_to_raw(value);
+            if !raw.is_empty() {
+                sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), raw);
             }
         }
-        if let Ok(formulas) = excel.worksheet_formula(&name) {
-            let (sr, sc) = formulas.start().unwrap_or((0, 0));
-            for (r, c, formula) in formulas.used_cells() {
-                let f = formula.trim();
-                if !f.is_empty() {
-                    let text = if f.starts_with('=') {
-                        f.to_string()
-                    } else {
-                        format!("={f}")
-                    };
-                    sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), text);
-                }
+        let formulas = excel.worksheet_formula(&name).map_err(|error| {
+            XlsxError::Read(format!(
+                "cannot read formulas of worksheet {name:?}: {error}"
+            ))
+        })?;
+        let (sr, sc) = formulas.start().unwrap_or((0, 0));
+        for (r, c, formula) in formulas.used_cells() {
+            let f = formula.trim();
+            if !f.is_empty() {
+                let text = if f.starts_with('=') {
+                    f.to_string()
+                } else {
+                    format!("={f}")
+                };
+                sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), text);
             }
         }
         sheets.push(sheet);
@@ -68,7 +73,9 @@ fn data_to_raw(value: &Data) -> String {
     match value {
         Data::Empty => String::new(),
         Data::String(s) => s.clone(),
-        Data::Float(f) => format_number(*f),
+        // Use the shortest representation that parses back to the same f64.
+        // Display rounding must not change stored values or later calculations.
+        Data::Float(f) => f.to_string(),
         Data::Int(i) => i.to_string(),
         Data::Bool(b) => {
             if *b {
@@ -80,15 +87,6 @@ fn data_to_raw(value: &Data) -> String {
         Data::Error(e) => format!("{e:?}"),
         Data::DateTime(dt) => dt.to_string(),
         Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
-    }
-}
-
-fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{n:.0}")
-    } else {
-        let s = format!("{n:.10}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -150,7 +148,45 @@ pub fn write_xlsx_bytes(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addr::CellAddr;
+    use std::io::{Cursor, Read, Write};
+
+    fn reload(bytes: &[u8]) -> Result<Workbook, XlsxError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workbook.xlsx");
+        std::fs::write(&path, bytes).unwrap();
+        load_xlsx_path(&path)
+    }
+
+    fn replace_second_sheet(xml: Option<&str>) -> Vec<u8> {
+        let mut book = Workbook::new();
+        book.active_sheet_mut().name = "Good".into();
+        book.set_cell(CellAddr::new(0, 0), "keep me");
+        let mut broken = Sheet::new("壊れたシート");
+        broken.set_raw(CellAddr::new(0, 0), "=1+1");
+        book.sheets.push(broken);
+        let bytes = write_xlsx_bytes(&book).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..archive.len() {
+            let mut part = archive.by_index(index).unwrap();
+            if part.name() == "xl/worksheets/sheet2.xml" {
+                if let Some(xml) = xml {
+                    output
+                        .start_file(part.name(), zip::write::FileOptions::default())
+                        .unwrap();
+                    output.write_all(xml.as_bytes()).unwrap();
+                }
+            } else {
+                let mut contents = Vec::new();
+                part.read_to_end(&mut contents).unwrap();
+                output
+                    .start_file(part.name(), zip::write::FileOptions::default())
+                    .unwrap();
+                output.write_all(&contents).unwrap();
+            }
+        }
+        output.finish().unwrap().into_inner()
+    }
 
     #[test]
     fn xlsx_round_trip_values_and_formula() {
@@ -165,20 +201,154 @@ mod tests {
         let bytes = write_xlsx_bytes(&wb).unwrap();
         assert!(bytes.starts_with(b"PK"));
 
-        let tmp = std::env::temp_dir().join("rust-office-calc-roundtrip.xlsx");
-        std::fs::write(&tmp, &bytes).unwrap();
-        let restored = load_xlsx_path(&tmp).unwrap();
-        let _ = std::fs::remove_file(&tmp);
+        let restored = reload(&bytes).unwrap();
 
-        assert!(restored.sheets.len() >= 2);
+        assert_eq!(restored.sheets.len(), 2);
         assert_eq!(restored.sheets[0].name, "Data");
         assert_eq!(restored.sheets[0].raw(CellAddr::new(0, 0)), "10");
         assert_eq!(restored.sheets[0].raw(CellAddr::new(0, 1)), "20");
-        let f = restored.sheets[0].raw(CellAddr::new(0, 2));
-        assert!(
-            f.contains("SUM") || f == "30",
-            "expected formula or cached sum, got {f:?}"
-        );
+        assert_eq!(restored.sheets[0].raw(CellAddr::new(0, 2)), "=SUM(A1:A2)");
+        assert_eq!(restored.sheets[0].display(CellAddr::new(0, 2)), "30");
         assert_eq!(restored.sheets[1].raw(CellAddr::new(0, 0)), "hi");
+        assert!(!restored.is_dirty() && !restored.can_undo() && !restored.can_redo());
+    }
+
+    #[test]
+    fn formulas_preserve_absolute_mixed_range_and_error_references() {
+        let mut book = Workbook::new();
+        let formulas = [
+            "=A1+$A$1+$A1+A$1",
+            "=SUM($A$1:B2)+SUM(A$1:$B2)",
+            "=SUM(#REF!)+$A$1",
+            "=IF(1,\"日本語 A1 \"\"B2\"\"\",#REF!)",
+            "='売上 データ'!$A1+Sheet2!B$2",
+        ];
+        book.set_cell(CellAddr::new(0, 0), "3");
+        book.set_cell(CellAddr::new(0, 1), "4");
+        for (row, formula) in formulas.iter().enumerate() {
+            book.set_cell(CellAddr::new(2, row as u32), *formula);
+        }
+        let restored = reload(&write_xlsx_bytes(&book).unwrap()).unwrap();
+        for (row, formula) in formulas.iter().enumerate() {
+            assert_eq!(
+                restored.active_sheet().raw(CellAddr::new(2, row as u32)),
+                *formula
+            );
+        }
+        assert_eq!(restored.active_sheet().display(CellAddr::new(2, 0)), "12");
+        assert_eq!(restored.active_sheet().display(CellAddr::new(2, 1)), "14");
+        assert_eq!(
+            restored.active_sheet().display(CellAddr::new(2, 2)),
+            "#REF!"
+        );
+        assert_eq!(
+            restored.active_sheet().display(CellAddr::new(2, 3)),
+            "日本語 A1 \"B2\""
+        );
+    }
+
+    #[test]
+    fn numeric_values_keep_their_f64_precision_after_reload() {
+        let values: [f64; 10] = [
+            0.0,
+            1.0,
+            -123.0,
+            1.2345678901234567,
+            -9.876543210987654,
+            1e-12,
+            -1e-12,
+            1e100,
+            1e-100,
+            1234567890123456.0,
+        ];
+        let mut book = Workbook::new();
+        for (row, value) in values.iter().enumerate() {
+            book.set_cell(CellAddr::new(0, row as u32), value.to_string());
+        }
+        book.set_cell(CellAddr::new(1, 0), "=A6*1000000000000");
+        let restored = reload(&write_xlsx_bytes(&book).unwrap()).unwrap();
+        for (row, value) in values.iter().enumerate() {
+            let raw = restored.active_sheet().raw(CellAddr::new(0, row as u32));
+            assert_eq!(
+                raw.parse::<f64>().unwrap().to_bits(),
+                value.to_bits(),
+                "{value} reloaded as {raw}"
+            );
+        }
+        assert_eq!(restored.active_sheet().display(CellAddr::new(1, 0)), "1");
+    }
+
+    #[test]
+    fn empty_and_sparse_unicode_sheets_survive_reload() {
+        let mut book = Workbook::new();
+        book.active_sheet_mut().name = "空のシート".into();
+        let mut sparse = Sheet::new("売上 データ");
+        sparse.set_raw(CellAddr::new(702, 1000), "日本語\nsecond line");
+        sparse.set_raw(CellAddr::new(703, 1001), "=SUM(AAA1001:AAA1002)");
+        book.sheets.push(sparse);
+        let restored = reload(&write_xlsx_bytes(&book).unwrap()).unwrap();
+        assert_eq!(restored.sheets.len(), 2);
+        assert_eq!(restored.sheets[0].name, "空のシート");
+        assert_eq!(restored.sheets[0].occupied().count(), 0);
+        assert_eq!(restored.sheets[1].name, "売上 データ");
+        assert_eq!(restored.sheets[1].occupied().count(), 2);
+        assert_eq!(
+            restored.sheets[1].raw(CellAddr::new(702, 1000)),
+            "日本語\nsecond line"
+        );
+        assert_eq!(
+            restored.sheets[1].raw(CellAddr::new(703, 1001)),
+            "=SUM(AAA1001:AAA1002)"
+        );
+        assert!(!restored.is_dirty() && !restored.can_undo() && !restored.can_redo());
+    }
+
+    #[test]
+    fn invalid_sheet_values_fail_the_whole_workbook_load() {
+        let bytes = replace_second_sheet(Some(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1" t="n"><v>not-a-number</v></c></row></sheetData></worksheet>"#,
+        ));
+        let mut reader = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.clone())).unwrap();
+        assert!(reader.worksheet_range("壊れたシート").is_err());
+        let error = reload(&bytes).expect_err("a broken sheet must not become an empty sheet");
+        assert!(matches!(error, XlsxError::Read(_)));
+        assert!(error.to_string().contains("壊れたシート"));
+        assert!(error.to_string().contains("values"));
+    }
+
+    #[test]
+    fn invalid_sheet_formulas_fail_instead_of_importing_cached_values() {
+        let bytes = replace_second_sheet(Some(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1"><f t="shared">1+1</f><v>2</v></c></row></sheetData></worksheet>"#,
+        ));
+        let mut reader = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(
+            reader
+                .worksheet_range("壊れたシート")
+                .unwrap()
+                .get_value((0, 0)),
+            Some(&Data::Float(2.0))
+        );
+        assert!(reader.worksheet_formula("壊れたシート").is_err());
+        let error = reload(&bytes).expect_err("cached values must not hide a formula read error");
+        assert!(matches!(error, XlsxError::Read(_)));
+        assert!(error.to_string().contains("壊れたシート"));
+        assert!(error.to_string().contains("formulas"));
+    }
+
+    #[test]
+    fn missing_sheet_xml_fails_instead_of_returning_a_partial_workbook() {
+        let bytes = replace_second_sheet(None);
+        let error = reload(&bytes).expect_err("missing sheets must not be silently skipped");
+        assert!(matches!(error, XlsxError::Read(_)));
+        assert!(error.to_string().contains("壊れたシート"));
+    }
+
+    #[test]
+    fn invalid_workbook_reports_a_read_error() {
+        assert!(matches!(
+            reload(b"not an XLSX file"),
+            Err(XlsxError::Read(_))
+        ));
     }
 }
