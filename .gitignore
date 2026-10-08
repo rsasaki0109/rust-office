@@ -4,4 +4,5 @@
 .vscode/
 *.swp
 *.roffice.json
+!crates/office-format/tests/fixtures/json/*.roffice.json
 .cursor/

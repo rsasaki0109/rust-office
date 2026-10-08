@@ -21,3 +21,6 @@ egui = { workspace = true }
 rfd = { workspace = true }
 arboard = { workspace = true }
 open = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

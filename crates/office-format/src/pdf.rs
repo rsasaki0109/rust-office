@@ -5,7 +5,9 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use office_core::{Alignment, Block, Document, ListKind};
-use printpdf::{BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference, PdfPageIndex};
+use printpdf::{
+    BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference, PdfPageIndex,
+};
 use thiserror::Error;
 
 /// PDF export failures.
@@ -32,18 +34,15 @@ pub fn document_to_pdf_bytes(document: &Document) -> Result<Vec<u8>, PdfError> {
 
 /// Write `document` to a `.pdf` path.
 pub fn write_document_pdf_path(document: &Document, path: &Path) -> Result<(), PdfError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    write_document_pdf(document, &mut writer)?;
+    let bytes = document_to_pdf_bytes(document)?;
+    office_core::storage::atomic_write(path, &bytes)?;
     Ok(())
 }
 
-fn write_document_pdf<W: std::io::Write>(document: &Document, writer: &mut W) -> Result<(), PdfError> {
+fn write_document_pdf<W: std::io::Write>(
+    document: &Document,
+    writer: &mut W,
+) -> Result<(), PdfError> {
     let page_style = document.page_style();
     let page_w = Mm(pt_to_mm(page_style.width));
     let page_h = Mm(pt_to_mm(page_style.height));
@@ -190,7 +189,8 @@ fn write_document_pdf<W: std::io::Write>(document: &Document, writer: &mut W) ->
     }
 
     let mut buf = BufWriter::new(writer);
-    doc.save(&mut buf).map_err(|e| PdfError::Pdf(e.to_string()))?;
+    doc.save(&mut buf)
+        .map_err(|e| PdfError::Pdf(e.to_string()))?;
     Ok(())
 }
 
@@ -380,7 +380,8 @@ mod tests {
         assert!(bytes.starts_with(b"%PDF"));
         // printpdf may emit "/Type /Pages" and page objects without a literal "/Type /Page".
         let s = String::from_utf8_lossy(&bytes);
-        let has_count2 = s.contains("/Count 2") || s.contains("/Count 2\n") || s.contains("/Count 2 ");
+        let has_count2 =
+            s.contains("/Count 2") || s.contains("/Count 2\n") || s.contains("/Count 2 ");
         let page_objs = s.matches("/Type /Page").count() + s.matches("/Type/Page").count();
         let page2_layer = s.contains("Page 2");
         assert!(

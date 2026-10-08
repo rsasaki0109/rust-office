@@ -10,11 +10,13 @@ use office_impress::{
 };
 
 use crate::theme::{CANVAS_BG, STATUS_BG, TOOLBAR_BG};
+use crate::unsaved::{self, Choice, DocumentAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwitchTo {
     Writer,
     Calc,
+    Quit,
 }
 
 pub struct ImpressApp {
@@ -22,6 +24,7 @@ pub struct ImpressApp {
     file_path: Option<PathBuf>,
     status_message: String,
     last_error: Option<String>,
+    pending_action: Option<DocumentAction>,
     pub pending_switch: Option<SwitchTo>,
 }
 
@@ -32,6 +35,7 @@ impl ImpressApp {
             file_path: None,
             status_message: "Ready — Impress MVP (themes, slides, JSON, PPTX open/export)".into(),
             last_error: None,
+            pending_action: None,
             pending_switch: None,
         }
     }
@@ -40,7 +44,7 @@ impl ImpressApp {
         self.pending_switch.take()
     }
 
-    fn title(&self) -> String {
+    pub(super) fn title(&self) -> String {
         let name = self
             .file_path
             .as_ref()
@@ -67,12 +71,20 @@ impl ImpressApp {
     }
 
     fn new_deck(&mut self) {
+        self.request_action(DocumentAction::New);
+    }
+
+    fn do_new_deck(&mut self) {
         self.presentation = Presentation::new();
         self.file_path = None;
         self.set_status("New presentation");
     }
 
     fn open_file(&mut self) {
+        self.request_action(DocumentAction::Open);
+    }
+
+    fn do_open_file(&mut self) {
         let path = rfd::FileDialog::new()
             .add_filter("PowerPoint", &["pptx"])
             .add_filter("rust-office Impress", &["rimpress.json", "json"])
@@ -100,33 +112,87 @@ impl ImpressApp {
         }
     }
 
-    fn save_json(&mut self) {
-        if let Some(path) = self.file_path.clone() {
-            self.save_json_to(&path);
+    pub(super) fn is_dirty(&self) -> bool {
+        self.presentation.is_dirty()
+    }
+
+    pub(super) fn cancel_pending_action(&mut self) {
+        self.pending_action = None;
+    }
+
+    fn request_action(&mut self, action: DocumentAction) {
+        if self.is_dirty() {
+            self.pending_action = Some(action);
         } else {
-            self.save_json_as();
+            self.run_action(action);
         }
     }
 
-    fn save_json_as(&mut self) {
+    fn run_action(&mut self, action: DocumentAction) {
+        match action {
+            DocumentAction::New => self.do_new_deck(),
+            DocumentAction::Open => self.do_open_file(),
+        }
+    }
+
+    fn resolve_pending_action(&mut self, choice: Choice) {
+        if choice == Choice::Save && !self.save_file() {
+            self.pending_action = None;
+            return;
+        }
+        if let Some(action) = self.pending_action.take() {
+            if choice != Choice::Cancel {
+                self.run_action(action);
+            }
+        }
+    }
+
+    fn show_unsaved_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_action.is_some() {
+            if let Some(choice) = unsaved::confirm(ctx, "impress_unsaved", &self.title()) {
+                self.resolve_pending_action(choice);
+            }
+        }
+    }
+
+    pub(super) fn save_file(&mut self) -> bool {
+        if let Some(path) = self.file_path.clone() {
+            if is_json_destination(&path) {
+                return self.save_json_to(&path);
+            }
+        }
+        // PPTX import only models a subset of the original file. Save to a new
+        // native file; PPTX export remains a separate, explicit operation.
+        self.save_json_as()
+    }
+
+    fn save_json_as(&mut self) -> bool {
         let path = rfd::FileDialog::new()
             .add_filter("rust-office Impress", &["rimpress.json", "json"])
             .set_file_name("deck.rimpress.json")
             .save_file();
         let Some(path) = path else {
-            return;
+            return false;
         };
-        self.save_json_to(&path);
-        self.file_path = Some(path);
+        self.save_json_to(&path)
     }
 
-    fn save_json_to(&mut self, path: &std::path::Path) {
+    fn save_json_to(&mut self, path: &std::path::Path) -> bool {
+        if !is_json_destination(path) {
+            self.set_error("Save failed: choose a .rimpress.json or .json file");
+            return false;
+        }
         match write_json_path(&self.presentation, path) {
             Ok(()) => {
                 self.presentation.mark_clean();
+                self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Saved {}", path.display()));
+                true
             }
-            Err(e) => self.set_error(format!("Save failed: {e}")),
+            Err(e) => {
+                self.set_error(format!("Save failed: {e}"));
+                false
+            }
         }
     }
 
@@ -156,7 +222,7 @@ impl ImpressApp {
                     ui.close();
                 }
                 if ui.button("Save").clicked() {
-                    self.save_json();
+                    self.save_file();
                     ui.close();
                 }
                 if ui.button("Save As…").clicked() {
@@ -176,6 +242,11 @@ impl ImpressApp {
                     self.pending_switch = Some(SwitchTo::Calc);
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    self.pending_switch = Some(SwitchTo::Quit);
+                    ui.close();
+                }
             });
             ui.menu_button("Insert", |ui| {
                 if ui.button("New Slide").clicked() {
@@ -187,10 +258,7 @@ impl ImpressApp {
             ui.menu_button("Theme", |ui| {
                 for theme in Theme::builtins() {
                     let selected = self.presentation.theme.name == theme.name;
-                    if ui
-                        .selectable_label(selected, theme.name.clone())
-                        .clicked()
-                    {
+                    if ui.selectable_label(selected, theme.name.clone()).clicked() {
                         self.presentation.apply_theme(theme);
                         self.set_status("Theme applied");
                         ui.close();
@@ -245,7 +313,11 @@ impl ImpressApp {
             w = h * aspect;
         }
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
-        let bg = Color32::from_rgb(theme.background[0], theme.background[1], theme.background[2]);
+        let bg = Color32::from_rgb(
+            theme.background[0],
+            theme.background[1],
+            theme.background[2],
+        );
         ui.painter().rect_filled(rect, 4.0, bg);
         ui.painter().rect_stroke(
             rect,
@@ -254,10 +326,16 @@ impl ImpressApp {
             egui::StrokeKind::Outside,
         );
 
-        let title_color =
-            Color32::from_rgb(theme.title_color[0], theme.title_color[1], theme.title_color[2]);
-        let body_color =
-            Color32::from_rgb(theme.body_color[0], theme.body_color[1], theme.body_color[2]);
+        let title_color = Color32::from_rgb(
+            theme.title_color[0],
+            theme.title_color[1],
+            theme.title_color[2],
+        );
+        let body_color = Color32::from_rgb(
+            theme.body_color[0],
+            theme.body_color[1],
+            theme.body_color[2],
+        );
         let scale = h / SLIDE_HEIGHT_PT;
 
         ui.painter().text(
@@ -276,8 +354,11 @@ impl ImpressApp {
         );
 
         let accent = Color32::from_rgb(theme.accent[0], theme.accent[1], theme.accent[2]);
-        ui.painter()
-            .rect_filled(egui::Rect::from_min_size(rect.min, Vec2::new(6.0, h)), 0.0, accent);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, Vec2::new(6.0, h)),
+            0.0,
+            accent,
+        );
     }
 }
 
@@ -291,6 +372,10 @@ impl App for ImpressApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        self.show_unsaved_dialog(&ctx);
+        if self.pending_action.is_some() {
+            ui.disable();
+        }
 
         egui::Panel::top("impress_menu")
             .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(4.0))
@@ -380,5 +465,102 @@ impl App for ImpressApp {
             .show(ui, |ui| {
                 self.canvas(ui);
             });
+    }
+}
+
+fn is_json_destination(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_save_cannot_overwrite_imported_pptx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.pptx");
+        let mut app = ImpressApp::new();
+        write_pptx_path(&app.presentation, &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        app.presentation = load_pptx_path(&path).unwrap();
+        app.file_path = Some(path.clone());
+        app.presentation.mark_dirty();
+        assert!(!app.save_json_to(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(load_pptx_path(&path).is_ok());
+        assert_eq!(app.file_path, Some(path));
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn failed_save_as_preserves_old_destination_and_dirty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.json");
+        let bad = dir.path().join("destination.json");
+        std::fs::write(&original, "original file").unwrap();
+        std::fs::create_dir(&bad).unwrap();
+        let mut app = ImpressApp::new();
+        app.file_path = Some(original.clone());
+        app.presentation.mark_dirty();
+        assert!(!app.save_json_to(&bad));
+        assert_eq!(app.file_path, Some(original.clone()));
+        assert_eq!(std::fs::read_to_string(original).unwrap(), "original file");
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn successful_save_updates_destination_and_can_be_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.rimpress.json");
+        let mut app = ImpressApp::new();
+        app.presentation.mark_dirty();
+        assert!(app.save_json_to(&path));
+        assert!(!app.is_dirty());
+        assert_eq!(app.file_path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            load_json_path(&path).unwrap().slides,
+            app.presentation.slides
+        );
+    }
+
+    #[test]
+    fn cancel_new_or_open_retains_edited_slides() {
+        for action in [DocumentAction::New, DocumentAction::Open] {
+            let mut app = ImpressApp::new();
+            app.presentation.active_slide_mut().unwrap().title.text = "keep edits".into();
+            app.presentation.mark_dirty();
+            app.request_action(action);
+            assert_eq!(app.pending_action, Some(action));
+            app.resolve_pending_action(Choice::Cancel);
+            assert!(app.pending_action.is_none());
+            assert_eq!(
+                app.presentation.active_slide().unwrap().title.text,
+                "keep edits"
+            );
+            assert!(app.is_dirty());
+        }
+    }
+
+    #[test]
+    fn save_failure_blocks_new_and_explicit_discard_allows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("destination.json");
+        std::fs::create_dir(&path).unwrap();
+        let mut app = ImpressApp::new();
+        app.file_path = Some(path);
+        app.presentation.mark_dirty();
+        let slides = app.presentation.slides.clone();
+        app.new_deck();
+        app.resolve_pending_action(Choice::Save);
+        assert_eq!(app.presentation.slides, slides);
+        assert!(app.is_dirty());
+        app.new_deck();
+        app.resolve_pending_action(Choice::Discard);
+        assert!(!app.is_dirty());
+        assert!(app.file_path.is_none());
+        assert_eq!(app.presentation.slides.len(), 1);
     }
 }

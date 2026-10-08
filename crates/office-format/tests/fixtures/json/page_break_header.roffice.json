@@ -1,0 +1,100 @@
+{
+  "title": "",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "One",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15
+          }
+        },
+        {
+          "type": "page_break"
+        },
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "Two",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15
+          }
+        }
+      ],
+      "paragraphs": null,
+      "page_style": {
+        "width": 595.28,
+        "height": 841.89,
+        "margin_top": 72.0,
+        "margin_bottom": 72.0,
+        "margin_left": 72.0,
+        "margin_right": 72.0
+      },
+      "header": {
+        "runs": [
+          {
+            "text": "Hdr",
+            "style": {
+              "bold": false,
+              "italic": false,
+              "underline": false,
+              "font_size": 12.0,
+              "font_family": "Sans"
+            }
+          }
+        ],
+        "style": {
+          "alignment": "left",
+          "space_after": 6.0,
+          "line_spacing": 1.15
+        }
+      },
+      "footer": {
+        "runs": [
+          {
+            "text": "Page {page} of {pages}",
+            "style": {
+              "bold": false,
+              "italic": false,
+              "underline": false,
+              "font_size": 12.0,
+              "font_family": "Sans"
+            }
+          }
+        ],
+        "style": {
+          "alignment": "left",
+          "space_after": 6.0,
+          "line_spacing": 1.15
+        }
+      }
+    }
+  ],
+  "format_version": 3
+}

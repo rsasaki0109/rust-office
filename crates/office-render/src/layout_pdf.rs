@@ -29,13 +29,8 @@ pub fn document_to_layout_pdf_bytes(document: &Document) -> Result<Vec<u8>, Stri
 
 /// Layout `document` and write a `.pdf` file.
 pub fn write_document_layout_pdf_path(document: &Document, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-    }
     let bytes = document_to_layout_pdf_bytes(document)?;
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    office_core::storage::atomic_write(path, &bytes).map_err(|e| e.to_string())
 }
 
 /// Render `layout` (typically from `layout_document` at zoom 1.0) to PDF bytes.

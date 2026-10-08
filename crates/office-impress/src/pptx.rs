@@ -20,13 +20,9 @@ pub enum PptxError {
 }
 
 pub fn write_pptx_path(presentation: &Presentation, path: &Path) -> Result<(), PptxError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let file = std::fs::File::create(path)?;
-    write_pptx(presentation, file)
+    let bytes = write_pptx_bytes(presentation)?;
+    office_core::storage::atomic_write(path, &bytes)?;
+    Ok(())
 }
 
 pub fn write_pptx_bytes(presentation: &Presentation) -> Result<Vec<u8>, PptxError> {
@@ -111,9 +107,7 @@ fn presentation_xml(n: usize) -> String {
     let mut sld_id_lst = String::new();
     for i in 1..=n {
         let id = 256 + i as u32;
-        sld_id_lst.push_str(&format!(
-            r#"<p:sldId id="{id}" r:id="rId{i}"/>"#
-        ));
+        sld_id_lst.push_str(&format!(r#"<p:sldId id="{id}" r:id="rId{i}"/>"#));
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -207,9 +201,7 @@ fn body_paragraphs(escaped: &str) -> String {
     escaped
         .split('\n')
         .map(|line| {
-            format!(
-                r#"<a:p><a:r><a:rPr lang="en-US" sz="2000"/><a:t>{line}</a:t></a:r></a:p>"#
-            )
+            format!(r#"<a:p><a:r><a:rPr lang="en-US" sz="2000"/><a:t>{line}</a:t></a:r></a:p>"#)
         })
         .collect::<Vec<_>>()
         .join("")

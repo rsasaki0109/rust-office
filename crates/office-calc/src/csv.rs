@@ -38,12 +38,7 @@ pub fn load_csv_str(text: &str) -> Workbook {
 
 pub fn write_csv_path(workbook: &Workbook, path: &Path) -> Result<(), CsvError> {
     let text = sheet_to_csv(workbook.active_sheet());
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(path, text)?;
+    office_core::storage::atomic_write(path, text.as_bytes())?;
     Ok(())
 }
 

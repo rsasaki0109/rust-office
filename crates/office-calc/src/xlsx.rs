@@ -36,10 +36,7 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
             for (r, c, value) in range.used_cells() {
                 let raw = data_to_raw(value);
                 if !raw.is_empty() {
-                    sheet.set_raw(
-                        CellAddr::new(sc + c as u32, sr + r as u32),
-                        raw,
-                    );
+                    sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), raw);
                 }
             }
         }
@@ -53,10 +50,7 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
                     } else {
                         format!("={f}")
                     };
-                    sheet.set_raw(
-                        CellAddr::new(sc + c as u32, sr + r as u32),
-                        text,
-                    );
+                    sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), text);
                 }
             }
         }
@@ -100,13 +94,8 @@ fn format_number(n: f64) -> String {
 
 /// Write workbook sheets to an `.xlsx` path (formulas preserved as formulas).
 pub fn write_xlsx_path(workbook: &Workbook, path: &Path) -> Result<(), XlsxError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
     let bytes = write_xlsx_bytes(workbook)?;
-    std::fs::write(path, bytes)?;
+    office_core::storage::atomic_write(path, &bytes)?;
     Ok(())
 }
 

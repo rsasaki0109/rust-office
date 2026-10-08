@@ -6,6 +6,7 @@
 mod document;
 mod editor;
 mod selection;
+pub mod storage;
 mod style;
 
 pub use document::{

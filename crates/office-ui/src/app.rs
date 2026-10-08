@@ -19,22 +19,18 @@ use office_render::{
 
 use crate::print_sys::{self, PrintAction};
 use crate::theme::{ACCENT, CANVAS_BG, STATUS_BG, TOOLBAR_BG};
+use crate::unsaved::{self, Choice, DocumentAction as PendingAction};
 
-const FONT_SIZES: &[f32] = &[8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0];
-
-/// Action deferred until the user resolves an unsaved-changes prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingAction {
-    New,
-    Open,
-    Quit,
-}
+const FONT_SIZES: &[f32] = &[
+    8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 36.0,
+];
 
 /// Request to switch the suite app mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwitchTo {
     Calc,
     Impress,
+    Quit,
 }
 
 pub struct WriterApp {
@@ -76,7 +72,7 @@ struct PrintDialog {
 }
 
 impl WriterApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new() -> Self {
         let mut editor = DocumentEditor::default();
         let _ = editor.insert_text(
             "Welcome to rust-office Writer.\n\n\
@@ -116,7 +112,7 @@ impl WriterApp {
         self.pending_switch.take()
     }
 
-    fn title(&self) -> String {
+    pub(super) fn title(&self) -> String {
         let name = self
             .file_path
             .as_ref()
@@ -336,11 +332,9 @@ impl WriterApp {
         self.image_textures.retain(|k, _| live.contains(k));
     }
 
-    fn request_quit(&mut self, ctx: &Context) {
-        if !self.request_or_run(PendingAction::Quit) {
-            return;
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    fn request_quit(&mut self, _ctx: &Context) {
+        // OfficeApp checks every open document, including inactive apps.
+        self.pending_switch = Some(SwitchTo::Quit);
     }
 
     /// Returns `true` if the action may proceed immediately.
@@ -353,25 +347,14 @@ impl WriterApp {
         }
     }
 
-    fn finish_pending_after_discard(&mut self, ctx: &Context) {
+    fn finish_pending_after_discard(&mut self) {
         let Some(action) = self.pending_action.take() else {
             return;
         };
         match action {
             PendingAction::New => self.do_new_file(),
             PendingAction::Open => self.do_open_file(),
-            PendingAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
-    }
-
-    fn finish_pending_after_save(&mut self, ctx: &Context) {
-        self.save_file();
-        if self.editor.is_dirty() {
-            // Save cancelled or failed — keep the prompt dismissed but stay put.
-            self.pending_action = None;
-            return;
-        }
-        self.finish_pending_after_discard(ctx);
     }
 
     fn show_unsaved_dialog(&mut self, ctx: &Context) {
@@ -379,57 +362,52 @@ impl WriterApp {
             return;
         }
 
-        #[derive(Clone, Copy)]
-        enum Choice {
-            Save,
-            Discard,
-            Cancel,
-        }
-        let mut choice = None::<Choice>;
-
-        egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.heading("Unsaved changes");
-            ui.add_space(6.0);
-            ui.label("Save changes to the current document?");
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    choice = Some(Choice::Save);
-                }
-                if ui.button("Don't Save").clicked() {
-                    choice = Some(Choice::Discard);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(Choice::Cancel);
-                }
-            });
-        });
-
-        match choice {
-            Some(Choice::Save) => self.finish_pending_after_save(ctx),
-            Some(Choice::Discard) => self.finish_pending_after_discard(ctx),
-            Some(Choice::Cancel) => self.pending_action = None,
-            None => {}
+        if let Some(choice) = unsaved::confirm(ctx, "writer_unsaved", &self.title()) {
+            self.resolve_pending_action(choice);
         }
     }
 
-    fn save_file(&mut self) {
+    fn resolve_pending_action(&mut self, choice: Choice) {
+        match choice {
+            Choice::Save => {
+                if self.save_file() {
+                    self.finish_pending_after_discard();
+                } else {
+                    self.pending_action = None;
+                }
+            }
+            Choice::Discard => self.finish_pending_after_discard(),
+            Choice::Cancel => self.pending_action = None,
+        }
+    }
+
+    pub(super) fn is_dirty(&self) -> bool {
+        self.editor.is_dirty()
+    }
+
+    pub(super) fn cancel_pending_action(&mut self) {
+        self.pending_action = None;
+    }
+
+    pub(super) fn save_file(&mut self) -> bool {
         if self.file_path.is_none() {
-            self.save_file_as();
-            return;
+            return self.save_file_as();
         }
         let path = self.file_path.clone().unwrap();
         match save_document(self.editor.document(), &path) {
             Ok(()) => {
                 self.editor.mark_clean();
                 self.set_status(format!("Saved {}", path.display()));
+                true
             }
-            Err(e) => self.set_error(format!("Save failed: {e}")),
+            Err(e) => {
+                self.set_error(format!("Save failed: {e}"));
+                false
+            }
         }
     }
 
-    fn save_file_as(&mut self) {
+    fn save_file_as(&mut self) -> bool {
         let path = rfd::FileDialog::new()
             .add_filter("OpenDocument Text", &["odt"])
             .add_filter("Word Document", &["docx"])
@@ -437,15 +415,19 @@ impl WriterApp {
             .set_file_name("document.odt")
             .save_file();
         let Some(path) = path else {
-            return;
+            return false;
         };
         match save_document(self.editor.document(), &path) {
             Ok(()) => {
                 self.editor.mark_clean();
                 self.file_path = Some(path.clone());
                 self.set_status(format!("Saved {}", path.display()));
+                true
             }
-            Err(e) => self.set_error(format!("Save failed: {e}")),
+            Err(e) => {
+                self.set_error(format!("Save failed: {e}"));
+                false
+            }
         }
     }
 
@@ -522,10 +504,7 @@ impl WriterApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Layout pages (on screen): {}",
-                    dialog.layout_pages
-                ));
+                ui.label(format!("Layout pages (on screen): {}", dialog.layout_pages));
                 ui.label("Print uses layout-faithful PDF (same pages as the canvas).");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -604,10 +583,16 @@ impl WriterApp {
                 "redo",
             ),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::Y), "redo"),
-            (KeyboardShortcut::new(Modifiers::COMMAND, Key::A), "select_all"),
+            (
+                KeyboardShortcut::new(Modifiers::COMMAND, Key::A),
+                "select_all",
+            ),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::B), "bold"),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::I), "italic"),
-            (KeyboardShortcut::new(Modifiers::COMMAND, Key::U), "underline"),
+            (
+                KeyboardShortcut::new(Modifiers::COMMAND, Key::U),
+                "underline",
+            ),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::C), "copy"),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::X), "cut"),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::V), "paste"),
@@ -615,8 +600,14 @@ impl WriterApp {
                 KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals),
                 "zoom_in",
             ),
-            (KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus), "zoom_out"),
-            (KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0), "zoom_reset"),
+            (
+                KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus),
+                "zoom_out",
+            ),
+            (
+                KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0),
+                "zoom_reset",
+            ),
             (
                 KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter),
                 "page_break",
@@ -629,7 +620,9 @@ impl WriterApp {
                 match action {
                     "new" => self.new_file(),
                     "open" => self.open_file(),
-                    "save" => self.save_file(),
+                    "save" => {
+                        self.save_file();
+                    }
                     "undo" => {
                         if self.editor.undo() {
                             self.set_status("Undo");
@@ -875,7 +868,9 @@ impl WriterApp {
 
             toolbar_btn(ui, "New", || self.new_file());
             toolbar_btn(ui, "Open", || self.open_file());
-            toolbar_btn(ui, "Save", || self.save_file());
+            toolbar_btn(ui, "Save", || {
+                self.save_file();
+            });
             ui.separator();
             if ui
                 .add_enabled(self.editor.can_undo(), egui::Button::new("Undo"))
@@ -933,9 +928,15 @@ impl WriterApp {
                     .map(|p| p.style.alignment)
                     .unwrap_or_default(),
             };
-            toggle_btn(ui, "Left", align == Alignment::Left, RichText::new("⬅"), || {
-                let _ = self.editor.set_alignment(Alignment::Left);
-            });
+            toggle_btn(
+                ui,
+                "Left",
+                align == Alignment::Left,
+                RichText::new("⬅"),
+                || {
+                    let _ = self.editor.set_alignment(Alignment::Left);
+                },
+            );
             toggle_btn(
                 ui,
                 "Center",
@@ -1070,11 +1071,7 @@ impl WriterApp {
                 );
 
                 let layout = layout_document(ui, self.editor.document(), origin, zoom);
-                ensure_image_textures(
-                    ui.ctx(),
-                    self.editor.document(),
-                    &mut self.image_textures,
-                );
+                ensure_image_textures(ui.ctx(), self.editor.document(), &mut self.image_textures);
                 self.prune_image_textures();
                 let texture_ids: HashMap<String, egui::TextureId> = self
                     .image_textures
@@ -1137,7 +1134,8 @@ impl WriterApp {
                                     }
                                 }
                                 HitResult::Header(doc_pos) => {
-                                    if extend && matches!(self.editor.edit_focus(), EditFocus::Header)
+                                    if extend
+                                        && matches!(self.editor.edit_focus(), EditFocus::Header)
                                     {
                                         let sel = self.editor.selection().with_focus(doc_pos);
                                         self.editor.set_selection(sel);
@@ -1146,7 +1144,8 @@ impl WriterApp {
                                     }
                                 }
                                 HitResult::Footer(doc_pos) => {
-                                    if extend && matches!(self.editor.edit_focus(), EditFocus::Footer)
+                                    if extend
+                                        && matches!(self.editor.edit_focus(), EditFocus::Footer)
                                     {
                                         let sel = self.editor.selection().with_focus(doc_pos);
                                         self.editor.set_selection(sel);
@@ -1198,9 +1197,7 @@ impl WriterApp {
                                     let sel = self.editor.selection().with_focus(doc_pos);
                                     self.editor.set_selection(sel);
                                 }
-                                HitResult::Body(doc_pos)
-                                    if self.editor.edit_focus().is_body() =>
-                                {
+                                HitResult::Body(doc_pos) if self.editor.edit_focus().is_body() => {
                                     let sel = self.editor.selection().with_focus(doc_pos);
                                     self.editor.set_selection(sel);
                                 }
@@ -1541,7 +1538,10 @@ fn paint_ime_preedit(
     // Thin underline under the whole composition.
     let y = pre_rect.bottom() - 1.0;
     painter.line_segment(
-        [Pos2::new(pre_rect.left(), y), Pos2::new(pre_rect.right(), y)],
+        [
+            Pos2::new(pre_rect.left(), y),
+            Pos2::new(pre_rect.right(), y),
+        ],
         egui::Stroke::new(1.0, Color32::from_gray(100)),
     );
 
@@ -1595,13 +1595,7 @@ fn toolbar_btn(ui: &mut Ui, label: &str, mut on_click: impl FnMut()) {
     }
 }
 
-fn toggle_btn(
-    ui: &mut Ui,
-    id: &str,
-    selected: bool,
-    label: RichText,
-    mut on_click: impl FnMut(),
-) {
+fn toggle_btn(ui: &mut Ui, id: &str, selected: bool, label: RichText, mut on_click: impl FnMut()) {
     let mut btn = egui::Button::new(label);
     if selected {
         btn = btn.fill(Color32::from_rgb(200, 214, 232));
@@ -1616,18 +1610,13 @@ impl App for WriterApp {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
 
-        // Intercept window close while dirty.
-        if ctx.input(|i| i.viewport().close_requested()) && self.editor.is_dirty() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending_action = Some(PendingAction::Quit);
-        }
-
         // Focus the document canvas on first frame so typing works immediately.
         if self.focus_document && ctx.memory(|m| m.focused().is_none()) {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("writer_document")));
         }
 
-        if self.pending_action.is_none()
+        if ui.is_enabled()
+            && self.pending_action.is_none()
             && self.link_dialog.is_none()
             && self.header_footer_dialog.is_none()
             && self.print_dialog.is_none()
@@ -1636,6 +1625,9 @@ impl App for WriterApp {
             self.handle_text_input(&ctx);
         }
         self.show_unsaved_dialog(&ctx);
+        if self.pending_action.is_some() {
+            ui.disable();
+        }
         self.show_link_dialog(&ctx);
         self.show_header_footer_dialog(&ctx);
         self.show_print_dialog(&ctx);
@@ -1680,5 +1672,54 @@ impl App for WriterApp {
             .show(ui, |ui| {
                 self.document_canvas(ui);
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_save_does_not_replace_pending_new_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("destination.json");
+        std::fs::create_dir(&path).unwrap();
+        let mut app = WriterApp::new();
+        app.file_path = Some(path.clone());
+        app.editor.insert_text("keep edits").unwrap();
+        let original = app.editor.document().plain_text();
+        app.new_file();
+        app.resolve_pending_action(Choice::Save);
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.editor.document().plain_text(), original);
+        assert_eq!(app.file_path, Some(path));
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn cancel_new_or_open_retains_writer_edits() {
+        for action in [PendingAction::New, PendingAction::Open] {
+            let mut app = WriterApp::new();
+            app.editor.insert_text("keep edits").unwrap();
+            let original = app.editor.document().plain_text();
+            assert!(!app.request_or_run(action));
+            app.resolve_pending_action(Choice::Cancel);
+            assert!(app.pending_action.is_none());
+            assert_eq!(app.editor.document().plain_text(), original);
+            assert!(app.is_dirty());
+        }
+    }
+
+    #[test]
+    fn save_refuses_json_fallback_over_existing_unsupported_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.xlsx");
+        std::fs::write(&path, b"original file").unwrap();
+        let mut app = WriterApp::new();
+        app.file_path = Some(path.clone());
+        app.editor.insert_text("keep edits").unwrap();
+        assert!(!app.save_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original file");
+        assert!(app.is_dirty());
     }
 }
