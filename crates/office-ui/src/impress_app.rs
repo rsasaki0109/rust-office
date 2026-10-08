@@ -92,20 +92,24 @@ impl ImpressApp {
         let Some(path) = path else {
             return;
         };
+        self.open_path(&path);
+    }
+
+    fn open_path(&mut self, path: &std::path::Path) {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
         let result = if ext == "pptx" {
-            load_pptx_path(&path).map_err(|e| e.to_string())
+            load_pptx_path(path).map_err(|e| e.to_string())
         } else {
-            load_json_path(&path).map_err(|e| e.to_string())
+            load_json_path(path).map_err(|e| e.to_string())
         };
         match result {
             Ok(p) => {
                 self.presentation = p;
-                self.file_path = Some(path.clone());
+                self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Opened {}", path.display()));
             }
             Err(e) => self.set_error(format!("Open failed: {e}")),
@@ -477,6 +481,58 @@ fn is_json_destination(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pptx_open_retains_slides_selection_path_and_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("broken.pptx");
+        // A valid ZIP with no presentation manifest must not replace the deck.
+        std::fs::write(&bad, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        let mut app = ImpressApp::new();
+        app.file_path = Some(dir.path().join("original.rimpress.json"));
+        app.presentation.set_active(1);
+        app.presentation.active_slide_mut().unwrap().body.text = "keep edited body".into();
+        app.presentation.mark_dirty();
+        let before = app.presentation.clone();
+        let path = app.file_path.clone();
+        let title = app.title();
+        app.open_path(&bad);
+        assert_eq!(app.presentation, before);
+        assert_eq!(app.file_path, path);
+        assert_eq!(app.title(), title);
+        assert!(app.is_dirty());
+        assert!(app
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("ppt/presentation.xml"));
+        // The retained edits can still be saved after the failure.
+        assert!(app.save_file());
+        assert_eq!(
+            load_json_path(app.file_path.as_ref().unwrap())
+                .unwrap()
+                .slides,
+            before.slides
+        );
+    }
+
+    #[test]
+    fn successful_pptx_open_replaces_the_deck_and_resets_active_and_dirty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordered.pptx");
+        let mut deck = Presentation::demo();
+        deck.slides.reverse();
+        write_pptx_path(&deck, &path).unwrap();
+        let mut app = ImpressApp::new();
+        app.presentation.set_active(2);
+        app.presentation.mark_dirty();
+        app.open_path(&path);
+        assert_eq!(app.presentation.slides, deck.slides);
+        assert_eq!(app.presentation.active, 0);
+        assert!(!app.is_dirty());
+        assert_eq!(app.file_path, Some(path));
+        assert!(app.last_error.is_none());
+    }
 
     #[test]
     fn json_save_cannot_overwrite_imported_pptx() {

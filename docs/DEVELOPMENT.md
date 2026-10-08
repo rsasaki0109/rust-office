@@ -43,6 +43,22 @@ Run these checks before submitting changes:
   and field; imports beyond XLSX worksheet row/column limits fail.
 * After importing a PPTX, Impress Save opens Save As for a native JSON file, preserving
   the source PPTX. Export PPTX remains a separate operation with MVP format coverage.
+* PPTX imports follow `ppt/presentation.xml`'s slide list, resolving relationship
+  IDs by their namespace rather than numeric ID or ZIP filename order. Unlisted
+  slide files are ignored. Listed slides require internal slide relationships;
+  absolute package targets, relative targets, dot segments and percent-encoded
+  names are resolved relative to the presentation part.
+* A missing presentation, relationship or listed slide, unreadable part, or malformed
+  XML rejects the entire PPTX import and identifies the affected part. The existing
+  deck, active slide, destination and unsaved edits remain intact on failure.
+  Missing optional `ppt/theme/theme1.xml` / `docProps/core.xml` use defaults; present
+  but unreadable or malformed optional parts also fail. A valid empty slide list
+  opens one editable blank slide, and may omit the presentation relationships part.
+* PPTX text import retains empty titles, paragraph breaks (including blank lines),
+  escaped XML text and CDATA. Coverage remains title/body text and a basic theme
+  accent/background; rich shapes, notes, layouts and theme relationship selection
+  are not preserved. UTF-8 XML parts with Transitional or Strict main namespaces
+  are supported; arbitrary presentation-part locations are not yet supported.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
   checks every edited document, including inactive apps. Cancelling retains edits,
   even after choosing Don't Save for another document in the same close attempt.
