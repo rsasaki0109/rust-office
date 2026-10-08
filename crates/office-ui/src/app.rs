@@ -165,10 +165,14 @@ impl WriterApp {
         let Some(path) = path else {
             return;
         };
-        match load_document(&path) {
+        self.open_path(&path);
+    }
+
+    fn open_path(&mut self, path: &std::path::Path) {
+        match load_document(path) {
             Ok(doc) => {
                 self.editor.replace_document(doc);
-                self.file_path = Some(path);
+                self.file_path = Some(path.to_path_buf());
                 self.preferred_caret_x = None;
                 self.set_status("Opened");
             }
@@ -1678,6 +1682,63 @@ impl App for WriterApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_docx_open_retains_document_selection_history_and_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("broken.docx");
+        std::fs::write(&bad, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        let mut app = WriterApp::new();
+        app.editor.new_document();
+        app.editor.insert_text("keep").unwrap();
+        app.editor.insert_text(" edits").unwrap();
+        app.file_path = Some(dir.path().join("original.docx"));
+        app.preferred_caret_x = Some(123.0);
+        let text = app.editor.document().plain_text();
+        let selection = app.editor.selection();
+        let path = app.file_path.clone();
+        app.open_path(&bad);
+        assert_eq!(app.editor.document().plain_text(), text);
+        assert_eq!(app.editor.selection(), selection);
+        assert_eq!(app.file_path, path);
+        assert_eq!(app.preferred_caret_x, Some(123.0));
+        assert!(app.is_dirty());
+        assert!(app
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("word/document.xml"));
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.document().plain_text(), "keep");
+        assert!(app.editor.redo());
+        assert_eq!(app.editor.document().plain_text(), text);
+        assert!(app.save_file());
+        assert_eq!(
+            load_document(app.file_path.as_ref().unwrap())
+                .unwrap()
+                .plain_text(),
+            text
+        );
+    }
+
+    #[test]
+    fn successful_docx_open_replaces_document_and_resets_history_and_dirty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid.docx");
+        let mut editor = office_core::DocumentEditor::default();
+        editor.insert_text("Loaded DOCX").unwrap();
+        save_document(editor.document(), &path).unwrap();
+        let mut app = WriterApp::new();
+        app.editor.insert_text("old edits").unwrap();
+        app.preferred_caret_x = Some(123.0);
+        app.open_path(&path);
+        assert_eq!(app.editor.document().plain_text(), "Loaded DOCX");
+        assert_eq!(app.file_path, Some(path));
+        assert_eq!(app.preferred_caret_x, None);
+        assert!(!app.is_dirty());
+        assert!(!app.editor.undo());
+        assert!(app.last_error.is_none());
+    }
 
     #[test]
     fn failed_save_does_not_replace_pending_new_document() {

@@ -9,8 +9,9 @@ use office_core::{
 };
 use quick_xml::events::Event;
 use quick_xml::name::QName;
-use quick_xml::reader::Reader;
+use quick_xml::reader::NsReader;
 
+use super::xml::{self, invalid, part_error, DRAWING_NS, PACKAGE_NS, REL_NS, WORD_NS};
 use crate::FormatError;
 
 /// Embedded image bytes keyed by relationship id (`rId1`, …).
@@ -36,61 +37,208 @@ pub fn parse_document_parts(
     header_xml: Option<&str>,
     footer_xml: Option<&str>,
 ) -> Result<Document, FormatError> {
-    let hyperlinks = parse_typed_rels(rels_xml).hyperlinks;
+    let references = document_references(xml)?;
+    let relationships = if rels_xml.is_empty() {
+        HashMap::new()
+    } else {
+        parse_typed_rels(rels_xml)?
+    };
+    let mut hyperlinks = HashMap::new();
+    // XML-only callers may deliberately omit package resources. File imports
+    // resolve every reference and read the required parts before reaching here.
+    if !rels_xml.is_empty() {
+        for reference in &references {
+            let relationship = resolve_reference(&relationships, reference)?;
+            if reference.kind == ReferenceKind::Hyperlink {
+                hyperlinks.insert(reference.id.clone(), relationship.target.clone());
+            }
+        }
+    }
     let mut doc = parse_body(xml, &hyperlinks, media)?;
-    if let Some(h) = header_xml.and_then(parse_hf_paragraph) {
+    if let Some(h) = header_xml
+        .map(|xml| parse_hf_paragraph(xml, "hdr"))
+        .transpose()?
+        .flatten()
+    {
         doc.main_section_mut().header = Some(h);
     }
-    if let Some(f) = footer_xml.and_then(parse_hf_paragraph) {
+    if let Some(f) = footer_xml
+        .map(|xml| parse_hf_paragraph(xml, "ftr"))
+        .transpose()?
+        .flatten()
+    {
         doc.main_section_mut().footer = Some(f);
     }
     Ok(doc)
 }
 
-/// Relationship targets discovered in `document.xml.rels`.
-#[derive(Debug, Default)]
-pub struct DocRels {
-    pub hyperlinks: HashMap<String, String>,
-    pub images: HashMap<String, String>,
-    pub header: Option<String>,
-    pub footer: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReferenceKind {
+    Image,
+    Header,
+    Footer,
+    Hyperlink,
 }
 
-pub fn parse_typed_rels(rels_xml: &str) -> DocRels {
-    let mut out = DocRels::default();
-    if rels_xml.is_empty() {
-        return out;
+impl ReferenceKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Header => "header",
+            Self::Footer => "footer",
+            Self::Hyperlink => "hyperlink",
+        }
     }
-    let mut reader = Reader::from_str(rels_xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
-                if local_name(e.name()) == "Relationship" {
-                    let id = attr(&e, "Id");
-                    let ty = attr(&e, "Type").unwrap_or_default();
-                    let target = attr(&e, "Target");
-                    if let (Some(id), Some(target)) = (id, target) {
-                        if ty.contains("/hyperlink") {
-                            out.hyperlinks.insert(id, target);
-                        } else if ty.contains("/image") {
-                            out.images.insert(id, target);
-                        } else if ty.contains("/header") {
-                            out.header = Some(target);
-                        } else if ty.contains("/footer") {
-                            out.footer = Some(target);
+}
+
+pub(super) struct Reference {
+    pub id: String,
+    pub kind: ReferenceKind,
+    pub is_default: bool,
+}
+pub(super) struct Relationship {
+    pub target: String,
+    kind: String,
+    external: bool,
+}
+pub(super) type DocRels = HashMap<String, Relationship>;
+
+pub(super) fn parse_typed_rels(xml_text: &str) -> Result<DocRels, FormatError> {
+    let mut relationships = HashMap::new();
+    xml::read_xml(
+        xml_text,
+        "Relationships",
+        PACKAGE_NS,
+        |event, reader, parents| {
+            if let Event::Start(e) | Event::Empty(e) = event {
+                if parents == ["Relationships"]
+                    && xml::element(reader, e.name(), "Relationship", PACKAGE_NS)
+                {
+                    let id = xml::required_attr(e, "Id")?;
+                    let external = match xml::attr(e, "TargetMode")?.as_deref() {
+                        None | Some("Internal") => false,
+                        Some("External") => true,
+                        Some(_) => return Err(invalid("invalid relationship TargetMode")),
+                    };
+                    let relationship = Relationship {
+                        target: xml::required_attr(e, "Target")?,
+                        kind: xml::required_attr(e, "Type")?,
+                        external,
+                    };
+                    if relationships.insert(id, relationship).is_some() {
+                        return Err(invalid("duplicate relationship Id"));
+                    }
+                }
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| part_error("word/_rels/document.xml.rels", e))?;
+    Ok(relationships)
+}
+
+pub(super) fn document_references(text: &str) -> Result<Vec<Reference>, FormatError> {
+    let mut references = Vec::new();
+    let mut seen_body = false;
+    let mut in_body = false;
+    xml::read_xml(text, "document", WORD_NS, |event, reader, parents| {
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                if parents == ["document"] && xml::element(reader, e.name(), "body", WORD_NS) {
+                    if seen_body {
+                        return Err(invalid("duplicate document body"));
+                    }
+                    seen_body = true;
+                    in_body = matches!(event, Event::Start(_));
+                }
+                if !in_body {
+                    return Ok(());
+                }
+                let kind = if xml::element(reader, e.name(), "headerReference", WORD_NS) {
+                    Some(ReferenceKind::Header)
+                } else if xml::element(reader, e.name(), "footerReference", WORD_NS) {
+                    Some(ReferenceKind::Footer)
+                } else if xml::element(reader, e.name(), "hyperlink", WORD_NS) {
+                    Some(ReferenceKind::Hyperlink)
+                } else if xml::element(reader, e.name(), "blip", DRAWING_NS) {
+                    Some(ReferenceKind::Image)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    let key = if kind == ReferenceKind::Image {
+                        "embed"
+                    } else {
+                        "id"
+                    };
+                    let id = xml::namespaced_attr(e, reader, key, REL_NS)?;
+                    if kind == ReferenceKind::Image
+                        && id.is_none()
+                        && xml::namespaced_attr(e, reader, "link", REL_NS)?.is_some()
+                    {
+                        return Err(invalid("external linked images are unsupported"));
+                    }
+                    match id {
+                        Some(id) if !id.is_empty() => references.push(Reference {
+                            id,
+                            kind,
+                            is_default: xml::namespaced_attr(e, reader, "type", WORD_NS)?
+                                .is_none_or(|value| value == "default"),
+                        }),
+                        None if matches!(kind, ReferenceKind::Image | ReferenceKind::Hyperlink) => {
+                        }
+                        _ => {
+                            return Err(invalid(format!("missing {} relationship id", kind.name())))
                         }
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Event::End(e)
+                if parents == ["document", "body"]
+                    && xml::element(reader, e.name(), "body", WORD_NS) =>
+            {
+                in_body = false
+            }
             _ => {}
         }
-        buf.clear();
+        Ok(())
+    })
+    .map_err(|e| part_error("word/document.xml", e))?;
+    if !seen_body {
+        return Err(invalid("DOCX word/document.xml: missing document body"));
     }
-    out
+    Ok(references)
+}
+
+pub(super) fn resolve_reference<'a>(
+    relationships: &'a DocRels,
+    reference: &Reference,
+) -> Result<&'a Relationship, FormatError> {
+    let relationship = relationships.get(&reference.id).ok_or_else(|| {
+        invalid(format!(
+            "DOCX word/_rels/document.xml.rels: missing {} relationship {}",
+            reference.kind.name(),
+            reference.id
+        ))
+    })?;
+    if !REL_NS
+        .iter()
+        .any(|ns| relationship.kind == format!("{ns}/{}", reference.kind.name()))
+    {
+        return Err(invalid(format!(
+            "DOCX word/_rels/document.xml.rels: {} is not a {} relationship",
+            reference.id,
+            reference.kind.name()
+        )));
+    }
+    if reference.kind != ReferenceKind::Hyperlink && relationship.external {
+        return Err(invalid(format!(
+            "DOCX word/_rels/document.xml.rels: external {} {} is unsupported",
+            reference.kind.name(),
+            reference.id
+        )));
+    }
+    Ok(relationship)
 }
 
 fn parse_body(
@@ -98,7 +246,7 @@ fn parse_body(
     hyperlinks: &HashMap<String, String>,
     media: &MediaMap,
 ) -> Result<Document, FormatError> {
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
 
     let mut blocks: Vec<Block> = Vec::new();
@@ -126,15 +274,15 @@ fn parse_body(
     let mut cell_paragraphs: Vec<Paragraph> = Vec::new();
     let mut buf = Vec::new();
 
-    let flush_run = |runs: &mut Vec<Run>,
-                     text: &mut String,
-                     style: &TextStyle,
-                     link: Option<&str>| {
-        if text.is_empty() {
-            return;
-        }
-        runs.push(Run::new(std::mem::take(text), style.clone()).with_link(link.map(str::to_string)));
-    };
+    let flush_run =
+        |runs: &mut Vec<Run>, text: &mut String, style: &TextStyle, link: Option<&str>| {
+            if text.is_empty() {
+                return;
+            }
+            runs.push(
+                Run::new(std::mem::take(text), style.clone()).with_link(link.map(str::to_string)),
+            );
+        };
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -182,7 +330,8 @@ fn parse_body(
                     }
                     "hyperlink" if in_p => {
                         in_hyperlink = true;
-                        current_link = attr(&e, "id").and_then(|id| hyperlinks.get(&id).cloned());
+                        current_link = xml::namespaced_attr(&e, &reader, "id", REL_NS)?
+                            .and_then(|id| hyperlinks.get(&id).cloned());
                     }
                     "r" if in_p => {
                         in_r = true;
@@ -213,7 +362,7 @@ fn parse_body(
                         }
                     }
                     "blip" if in_p => {
-                        if let Some(id) = attr(&e, "embed") {
+                        if let Some(id) = xml::namespaced_attr(&e, &reader, "embed", REL_NS)? {
                             pending_image = Some(id);
                         }
                     }
@@ -263,7 +412,7 @@ fn parse_body(
                         }
                     }
                     "blip" if in_p => {
-                        if let Some(id) = attr(&e, "embed") {
+                        if let Some(id) = xml::namespaced_attr(&e, &reader, "embed", REL_NS)? {
                             pending_image = Some(id);
                         }
                     }
@@ -275,9 +424,17 @@ fn parse_body(
             }
             Ok(Event::Text(t)) => {
                 if in_t {
-                    let text = t.unescape().unwrap_or_default();
+                    let text = t
+                        .unescape()
+                        .map_err(|e| part_error("word/document.xml", invalid(e.to_string())))?;
                     run_buf.push_str(&text);
                 }
+            }
+            Ok(Event::CData(text)) if in_t => {
+                run_buf.push_str(
+                    std::str::from_utf8(text.as_ref())
+                        .map_err(|e| part_error("word/document.xml", invalid(e.to_string())))?,
+                );
             }
             Ok(Event::End(e)) => {
                 let local = local_name(e.name());
@@ -379,43 +536,32 @@ fn parse_body(
     Ok(doc)
 }
 
-fn parse_hf_paragraph(xml: &str) -> Option<Paragraph> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(false);
-    let mut in_t = false;
-    let mut text = String::new();
-    let mut buf = Vec::new();
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                if local_name(e.name()) == "t" {
-                    in_t = true;
-                }
+pub(super) fn parse_hf_paragraph(text: &str, root: &str) -> Result<Option<Paragraph>, FormatError> {
+    let mut in_text = false;
+    let mut output = String::new();
+    xml::read_xml(text, root, WORD_NS, |event, reader, _| {
+        match event {
+            Event::Start(e) if xml::element(reader, e.name(), "t", WORD_NS) => in_text = true,
+            Event::End(e) if xml::element(reader, e.name(), "t", WORD_NS) => in_text = false,
+            Event::End(e) if xml::element(reader, e.name(), "p", WORD_NS) => output.push('\n'),
+            Event::Start(e) | Event::Empty(e) if xml::element(reader, e.name(), "br", WORD_NS) => {
+                output.push('\n')
             }
-            Ok(Event::Empty(e)) => {
-                if local_name(e.name()) == "t" {
-                    // empty text node
-                }
+            Event::Empty(e) if xml::element(reader, e.name(), "p", WORD_NS) => output.push('\n'),
+            Event::Empty(e) if xml::element(reader, e.name(), "tab", WORD_NS) => output.push('\t'),
+            Event::Text(t) if in_text => {
+                output.push_str(&t.unescape().map_err(|e| invalid(e.to_string()))?)
             }
-            Ok(Event::Text(t)) if in_t => {
-                text.push_str(&t.unescape().unwrap_or_default());
-            }
-            Ok(Event::End(e)) => {
-                if local_name(e.name()) == "t" {
-                    in_t = false;
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Event::CData(t) if in_text => output
+                .push_str(std::str::from_utf8(t.as_ref()).map_err(|e| invalid(e.to_string()))?),
             _ => {}
         }
-        buf.clear();
+        Ok(())
+    })?;
+    if output.ends_with('\n') {
+        output.pop();
     }
-    if text.is_empty() {
-        None
-    } else {
-        Some(Paragraph::from_text(text))
-    }
+    Ok((!output.is_empty()).then(|| Paragraph::from_text(output)))
 }
 
 fn parse_jc(val: &str) -> Alignment {
@@ -516,22 +662,61 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
         let k = String::from_utf8_lossy(a.key.as_ref()).into_owned();
         let local = k.rsplit(':').next().unwrap_or(&k);
         if local == key || k == key {
-            return Some(String::from_utf8_lossy(&a.value).into_owned());
+            return a.unescape_value().ok().map(|value| value.into_owned());
         }
     }
     None
 }
 
-/// Resolve a relationship Target to a zip path under the package.
-pub fn word_part_path(target: &str) -> String {
-    let t = target.replace('\\', "/");
-    if t.starts_with("word/") || t.starts_with("/word/") {
-        t.trim_start_matches('/').to_string()
-    } else if let Some(rest) = t.strip_prefix('/') {
-        format!("word/{rest}")
-    } else {
-        format!("word/{t}")
+/// Resolve a target URI relative to word/document.xml for ZIP lookup.
+pub(super) fn word_part_path(target: &str) -> Result<String, FormatError> {
+    if target.contains(['\\', '?', '#', ':']) {
+        return Err(invalid(format!("invalid DOCX part target {target:?}")));
     }
+    let mut decoded = Vec::new();
+    let bytes = target.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .ok_or_else(|| invalid("invalid percent-encoded DOCX part target"))?;
+            let hex = std::str::from_utf8(hex)
+                .map_err(|_| invalid("invalid percent-encoded DOCX part target"))?;
+            let byte = u8::from_str_radix(hex, 16)
+                .map_err(|_| invalid("invalid percent-encoded DOCX part target"))?;
+            if matches!(byte, b'/' | b'\\' | 0) {
+                return Err(invalid("invalid encoded path separator"));
+            }
+            decoded.push(byte);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded =
+        String::from_utf8(decoded).map_err(|_| invalid("DOCX part target is not UTF-8"))?;
+    let mut parts = if decoded.starts_with('/') {
+        Vec::new()
+    } else {
+        vec!["word"]
+    };
+    for part in decoded.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(invalid("DOCX part target leaves package root"));
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err(invalid("empty DOCX part target"));
+    }
+    Ok(parts.join("/"))
 }
 
 pub fn mime_for_media_path(path: &str) -> String {
