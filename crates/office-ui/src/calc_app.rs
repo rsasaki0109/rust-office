@@ -6,7 +6,7 @@ use eframe::App;
 use egui::{self, Color32, Context, Key, RichText, Sense, Ui, Vec2};
 use office_calc::{
     col_to_letters, load_csv_path, load_xlsx_path, write_csv_path, write_xlsx_path, CellAddr,
-    Workbook,
+    CellRange, Workbook,
 };
 
 use crate::theme::{ACCENT, CANVAS_BG, STATUS_BG, TOOLBAR_BG};
@@ -27,6 +27,11 @@ pub struct CalcApp {
     workbook: Workbook,
     file_path: Option<PathBuf>,
     active: CellAddr,
+    selection_anchor: CellAddr,
+    selection_end: CellAddr,
+    dragging_range: bool,
+    focus_formula: bool,
+    scroll_to_active: bool,
     /// Draft text in the formula bar / in-cell editor.
     edit_buf: String,
     editing: bool,
@@ -53,12 +58,18 @@ impl CalcApp {
         workbook.set_cell(CellAddr::new(1, 3), "=SUM(B2:B3)");
         workbook.set_cell(CellAddr::new(2, 3), "=B2*C2+B3*C3");
         workbook.mark_clean();
+        workbook.clear_history();
         let edit_buf = workbook.active_sheet().raw(CellAddr::new(0, 0)).to_owned();
 
         Self {
             workbook,
             file_path: None,
             active: CellAddr::new(0, 0),
+            selection_anchor: CellAddr::new(0, 0),
+            selection_end: CellAddr::new(0, 0),
+            dragging_range: false,
+            focus_formula: false,
+            scroll_to_active: false,
             edit_buf,
             editing: false,
             status_message: "Ready — Calc MVP (CSV/XLSX, SUM/AVERAGE/MIN/MAX/IF/COUNT, +−*/)"
@@ -98,6 +109,7 @@ impl CalcApp {
     fn begin_edit(&mut self) {
         self.edit_buf = self.workbook.active_sheet().raw(self.active).to_string();
         self.editing = true;
+        self.focus_formula = true;
     }
 
     fn commit_edit(&mut self) {
@@ -106,31 +118,136 @@ impl CalcApp {
                 self.workbook.set_cell(self.active, self.edit_buf.clone());
             }
             self.editing = false;
+            self.focus_formula = false;
             self.set_status(format!("Edited {}", self.active.to_a1()));
         }
     }
 
     fn cancel_edit(&mut self) {
         self.editing = false;
-        self.edit_buf.clear();
+        self.focus_formula = false;
+        self.edit_buf = self.workbook.active_sheet().raw(self.active).to_owned();
     }
 
-    fn select_cell(&mut self, addr: CellAddr) {
-        if self.editing {
-            self.commit_edit();
+    fn selection(&self) -> CellRange {
+        CellRange {
+            start: self.selection_anchor,
+            end: self.selection_end,
         }
+        .normalize()
+    }
+
+    fn selection_label(&self) -> String {
+        let range = self.selection();
+        if range.start == range.end {
+            range.start.to_a1()
+        } else {
+            format!("{}:{}", range.start.to_a1(), range.end.to_a1())
+        }
+    }
+
+    fn select_cell(&mut self, addr: CellAddr, extend: bool) {
+        self.commit_edit();
         self.active = addr;
-        self.edit_buf = self.workbook.active_sheet().raw(addr).to_string();
+        if !extend {
+            self.selection_anchor = addr;
+        }
+        self.selection_end = addr;
+        self.edit_buf = self.workbook.active_sheet().raw(addr).to_owned();
     }
 
-    fn move_active(&mut self, dcol: i32, drow: i32) {
-        if self.editing {
-            self.commit_edit();
-        }
+    fn move_active(&mut self, dcol: i32, drow: i32, extend: bool) {
         let sheet = self.workbook.active_sheet();
-        let col = (self.active.col as i32 + dcol).clamp(0, sheet.cols as i32 - 1) as u32;
-        let row = (self.active.row as i32 + drow).clamp(0, sheet.rows as i32 - 1) as u32;
-        self.select_cell(CellAddr::new(col, row));
+        let col =
+            (self.active.col as i64 + i64::from(dcol)).clamp(0, i64::from(sheet.cols) - 1) as u32;
+        let row =
+            (self.active.row as i64 + i64::from(drow)).clamp(0, i64::from(sheet.rows) - 1) as u32;
+        self.select_cell(CellAddr::new(col, row), extend);
+        self.scroll_to_active = true;
+    }
+
+    fn switch_sheet(&mut self, index: usize) {
+        self.commit_edit();
+        self.workbook.set_active_sheet(index);
+        self.select_cell(CellAddr::new(0, 0), false);
+        self.scroll_to_active = true;
+    }
+
+    fn add_sheet(&mut self) {
+        self.commit_edit();
+        let n = self.workbook.sheet_count() + 1;
+        self.workbook.add_sheet(format!("Sheet{n}"));
+        self.select_cell(CellAddr::new(0, 0), false);
+        self.scroll_to_active = true;
+    }
+
+    fn clear_selection(&mut self) {
+        self.commit_edit();
+        self.workbook.clear_range(self.selection());
+        self.edit_buf = self.workbook.active_sheet().raw(self.active).to_owned();
+        self.set_status(format!("Cleared {}", self.selection_label()));
+    }
+
+    fn paste(&mut self, text: &str) {
+        self.commit_edit();
+        // The model validates the entire table before changing any cells.
+        match self.workbook.paste_tsv(self.selection().start, text) {
+            Ok(range) => {
+                self.editing = false;
+                self.active = range.start;
+                self.selection_anchor = range.start;
+                self.selection_end = range.end;
+                self.edit_buf = self.workbook.active_sheet().raw(self.active).to_owned();
+                self.scroll_to_active = true;
+                self.set_status(format!("Pasted {}", self.selection_label()));
+            }
+            Err(error) => self.set_error(format!("Paste failed: {error}")),
+        }
+    }
+
+    fn copy_selection(&mut self, ctx: &Context, cut: bool) {
+        self.commit_edit();
+        match self.workbook.copy_tsv(self.selection()) {
+            Ok(text) => {
+                ctx.copy_text(text);
+                if cut {
+                    self.clear_selection();
+                } else {
+                    self.set_status(format!("Copied {}", self.selection_label()));
+                }
+            }
+            Err(error) => self.set_error(format!("Copy failed: {error}")),
+        }
+    }
+
+    fn history(&mut self, redo: bool) {
+        self.commit_edit();
+        let previous_sheet = self.workbook.active;
+        let changed = if redo {
+            self.workbook.redo()
+        } else {
+            self.workbook.undo()
+        };
+        if changed {
+            let sheet = self.workbook.active_sheet();
+            let clamp = |addr: CellAddr| {
+                CellAddr::new(addr.col.min(sheet.cols - 1), addr.row.min(sheet.rows - 1))
+            };
+            if previous_sheet == self.workbook.active {
+                self.active = clamp(self.active);
+                self.selection_anchor = clamp(self.selection_anchor);
+                self.selection_end = clamp(self.selection_end);
+                self.edit_buf = sheet.raw(self.active).to_owned();
+            } else {
+                self.select_cell(CellAddr::new(0, 0), false);
+            }
+            self.scroll_to_active = true;
+            self.set_status(if redo { "Redo" } else { "Undo" });
+        }
+    }
+
+    fn leave_formula(ctx: &Context) {
+        ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("calc_formula_input")));
     }
 
     fn new_sheet(&mut self) {
@@ -140,9 +257,9 @@ impl CalcApp {
     fn do_new_sheet(&mut self) {
         self.workbook = Workbook::new();
         self.file_path = None;
-        self.active = CellAddr::new(0, 0);
         self.editing = false;
-        self.edit_buf.clear();
+        self.select_cell(CellAddr::new(0, 0), false);
+        self.scroll_to_active = true;
         self.set_status("New spreadsheet");
     }
 
@@ -173,9 +290,9 @@ impl CalcApp {
             Ok(wb) => {
                 self.workbook = wb;
                 self.file_path = Some(path.clone());
-                self.active = CellAddr::new(0, 0);
                 self.editing = false;
-                self.edit_buf = self.workbook.active_sheet().raw(self.active).to_string();
+                self.select_cell(CellAddr::new(0, 0), false);
+                self.scroll_to_active = true;
                 self.set_status(format!("Opened {}", path.display()));
             }
             Err(e) => self.set_error(format!("Open failed: {e}")),
@@ -329,24 +446,56 @@ impl CalcApp {
                 for (i, name) in names.iter().enumerate() {
                     let selected = i == self.workbook.active;
                     if ui.selectable_label(selected, name).clicked() {
-                        self.workbook.set_active_sheet(i);
-                        self.select_cell(CellAddr::new(0, 0));
+                        self.switch_sheet(i);
                         ui.close();
                     }
                 }
                 ui.separator();
                 if ui.button("Add Sheet").clicked() {
-                    let n = self.workbook.sheet_count() + 1;
-                    self.workbook.add_sheet(format!("Sheet{n}"));
-                    self.select_cell(CellAddr::new(0, 0));
+                    self.add_sheet();
                     ui.close();
                 }
             });
             ui.menu_button("Edit", |ui| {
-                if ui.button("Clear Active Cell").clicked() {
-                    self.workbook.set_cell(self.active, "");
-                    self.edit_buf.clear();
-                    self.editing = false;
+                if ui
+                    .add_enabled(
+                        self.workbook.can_undo() || self.is_dirty() && self.editing,
+                        egui::Button::new("Undo    Ctrl+Z"),
+                    )
+                    .clicked()
+                {
+                    self.history(false);
+                    Self::leave_formula(ui.ctx());
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.workbook.can_redo(),
+                        egui::Button::new("Redo    Ctrl+Shift+Z"),
+                    )
+                    .clicked()
+                {
+                    self.history(true);
+                    Self::leave_formula(ui.ctx());
+                    ui.close();
+                }
+                ui.separator();
+                for (label, command) in [
+                    ("Copy    Ctrl+C", egui::ViewportCommand::RequestCopy),
+                    ("Cut    Ctrl+X", egui::ViewportCommand::RequestCut),
+                    ("Paste    Ctrl+V", egui::ViewportCommand::RequestPaste),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.commit_edit();
+                        Self::leave_formula(ui.ctx());
+                        ui.ctx().send_viewport_cmd(command);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear Selected Cells    Delete").clicked() {
+                    self.clear_selection();
+                    Self::leave_formula(ui.ctx());
                     ui.close();
                 }
             });
@@ -355,139 +504,286 @@ impl CalcApp {
 
     fn formula_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(self.active.to_a1()).strong().color(ACCENT));
+            ui.label(RichText::new(self.selection_label()).strong().color(ACCENT));
             ui.separator();
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.edit_buf)
-                    .desired_width(ui.available_width() - 80.0)
+                    .id(egui::Id::new("calc_formula_input"))
+                    .desired_width((ui.available_width() - 80.0).max(40.0))
                     .hint_text("value or =formula"),
             );
-            if response.gained_focus() {
+            if self.focus_formula {
+                response.request_focus();
+                self.focus_formula = false;
+            }
+            if response.gained_focus() || response.changed() {
                 self.editing = true;
             }
             if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 self.commit_edit();
+                self.move_active(0, 1, false);
             }
             if ui.button("✓").clicked() {
                 self.commit_edit();
+                Self::leave_formula(ui.ctx());
             }
             if ui.button("✗").clicked() {
                 self.cancel_edit();
-                self.edit_buf = self.workbook.active_sheet().raw(self.active).to_string();
+                Self::leave_formula(ui.ctx());
             }
         });
     }
 
     fn grid(&mut self, ui: &mut Ui) {
-        let cols = self.workbook.active_sheet().cols.min(40);
-        let rows = self.workbook.active_sheet().rows.min(80);
-        let active = self.active;
-
+        let cols = self.workbook.active_sheet().cols;
+        let rows = self.workbook.active_sheet().rows;
+        // Only paint the visible cells; imported/pasted sheets can exceed the
+        // old 40-column/80-row display limit without creating millions of widgets.
         egui::ScrollArea::both()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.allocate_exact_size(Vec2::new(HEADER_W, ROW_HEIGHT), Sense::hover());
-                    for c in 0..cols {
-                        let label = col_to_letters(c);
-                        let (rect, _) = ui
-                            .allocate_exact_size(Vec2::new(COL_WIDTH, ROW_HEIGHT), Sense::hover());
-                        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(230));
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            egui::FontId::proportional(12.0),
-                            Color32::DARK_GRAY,
-                        );
+            .show_viewport(ui, |ui, viewport| {
+                let size = Vec2::new(
+                    HEADER_W + cols as f32 * COL_WIDTH,
+                    (rows + 1) as f32 * ROW_HEIGHT,
+                );
+                let (grid_rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let origin = grid_rect.min;
+                let cells_rect = egui::Rect::from_min_max(
+                    origin + Vec2::new(HEADER_W, ROW_HEIGHT),
+                    grid_rect.max,
+                );
+                let response = ui.interact(
+                    cells_rect,
+                    egui::Id::new("calc_grid"),
+                    Sense::click_and_drag(),
+                );
+                let cell_at = |pos: egui::Pos2| {
+                    let offset = pos - origin - Vec2::new(HEADER_W, ROW_HEIGHT);
+                    CellAddr::new(
+                        (offset.x / COL_WIDTH).floor().clamp(0.0, (cols - 1) as f32) as u32,
+                        (offset.y / ROW_HEIGHT)
+                            .floor()
+                            .clamp(0.0, (rows - 1) as f32) as u32,
+                    )
+                };
+                if ui.is_enabled() {
+                    if response.contains_pointer() && ui.input(|i| i.pointer.primary_pressed()) {
+                        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            self.select_cell(cell_at(pos), ui.input(|i| i.modifiers.shift));
+                            Self::leave_formula(ui.ctx());
+                            self.dragging_range = true;
+                        }
                     }
-                });
-
-                for r in 0..rows {
-                    ui.horizontal(|ui| {
-                        let (hrect, _) =
-                            ui.allocate_exact_size(Vec2::new(HEADER_W, ROW_HEIGHT), Sense::hover());
-                        ui.painter()
-                            .rect_filled(hrect, 0.0, Color32::from_gray(230));
-                        ui.painter().text(
-                            hrect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            format!("{}", r + 1),
-                            egui::FontId::proportional(11.0),
-                            Color32::DARK_GRAY,
+                    if self.dragging_range && ui.input(|i| i.pointer.primary_down()) {
+                        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            self.select_cell(cell_at(pos), true);
+                        }
+                    } else {
+                        self.dragging_range = false;
+                    }
+                    if response.double_clicked() {
+                        self.begin_edit();
+                    }
+                }
+                if self.scroll_to_active {
+                    let min = origin
+                        + Vec2::new(
+                            HEADER_W + self.active.col as f32 * COL_WIDTH,
+                            (self.active.row + 1) as f32 * ROW_HEIGHT,
                         );
-
-                        for c in 0..cols {
-                            let addr = CellAddr::new(c, r);
-                            let display = self.workbook.active_sheet().display(addr);
-                            let is_active = addr == active;
-                            let (rect, response) = ui.allocate_exact_size(
-                                Vec2::new(COL_WIDTH, ROW_HEIGHT),
-                                Sense::click(),
-                            );
-                            let bg = if is_active {
-                                Color32::from_rgb(210, 230, 255)
-                            } else {
-                                Color32::WHITE
-                            };
-                            ui.painter().rect_filled(rect, 0.0, bg);
-                            ui.painter().rect_stroke(
-                                rect,
-                                0.0,
-                                egui::Stroke::new(1.0, Color32::from_gray(200)),
-                                egui::StrokeKind::Inside,
-                            );
-                            ui.painter().text(
+                    ui.scroll_to_rect(
+                        egui::Rect::from_min_size(min, Vec2::new(COL_WIDTH, ROW_HEIGHT)),
+                        None,
+                    );
+                    self.scroll_to_active = false;
+                }
+                let first_col = ((viewport.min.x - HEADER_W) / COL_WIDTH).floor().max(0.0) as u32;
+                let last_col =
+                    (((viewport.max.x - HEADER_W) / COL_WIDTH).ceil().max(0.0) as u32).min(cols);
+                let first_row = ((viewport.min.y - ROW_HEIGHT) / ROW_HEIGHT)
+                    .floor()
+                    .max(0.0) as u32;
+                let last_row =
+                    (((viewport.max.y - ROW_HEIGHT) / ROW_HEIGHT).ceil().max(0.0) as u32).min(rows);
+                let painter = ui.painter();
+                let selection = self.selection();
+                for col in first_col..last_col {
+                    let rect = egui::Rect::from_min_size(
+                        origin + Vec2::new(HEADER_W + col as f32 * COL_WIDTH, 0.0),
+                        Vec2::new(COL_WIDTH, ROW_HEIGHT),
+                    );
+                    painter.rect_filled(rect, 0.0, Color32::from_gray(230));
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        col_to_letters(col),
+                        egui::FontId::proportional(12.0),
+                        Color32::DARK_GRAY,
+                    );
+                }
+                for row in first_row..last_row {
+                    let top = origin.y + (row + 1) as f32 * ROW_HEIGHT;
+                    let header = egui::Rect::from_min_size(
+                        egui::pos2(origin.x, top),
+                        Vec2::new(HEADER_W, ROW_HEIGHT),
+                    );
+                    painter.rect_filled(header, 0.0, Color32::from_gray(230));
+                    painter.text(
+                        header.center(),
+                        egui::Align2::CENTER_CENTER,
+                        (row + 1).to_string(),
+                        egui::FontId::proportional(11.0),
+                        Color32::DARK_GRAY,
+                    );
+                    for col in first_col..last_col {
+                        let addr = CellAddr::new(col, row);
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(origin.x + HEADER_W + col as f32 * COL_WIDTH, top),
+                            Vec2::new(COL_WIDTH, ROW_HEIGHT),
+                        );
+                        let bg = if selection.contains(addr) {
+                            Color32::from_rgb(210, 230, 255)
+                        } else {
+                            Color32::WHITE
+                        };
+                        painter.rect_filled(rect, 0.0, bg);
+                        painter.rect_stroke(
+                            rect,
+                            0.0,
+                            egui::Stroke::new(1.0, Color32::from_gray(200)),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter
+                            .with_clip_rect(rect.intersect(ui.clip_rect()).shrink(2.0))
+                            .text(
                                 rect.left_center() + Vec2::new(4.0, 0.0),
                                 egui::Align2::LEFT_CENTER,
-                                display,
+                                self.workbook.active_sheet().display(addr),
                                 egui::FontId::proportional(13.0),
                                 Color32::BLACK,
                             );
-                            if response.clicked() {
-                                self.select_cell(addr);
-                            }
-                            if response.double_clicked() {
-                                self.select_cell(addr);
-                                self.begin_edit();
-                            }
+                        if addr == self.active {
+                            painter.rect_stroke(
+                                rect,
+                                0.0,
+                                egui::Stroke::new(2.0, ACCENT),
+                                egui::StrokeKind::Inside,
+                            );
                         }
-                    });
+                    }
                 }
             });
     }
 
     fn handle_keys(&mut self, ctx: &Context) {
-        let escape = ctx.input(|i| i.key_pressed(Key::Escape));
-        let left = ctx.input(|i| i.key_pressed(Key::ArrowLeft));
-        let right = ctx.input(|i| i.key_pressed(Key::ArrowRight));
-        let up = ctx.input(|i| i.key_pressed(Key::ArrowUp));
-        let down = ctx.input(|i| i.key_pressed(Key::ArrowDown));
-        let enter = ctx.input(|i| i.key_pressed(Key::Enter));
-        let f2 = ctx.input(|i| i.key_pressed(Key::F2));
-        let delete = ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace));
-        let wants_text = ctx.egui_wants_keyboard_input();
-
-        if wants_text && self.editing {
-            if escape {
+        let command = egui::Modifiers::COMMAND;
+        if ctx.input_mut(|i| i.consume_key(command | egui::Modifiers::SHIFT, Key::S)) {
+            self.save_file_as();
+        } else if ctx.input_mut(|i| i.consume_key(command, Key::S)) {
+            self.save_file();
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::N)) {
+            self.new_sheet();
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::O)) {
+            self.open_file();
+        }
+        if self.pending_action.is_some() {
+            return;
+        }
+        if ctx.egui_wants_keyboard_input() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                 self.cancel_edit();
-                self.edit_buf = self.workbook.active_sheet().raw(self.active).to_string();
+                Self::leave_formula(ctx);
             }
             return;
         }
-        if left {
-            self.move_active(-1, 0);
-        } else if right {
-            self.move_active(1, 0);
-        } else if up {
-            self.move_active(0, -1);
-        } else if down || enter {
-            self.move_active(0, 1);
-        } else if f2 {
-            self.begin_edit();
-        } else if delete {
-            self.workbook.set_cell(self.active, "");
-            self.edit_buf.clear();
+        let mut clipboard_events = Vec::new();
+        ctx.input_mut(|i| {
+            i.events.retain(|event| {
+                if matches!(
+                    event,
+                    egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+                ) {
+                    clipboard_events.push(event.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+        });
+        for event in clipboard_events {
+            match event {
+                egui::Event::Copy => self.copy_selection(ctx, false),
+                egui::Event::Cut => self.copy_selection(ctx, true),
+                egui::Event::Paste(text) => self.paste(&text),
+                _ => {}
+            }
+        }
+        let redo = ctx.input_mut(|i| {
+            i.consume_key(command | egui::Modifiers::SHIFT, Key::Z)
+                || i.consume_key(command, Key::Y)
+        });
+        if redo {
+            self.history(true);
+        } else if ctx.input_mut(|i| i.consume_key(command, Key::Z)) {
+            self.history(false);
+        } else if ctx.input_mut(|i| i.consume_key(command, Key::A)) {
+            self.commit_edit();
+            self.selection_anchor = CellAddr::new(0, 0);
+            self.selection_end = CellAddr::new(
+                self.workbook.active_sheet().cols - 1,
+                self.workbook.active_sheet().rows - 1,
+            );
+        } else {
+            let shift = ctx.input(|i| i.modifiers.shift);
+            let modifiers = if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            for (key, dx, dy) in [
+                (Key::ArrowLeft, -1, 0),
+                (Key::ArrowRight, 1, 0),
+                (Key::ArrowUp, 0, -1),
+                (Key::ArrowDown, 0, 1),
+            ] {
+                if ctx.input_mut(|i| i.consume_key(modifiers, key)) {
+                    self.move_active(dx, dy, shift);
+                    return;
+                }
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+                self.move_active(0, 1, false);
+            } else if ctx.input_mut(|i| i.consume_key(modifiers, Key::Tab)) {
+                self.move_active(if shift { -1 } else { 1 }, 0, false);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
+                self.begin_edit();
+            } else if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::Delete)
+                    || i.consume_key(egui::Modifiers::NONE, Key::Backspace)
+            }) {
+                self.clear_selection();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.cancel_edit();
+                self.select_cell(self.active, false);
+            } else {
+                let mut text = String::new();
+                ctx.input_mut(|i| {
+                    i.events.retain(|event| {
+                        if let egui::Event::Text(value) = event {
+                            text.push_str(value);
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                });
+                if !text.is_empty() {
+                    self.begin_edit();
+                    self.edit_buf = text;
+                }
+            }
         }
     }
 }
@@ -663,6 +959,246 @@ mod tests {
         app.begin_edit();
         assert!(!app.is_dirty());
         app.commit_edit();
+        assert!(!app.is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    fn key(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn input(
+        app: &mut CalcApp,
+        ctx: &Context,
+        mut events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> egui::FullOutput {
+        events.insert(0, egui::Event::ModifiersChanged(modifiers));
+        ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| app.handle_keys(ui.ctx()),
+        )
+    }
+
+    #[test]
+    fn clipboard_events_copy_paste_cut_and_undo_a_whole_range() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        app.select_cell(CellAddr::new(0, 0), false);
+        app.select_cell(CellAddr::new(2, 3), true);
+        let expected = app.workbook.copy_tsv(app.selection()).unwrap();
+        let output = input(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Copy],
+            egui::Modifiers::NONE,
+        );
+        assert!(output
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText(expected.clone())));
+        output.drop_without_applying_deltas();
+        assert!(!app.is_dirty());
+        app.select_cell(CellAddr::new(4, 0), false);
+        input(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Paste(expected.clone())],
+            egui::Modifiers::NONE,
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.selection_label(), "E1:G4");
+        assert_eq!(
+            app.workbook.active_sheet().raw(CellAddr::new(6, 3)),
+            "=B2*C2+B3*C3"
+        );
+        input(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Cut],
+            egui::Modifiers::NONE,
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(6, 3)), "");
+        app.history(false);
+        assert_eq!(app.workbook.copy_tsv(app.selection()).unwrap(), expected);
+        app.history(false);
+        assert!(!app.is_dirty());
+        assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(4, 0)), "");
+    }
+
+    #[test]
+    fn shift_arrows_expand_and_contract_across_the_anchor() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        app.select_cell(CellAddr::new(2, 2), false);
+        for key_code in [Key::ArrowLeft, Key::ArrowUp, Key::ArrowUp] {
+            input(
+                &mut app,
+                &ctx,
+                vec![key(key_code, egui::Modifiers::SHIFT)],
+                egui::Modifiers::SHIFT,
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(app.selection_label(), "B1:C3");
+        for key_code in [Key::ArrowDown, Key::ArrowDown, Key::ArrowDown] {
+            input(
+                &mut app,
+                &ctx,
+                vec![key(key_code, egui::Modifiers::SHIFT)],
+                egui::Modifiers::SHIFT,
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(app.selection_label(), "B3:C4");
+        input(
+            &mut app,
+            &ctx,
+            vec![key(Key::ArrowRight, egui::Modifiers::NONE)],
+            egui::Modifiers::NONE,
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(app.selection_label(), "C4");
+    }
+
+    #[test]
+    fn redo_shortcut_does_not_trigger_undo() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        app.paste("changed");
+        let command = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+        input(&mut app, &ctx, vec![key(Key::Z, command)], command).drop_without_applying_deltas();
+        assert!(!app.is_dirty());
+        let redo = command | egui::Modifiers::SHIFT;
+        input(&mut app, &ctx, vec![key(Key::Z, redo)], redo).drop_without_applying_deltas();
+        assert_eq!(app.edit_buf, "changed");
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn xlsx_save_reload_and_undo_preserve_pasted_formulas_and_saved_state() {
+        let mut app = CalcApp::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range.xlsx");
+        app.select_cell(CellAddr::new(0, 60), false);
+        app.paste("りんご\t3\t=SUM(B61:B62)\r\nみかん\t2\t\r\n");
+        assert!(app.save_to(&path));
+        let restored = load_xlsx_path(&path).unwrap();
+        assert_eq!(restored.active_sheet().raw(CellAddr::new(0, 60)), "りんご");
+        assert_eq!(
+            restored.active_sheet().raw(CellAddr::new(2, 60)),
+            "=SUM(B61:B62)"
+        );
+        assert_eq!(restored.active_sheet().display(CellAddr::new(2, 60)), "5");
+        assert!(!restored.is_dirty() && !restored.can_undo());
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+        assert_eq!(app.file_path.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn malformed_paste_preserves_selection_values_and_history() {
+        let mut app = CalcApp::new();
+        app.select_cell(CellAddr::new(2, 3), false);
+        let selection = app.selection();
+        app.paste("\"unterminated");
+        assert!(app.last_error.as_ref().unwrap().contains("Paste failed"));
+        assert_eq!(app.selection(), selection);
+        assert_eq!(app.edit_buf, "=B2*C2+B3*C3");
+        assert!(!app.is_dirty() && !app.workbook.can_undo());
+    }
+
+    #[test]
+    fn sheet_changes_commit_drafts_to_the_original_sheet() {
+        let mut app = CalcApp::new();
+        app.begin_edit();
+        app.edit_buf = "first draft".into();
+        app.add_sheet();
+        assert_eq!(
+            app.workbook.sheets[0].raw(CellAddr::new(0, 0)),
+            "first draft"
+        );
+        assert_eq!(app.edit_buf, "");
+        app.begin_edit();
+        app.edit_buf = "second draft".into();
+        app.switch_sheet(0);
+        assert_eq!(
+            app.workbook.sheets[1].raw(CellAddr::new(0, 0)),
+            "second draft"
+        );
+        app.history(false);
+        assert_eq!(app.workbook.active, 1);
+        assert_eq!(app.edit_buf, "");
+        app.history(false);
+        assert_eq!(app.workbook.sheet_count(), 1);
+        assert_eq!(app.edit_buf, "first draft");
+        app.history(false);
+        assert_eq!(app.edit_buf, "Item");
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn clipboard_stays_in_the_formula_bar_after_saving_a_draft() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        app.begin_edit();
+        app.edit_buf = "saved".into();
+        for _ in 0..2 {
+            ctx.run_ui(egui::RawInput::default(), |ui| app.formula_bar(ui))
+                .drop_without_applying_deltas();
+        }
+        assert!(ctx.egui_wants_keyboard_input());
+        assert!(app.save_to(&dir.path().join("formula.xlsx")));
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Paste("more\ttext".into())],
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_keys(ui.ctx());
+                app.formula_bar(ui);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(app.edit_buf.contains("more"));
+        assert_eq!(
+            app.workbook.active_sheet().raw(CellAddr::new(0, 0)),
+            "saved"
+        );
+        assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(1, 0)), "Qty");
+        assert_eq!(app.selection_label(), "A1");
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn draft_saved_in_formula_bar_can_be_undone_and_redone() {
+        let mut app = CalcApp::new();
+        let dir = tempfile::tempdir().unwrap();
+        app.begin_edit();
+        app.edit_buf = "saved draft".into();
+        assert!(app.save_to(&dir.path().join("draft.xlsx")));
+        app.history(false);
+        assert_eq!(app.edit_buf, "Item");
+        assert!(app.is_dirty());
+        app.history(true);
+        assert_eq!(app.edit_buf, "saved draft");
         assert!(!app.is_dirty());
     }
 }

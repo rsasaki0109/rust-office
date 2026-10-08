@@ -57,6 +57,8 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 
 * Sparse grid UI, A1 refs, `+ − * /`, `SUM` / `AVERAGE` / `MIN` / `MAX` / `IF` / `COUNT`
 * CSV + XLSX open/save (multi-sheet)
+* Rectangular selection (drag / Shift+arrow / Shift+click), tabular copy/cut/paste
+* Undo/Redo for cell edits, range operations and adding sheets; save state tracking
 
 ### Impress
 

@@ -88,6 +88,10 @@ Not yet:
 * Named styles beyond Normal/Heading 1–3; custom user style registry
 * Layout PDF glyph metrics still approximate (egui ≠ embedded PDF fonts)
 * Calc: charting / pivot not started; formula set still limited vs Excel
+* Calc copies raw values/formulas as tab-separated text. Formula references are
+  preserved verbatim rather than adjusted relative to the destination. Formatting
+  is not exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
+  per operation and XLSX worksheet bounds; history retains the latest 100 operations.
 * Impress: shapes beyond title+body / animations not started
 * Packaging: CI builds Linux binary; no signed macOS/Windows installers yet
 
@@ -96,3 +100,19 @@ Not yet:
 1. True DOCX `sectPr` / ODT master-page section styles
 2. Win/macOS packaging artifacts + accessibility tree stubs
 3. Calc charting MVP / Impress richer shapes
+
+## Calc editing
+
+Drag across cells, Shift+click, or use Shift+arrow keys to select a rectangle.
+Ctrl/Cmd+C, X and V copy, cut and paste tables (including quoted fields and
+Windows line endings). Blank fields overwrite destination cells. Paste starts
+at the top-left corner of the selection. Delete clears the selected range.
+The Edit menu provides the same clipboard actions. While the formula bar has
+focus, text editing and its clipboard shortcuts apply to that single cell.
+
+Ctrl/Cmd+Z undoes a cell edit, a whole paste/clear, or adding a sheet.
+Ctrl/Cmd+Shift+Z (also Ctrl/Cmd+Y) redoes it. Saving retains history; returning
+to the saved revision removes the unsaved marker. A new edit after Undo drops
+the redo branch. Opening or creating a workbook resets history.
+F2 or double-click focuses the formula bar; typing on the grid starts a new
+cell value. Enter commits it and moves down; Escape cancels the draft.
