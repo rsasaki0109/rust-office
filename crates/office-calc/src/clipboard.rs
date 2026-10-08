@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::addr::CellRange;
+use crate::delimited::{self, Format, ParseError};
 
 pub const MAX_SHEET_ROWS: u32 = 1_048_576;
 pub const MAX_SHEET_COLS: u32 = 16_384;
@@ -34,64 +35,19 @@ pub(crate) fn validate_range(range: CellRange) -> Result<CellRange, ClipboardErr
 }
 
 pub(crate) fn parse_tsv(text: &str) -> Result<Vec<Vec<String>>, ClipboardError> {
-    let mut rows = Vec::new();
-    let mut row = Vec::new();
-    let mut field = String::new();
-    let mut quoted = false;
-    let mut after_quote = false;
-    let mut field_start = true;
-    let mut cell_count = 0u64;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if quoted {
-            if ch == '"' {
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    field.push('"');
-                } else {
-                    quoted = false;
-                    after_quote = true;
-                }
-            } else {
-                field.push(ch);
-            }
-            continue;
-        }
-        if ch == '"' && field_start {
-            quoted = true;
-            field_start = false;
-        } else if ch == '\t' || ch == '\n' || ch == '\r' {
-            cell_count += 1;
-            if cell_count > MAX_CLIPBOARD_CELLS {
-                return Err(ClipboardError::TooLarge);
-            }
-            row.push(std::mem::take(&mut field));
-            field_start = true;
-            after_quote = false;
-            if ch != '\t' {
-                if ch == '\r' && chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                rows.push(std::mem::take(&mut row));
-            }
-        } else if after_quote {
-            return Err(ClipboardError::InvalidQuote);
-        } else {
-            field.push(ch);
-            field_start = false;
-        }
-    }
-    if quoted {
-        return Err(ClipboardError::UnterminatedQuote);
-    }
-    // One final line delimiter is a terminator, not an additional empty row.
-    if !field_start || !row.is_empty() || rows.is_empty() {
-        if cell_count >= MAX_CLIPBOARD_CELLS {
-            return Err(ClipboardError::TooLarge);
-        }
-        row.push(field);
-        rows.push(row);
-    }
+    let mut rows = delimited::parse_records(
+        text,
+        Format {
+            delimiter: '\t',
+            max_fields: MAX_CLIPBOARD_CELLS,
+            allow_unquoted_quotes: true,
+        },
+    )
+    .map_err(|error| match error {
+        ParseError::UnterminatedQuote { .. } => ClipboardError::UnterminatedQuote,
+        ParseError::InvalidQuote { .. } => ClipboardError::InvalidQuote,
+        ParseError::TooLarge => ClipboardError::TooLarge,
+    })?;
     let width = rows.iter().map(Vec::len).max().unwrap_or(1);
     if (rows.len() as u64) * (width as u64) > MAX_CLIPBOARD_CELLS {
         return Err(ClipboardError::TooLarge);
@@ -146,5 +102,11 @@ mod tests {
     fn sparse_ragged_table_is_limited_before_padding() {
         let text = format!("{}\n{}", "\t".repeat(1_000), "x\n".repeat(1_000));
         assert_eq!(parse_tsv(&text), Err(ClipboardError::TooLarge));
+    }
+
+    #[test]
+    fn unquoted_clipboard_formulas_keep_their_string_literals() {
+        let formula = "=IF(1,\"日本語\",\"none\")";
+        assert_eq!(parse_tsv(formula).unwrap(), vec![vec![formula]]);
     }
 }

@@ -8,6 +8,7 @@ mod addr;
 mod cell;
 mod clipboard;
 mod csv;
+mod delimited;
 mod formula;
 mod reference;
 mod sheet;

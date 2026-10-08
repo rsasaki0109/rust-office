@@ -36,6 +36,11 @@ Run these checks before submitting changes:
 * Imported spreadsheet error values become constant error formulas (for example,
   `=#REF!`) in the raw-input model. Their tokens and error propagation survive
   XLSX save/reload; they are exported as formulas rather than standalone error cells.
+* CSV imports support quoted multiline cells, doubled quotes, LF/CRLF/CR record
+  endings, ragged rows and a leading UTF-8 BOM. Embedded line endings remain part
+  of the cell value. Blank records retain row positions, and whitespace-only
+  values are protected as literal text. Invalid quotes report the logical record
+  and field; imports beyond XLSX worksheet row/column limits fail.
 * After importing a PPTX, Impress Save opens Save As for a native JSON file, preserving
   the source PPTX. Export PPTX remains a separate operation with MVP format coverage.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
@@ -117,6 +122,12 @@ Not yet:
 3. Calc charting MVP / Impress richer shapes
 
 ## Calc editing
+
+The CSV library API `load_csv_str` returns `Result<Workbook, CsvError>`, matching
+`load_csv_path`, so callers can handle parse errors instead of accepting partial data.
+CSV and TSV share the quoted-field parser. CSV requires quotes to enclose a whole
+field; TSV keeps accepting unquoted formula text containing string literals and
+retains its existing cell-count limit and rectangular padding.
 
 Drag across cells, Shift+click, or use Shift+arrow keys to select a rectangle.
 Ctrl/Cmd+C, X and V copy, cut and paste tables (including quoted fields and
