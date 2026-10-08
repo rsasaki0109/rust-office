@@ -1685,14 +1685,23 @@ mod tests {
 
     #[test]
     fn failed_docx_open_retains_document_selection_history_and_unsaved_edits() {
+        assert_failed_writer_open_retains_state("docx", "word/document.xml");
+    }
+
+    #[test]
+    fn failed_odt_open_retains_document_selection_history_and_unsaved_edits() {
+        assert_failed_writer_open_retains_state("odt", "content.xml");
+    }
+
+    fn assert_failed_writer_open_retains_state(extension: &str, missing_part: &str) {
         let dir = tempfile::tempdir().unwrap();
-        let bad = dir.path().join("broken.docx");
+        let bad = dir.path().join(format!("broken.{extension}"));
         std::fs::write(&bad, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
         let mut app = WriterApp::new();
         app.editor.new_document();
         app.editor.insert_text("keep").unwrap();
         app.editor.insert_text(" edits").unwrap();
-        app.file_path = Some(dir.path().join("original.docx"));
+        app.file_path = Some(dir.path().join(format!("original.{extension}")));
         app.preferred_caret_x = Some(123.0);
         let text = app.editor.document().plain_text();
         let selection = app.editor.selection();
@@ -1703,11 +1712,7 @@ mod tests {
         assert_eq!(app.file_path, path);
         assert_eq!(app.preferred_caret_x, Some(123.0));
         assert!(app.is_dirty());
-        assert!(app
-            .last_error
-            .as_ref()
-            .unwrap()
-            .contains("word/document.xml"));
+        assert!(app.last_error.as_ref().unwrap().contains(missing_part));
         assert!(app.editor.undo());
         assert_eq!(app.editor.document().plain_text(), "keep");
         assert!(app.editor.redo());
