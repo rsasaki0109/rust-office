@@ -88,9 +88,8 @@ Not yet:
 * Named styles beyond Normal/Heading 1–3; custom user style registry
 * Layout PDF glyph metrics still approximate (egui ≠ embedded PDF fonts)
 * Calc: charting / pivot not started; formula set still limited vs Excel
-* Calc copies raw values/formulas as tab-separated text. Formula references are
-  preserved verbatim rather than adjusted relative to the destination. Formatting
-  is not exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
+* Calc copies raw values/formulas as tab-separated text. Formatting is not
+  exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.
 * Impress: shapes beyond title+body / animations not started
 * Packaging: CI builds Linux binary; no signed macOS/Windows installers yet
@@ -116,3 +115,20 @@ to the saved revision removes the unsaved marker. A new edit after Undo drops
 the redo branch. Opening or creating a workbook resets history.
 F2 or double-click focuses the formula bar; typing on the grid starts a new
 cell value. Enter commits it and moves down; Escape cancels the draft.
+
+Copying a cell range within the current Calc workbook adjusts formula references
+by the displacement from the copied top-left cell to the pasted top-left cell.
+For example, copying D2's `=B2*C2` to D3 produces `=B3*C3`. `$A$1` fixes both
+axes, `$A1` fixes the column, and `A$1` fixes the row. Both endpoints of ranges
+are adjusted. String literals, function names and structured-reference contents
+are preserved. A reference (or range endpoint) leaving XLSX bounds becomes
+`#REF!`, which propagates through evaluation and survives XLSX round-trips.
+
+The native clipboard carries unchanged TSV plus an HTML marker identifying the
+captured copy in this Calc session. Matching plain text alone never authorizes
+formula translation. Cut, external/plain-text paste and formula-bar editing keep
+formulas verbatim. New/Open clears the retained copy context. If the platform
+cannot exchange HTML clipboard data, plain-text copy/paste remains available
+without reference translation. Sheet-qualified references can be translated,
+but evaluating cross-sheet formulas, named ranges and structured references is
+still outside the current formula engine.
