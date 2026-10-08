@@ -8,6 +8,7 @@ use crate::sheet::Sheet;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
+    Error(CalcError),
     Number(f64),
     Text(String),
     Ref(CellAddr),
@@ -132,6 +133,7 @@ impl<'a> Parser<'a> {
                 Ok(e)
             }
             Some(b'"') => self.parse_string(),
+            Some(b'#') => self.parse_error(),
             Some(c) if c.is_ascii_digit() || c == b'.' => self.parse_number(),
             Some(c) if c.is_ascii_alphabetic() || c == b'$' => self.parse_ident_or_ref(),
             _ => Err(CalcError::Value),
@@ -142,12 +144,36 @@ impl<'a> Parser<'a> {
         if self.bump() != Some(b'"') {
             return Err(CalcError::Value);
         }
-        let mut out = String::new();
+        let mut out = Vec::new();
         while let Some(c) = self.bump() {
             if c == b'"' {
-                return Ok(Expr::Text(out));
+                if self.peek() == Some(b'"') {
+                    self.bump();
+                    out.push(b'"');
+                    continue;
+                }
+                return String::from_utf8(out)
+                    .map(Expr::Text)
+                    .map_err(|_| CalcError::Value);
             }
-            out.push(c as char);
+            out.push(c);
+        }
+        Err(CalcError::Value)
+    }
+
+    fn parse_error(&mut self) -> Result<Expr, CalcError> {
+        for error in [
+            CalcError::Ref,
+            CalcError::Value,
+            CalcError::Div0,
+            CalcError::Cycle,
+            CalcError::Name,
+        ] {
+            let token = error.to_string();
+            if self.src[self.i..].starts_with(token.as_bytes()) {
+                self.i += token.len();
+                return Ok(Expr::Error(error));
+            }
         }
         Err(CalcError::Value)
     }
@@ -205,7 +231,8 @@ impl<'a> Parser<'a> {
             ) {
                 self.i += 1;
             }
-            let end = std::str::from_utf8(&self.src[end_start..self.i]).map_err(|_| CalcError::Value)?;
+            let end =
+                std::str::from_utf8(&self.src[end_start..self.i]).map_err(|_| CalcError::Value)?;
             let range = parse_a1_range(&format!("{ident}:{end}")).map_err(|_| CalcError::Ref)?;
             return Ok(Expr::Range(range));
         }
@@ -227,11 +254,7 @@ pub fn evaluate_formula(sheet: &Sheet, body: &str, origin: CellAddr) -> Value {
     value
 }
 
-pub(crate) fn eval_body(
-    sheet: &Sheet,
-    body: &str,
-    visiting: &mut HashSet<CellAddr>,
-) -> Value {
+pub(crate) fn eval_body(sheet: &Sheet, body: &str, visiting: &mut HashSet<CellAddr>) -> Value {
     match Parser::new(body).parse() {
         Ok(expr) => eval_expr(sheet, &expr, visiting),
         Err(e) => Value::Error(e),
@@ -240,6 +263,7 @@ pub(crate) fn eval_body(
 
 fn eval_expr(sheet: &Sheet, expr: &Expr, visiting: &mut HashSet<CellAddr>) -> Value {
     match expr {
+        Expr::Error(error) => Value::Error(*error),
         Expr::Number(n) => Value::Number(*n),
         Expr::Text(t) => Value::Text(t.clone()),
         Expr::Ref(addr) => eval_cell(sheet, *addr, visiting),
@@ -274,12 +298,7 @@ fn eval_expr(sheet: &Sheet, expr: &Expr, visiting: &mut HashSet<CellAddr>) -> Va
     }
 }
 
-fn eval_call(
-    sheet: &Sheet,
-    name: &str,
-    args: &[Expr],
-    visiting: &mut HashSet<CellAddr>,
-) -> Value {
+fn eval_call(sheet: &Sheet, name: &str, args: &[Expr], visiting: &mut HashSet<CellAddr>) -> Value {
     match name {
         "SUM" => {
             let mut sum = 0.0;
@@ -450,5 +469,26 @@ mod tests {
         sheet.set_raw(CellAddr::new(0, 0), "=A2");
         sheet.set_raw(CellAddr::new(0, 1), "=A1");
         assert_eq!(sheet.display(CellAddr::new(0, 0)), "#CYCLE!");
+    }
+}
+
+#[cfg(test)]
+mod literal_tests {
+    use super::*;
+
+    #[test]
+    fn ref_errors_propagate_but_do_not_evaluate_unused_if_branches() {
+        let sheet = Sheet::new("Sheet1");
+        let origin = CellAddr::new(0, 0);
+        for body in ["#REF!+1", "SUM(#REF!)", "IF(1,#REF!,3)"] {
+            assert_eq!(
+                evaluate_formula(&sheet, body, origin),
+                Value::Error(CalcError::Ref)
+            );
+        }
+        assert_eq!(
+            evaluate_formula(&sheet, "IF(0,#REF!,\"日本語 \"\"A1\"\"\")", origin),
+            Value::Text("日本語 \"A1\"".into())
+        );
     }
 }

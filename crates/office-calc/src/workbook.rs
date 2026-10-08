@@ -147,6 +147,23 @@ impl Workbook {
     }
 
     pub fn paste_tsv(&mut self, start: CellAddr, text: &str) -> Result<CellRange, ClipboardError> {
+        self.paste_tsv_with_origin(start, text, None)
+    }
+
+    /// Paste a captured table as one edit. A known copy origin translates formula
+    /// references; external text and cut operations pass `None` to preserve them.
+    pub fn paste_tsv_with_origin(
+        &mut self,
+        start: CellAddr,
+        text: &str,
+        source: Option<CellAddr>,
+    ) -> Result<CellRange, ClipboardError> {
+        if let Some(source) = source {
+            clipboard::validate_range(CellRange {
+                start: source,
+                end: source,
+            })?;
+        }
         let rows = clipboard::parse_tsv(text)?;
         let end = CellAddr::new(
             start
@@ -163,7 +180,10 @@ impl Workbook {
             values.into_iter().enumerate().map(move |(col, value)| {
                 (
                     CellAddr::new(start.col + col as u32, start.row + row as u32),
-                    value,
+                    match source {
+                        Some(source) => crate::translate_formula(&value, source, start),
+                        None => value,
+                    },
                 )
             })
         }));
@@ -483,5 +503,82 @@ mod tests {
         }
         assert!(!book.redo());
         assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "104");
+    }
+}
+
+#[cfg(test)]
+mod copy_reference_tests {
+    use super::*;
+    use crate::{MAX_SHEET_COLS, MAX_SHEET_ROWS};
+
+    #[test]
+    fn copied_table_translates_each_formula_as_one_undoable_operation() {
+        let mut book = Workbook::new();
+        let source = CellAddr::new(3, 1);
+        book.paste_tsv(source, "=B2*C2\t=$B$2+$B2+B$2\n=SUM(B2:C3)\ttext A1")
+            .unwrap();
+        book.mark_clean();
+        book.clear_history();
+        let text = book
+            .copy_tsv(CellRange {
+                start: source,
+                end: CellAddr::new(4, 2),
+            })
+            .unwrap();
+        let dest = CellAddr::new(5, 4);
+        book.paste_tsv_with_origin(dest, &text, Some(source))
+            .unwrap();
+        assert_eq!(book.active_sheet().raw(dest), "=D5*E5");
+        assert_eq!(
+            book.active_sheet().raw(CellAddr::new(6, 4)),
+            "=$B$2+$B5+D$2"
+        );
+        assert_eq!(book.active_sheet().raw(CellAddr::new(5, 5)), "=SUM(D5:E6)");
+        assert_eq!(book.active_sheet().raw(CellAddr::new(6, 5)), "text A1");
+        assert!(book.undo());
+        assert!(!book.is_dirty() && !book.can_undo());
+        assert_eq!(book.active_sheet().raw(dest), "");
+        assert!(book.redo());
+        assert_eq!(book.active_sheet().raw(dest), "=D5*E5");
+    }
+
+    #[test]
+    fn copying_beyond_reference_bounds_propagates_ref_errors_and_can_be_undone() {
+        let mut book = Workbook::new();
+        let source = CellAddr::new(1, 1);
+        book.set_cell(source, "=SUM(A1:B2)+$A$1");
+        book.mark_clean();
+        book.clear_history();
+        book.paste_tsv_with_origin(CellAddr::new(0, 0), "=SUM(A1:B2)+$A$1", Some(source))
+            .unwrap();
+        assert_eq!(
+            book.active_sheet().raw(CellAddr::new(0, 0)),
+            "=SUM(#REF!)+$A$1"
+        );
+        assert_eq!(book.active_sheet().display(CellAddr::new(0, 0)), "#REF!");
+        book.undo();
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "");
+        assert!(!book.is_dirty());
+    }
+
+    #[test]
+    fn invalid_copy_paste_does_not_change_the_workbook_or_history() {
+        let mut book = Workbook::new();
+        for (destination, text, source) in [
+            (CellAddr::new(0, 0), "=A1", CellAddr::new(MAX_SHEET_COLS, 0)),
+            (CellAddr::new(0, 0), "=A1", CellAddr::new(0, MAX_SHEET_ROWS)),
+            (
+                CellAddr::new(MAX_SHEET_COLS - 1, 0),
+                "=A1\t=B1",
+                CellAddr::new(0, 0),
+            ),
+            (CellAddr::new(0, 0), "\"unfinished", CellAddr::new(1, 1)),
+        ] {
+            assert!(book
+                .paste_tsv_with_origin(destination, text, Some(source))
+                .is_err());
+            assert!(!book.is_dirty() && !book.can_undo());
+            assert_eq!(book.active_sheet().occupied().count(), 0);
+        }
     }
 }

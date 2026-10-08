@@ -9,6 +9,7 @@ use office_calc::{
     CellRange, Workbook,
 };
 
+use crate::calc_clipboard::CopiedCells;
 use crate::theme::{ACCENT, CANVAS_BG, STATUS_BG, TOOLBAR_BG};
 use crate::unsaved::{self, Choice, DocumentAction};
 
@@ -24,6 +25,9 @@ pub enum SwitchTo {
 }
 
 pub struct CalcApp {
+    copied_cells: Option<CopiedCells>,
+    clipboard: Option<arboard::Clipboard>,
+    copy_pending: bool,
     workbook: Workbook,
     file_path: Option<PathBuf>,
     active: CellAddr,
@@ -62,6 +66,9 @@ impl CalcApp {
         let edit_buf = workbook.active_sheet().raw(CellAddr::new(0, 0)).to_owned();
 
         Self {
+            copied_cells: None,
+            clipboard: None,
+            copy_pending: false,
             workbook,
             file_path: None,
             active: CellAddr::new(0, 0),
@@ -189,9 +196,27 @@ impl CalcApp {
     }
 
     fn paste(&mut self, text: &str) {
+        let html = if self.copied_cells.is_some() {
+            self.clipboard
+                .as_mut()
+                .and_then(|clipboard| clipboard.get().html().ok())
+        } else {
+            None
+        };
+        self.paste_with_html(text, html.as_deref());
+    }
+
+    fn paste_with_html(&mut self, text: &str, html: Option<&str>) {
         self.commit_edit();
+        let origin = self
+            .copied_cells
+            .as_ref()
+            .and_then(|copy| copy.origin_for(text, html));
         // The model validates the entire table before changing any cells.
-        match self.workbook.paste_tsv(self.selection().start, text) {
+        match self
+            .workbook
+            .paste_tsv_with_origin(self.selection().start, text, origin)
+        {
             Ok(range) => {
                 self.editing = false;
                 self.active = range.start;
@@ -209,7 +234,9 @@ impl CalcApp {
         self.commit_edit();
         match self.workbook.copy_tsv(self.selection()) {
             Ok(text) => {
-                ctx.copy_text(text);
+                ctx.copy_text(text.clone());
+                self.copied_cells = Some(CopiedCells::new(text, self.selection().start, cut));
+                self.copy_pending = true;
                 if cut {
                     self.clear_selection();
                 } else {
@@ -218,6 +245,51 @@ impl CalcApp {
             }
             Err(error) => self.set_error(format!("Copy failed: {error}")),
         }
+    }
+
+    fn publish_copy(&mut self, ctx: &Context) {
+        if !std::mem::take(&mut self.copy_pending) {
+            return;
+        }
+        let Some(copy) = &self.copied_cells else {
+            return;
+        };
+        let latest_is_copy = ctx.output(|output| {
+            output.commands.iter().rev().find_map(|command| {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    Some(text == &copy.text)
+                } else {
+                    None
+                }
+            }) == Some(true)
+        });
+        if !latest_is_copy {
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if let Some(clipboard) = &mut self.clipboard {
+            let html = copy.html();
+            if clipboard
+                .set_html(html.as_str(), Some(copy.text.as_str()))
+                .is_ok()
+            {
+                // Prevent egui's later plain-text write from removing provenance.
+                ctx.output_mut(|output| {
+                    output
+                        .commands
+                        .retain(|command| !matches!(command, egui::OutputCommand::CopyText(_)));
+                });
+            }
+        }
+        // If native HTML is unavailable, egui still publishes the plain text;
+        // a subsequent paste has no verified origin and preserves formulas.
+    }
+
+    fn reset_copy(&mut self) {
+        self.copied_cells = None;
+        self.copy_pending = false;
     }
 
     fn history(&mut self, redo: bool) {
@@ -255,6 +327,7 @@ impl CalcApp {
     }
 
     fn do_new_sheet(&mut self) {
+        self.reset_copy();
         self.workbook = Workbook::new();
         self.file_path = None;
         self.editing = false;
@@ -288,6 +361,7 @@ impl CalcApp {
         };
         match result {
             Ok(wb) => {
+                self.reset_copy();
                 self.workbook = wb;
                 self.file_path = Some(path.clone());
                 self.editing = false;
@@ -692,6 +766,14 @@ impl CalcApp {
             return;
         }
         if ctx.egui_wants_keyboard_input() {
+            if ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Copy | egui::Event::Cut))
+            }) {
+                self.reset_copy();
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                 self.cancel_edit();
                 Self::leave_formula(ctx);
@@ -842,6 +924,7 @@ impl App for CalcApp {
             .show(ui, |ui| {
                 self.grid(ui);
             });
+        self.publish_copy(&ctx);
     }
 }
 
@@ -1200,5 +1283,126 @@ mod range_tests {
         app.history(true);
         assert_eq!(app.edit_buf, "saved draft");
         assert!(!app.is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    fn copy(app: &mut CalcApp, cut: bool) -> (String, String) {
+        let ctx = Context::default();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.copy_selection(ui.ctx(), cut)
+        })
+        .drop_without_applying_deltas();
+        let copied = app.copied_cells.as_ref().unwrap();
+        (copied.text.clone(), copied.html())
+    }
+
+    #[test]
+    fn copied_formulas_recalculate_and_survive_history_save_and_reload() {
+        let mut app = CalcApp::new();
+        let dir = tempfile::tempdir().unwrap();
+        app.select_cell(CellAddr::new(0, 0), false);
+        app.select_cell(CellAddr::new(2, 3), true);
+        let (text, html) = copy(&mut app, false);
+        app.select_cell(CellAddr::new(4, 0), false);
+        app.paste_with_html(&text, Some(&html));
+        let total = CellAddr::new(6, 3);
+        assert_eq!(app.workbook.active_sheet().raw(total), "=F2*G2+F3*G3");
+        assert_eq!(app.workbook.active_sheet().display(total), "5.2");
+        app.history(false);
+        assert!(!app.is_dirty());
+        app.history(true);
+        let path = dir.path().join("copied.xlsx");
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.active_sheet().raw(total), "=F2*G2+F3*G3");
+        assert_eq!(loaded.active_sheet().display(total), "5.2");
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn repeated_paste_uses_the_captured_original_not_edited_source_cells() {
+        let mut app = CalcApp::new();
+        app.select_cell(CellAddr::new(2, 3), false);
+        let (text, html) = copy(&mut app, false);
+        app.workbook.set_cell(app.active, "=100");
+        for (destination, expected) in [
+            (CellAddr::new(3, 4), "=C3*D3+C4*D4"),
+            (CellAddr::new(4, 5), "=D4*E4+D5*E5"),
+        ] {
+            app.select_cell(destination, false);
+            app.paste_with_html(&text, Some(&html));
+            assert_eq!(app.workbook.active_sheet().raw(destination), expected);
+        }
+    }
+
+    #[test]
+    fn external_identical_text_and_cut_pastes_keep_formulas_verbatim() {
+        for cut in [false, true] {
+            let mut app = CalcApp::new();
+            app.select_cell(CellAddr::new(2, 3), false);
+            let (text, html) = copy(&mut app, cut);
+            app.select_cell(CellAddr::new(4, 5), false);
+            app.paste_with_html(&text, if cut { Some(&html) } else { None });
+            assert_eq!(app.workbook.active_sheet().raw(app.active), "=B2*C2+B3*C3");
+        }
+    }
+
+    #[test]
+    fn new_workbooks_and_formula_bar_copy_invalidate_range_provenance() {
+        let mut app = CalcApp::new();
+        app.select_cell(CellAddr::new(2, 3), false);
+        let (text, html) = copy(&mut app, false);
+        app.do_new_sheet();
+        app.select_cell(CellAddr::new(4, 5), false);
+        app.paste_with_html(&text, Some(&html));
+        assert_eq!(app.workbook.active_sheet().raw(app.active), "=B2*C2+B3*C3");
+        copy(&mut app, false);
+        let ctx = Context::default();
+        app.begin_edit();
+        for _ in 0..2 {
+            ctx.run_ui(egui::RawInput::default(), |ui| app.formula_bar(ui))
+                .drop_without_applying_deltas();
+        }
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_keys(ui.ctx());
+                app.formula_bar(ui);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(app.copied_cells.is_none());
+    }
+
+    #[test]
+    fn copied_ref_errors_survive_xlsx_save_reload() {
+        let mut app = CalcApp::new();
+        app.select_cell(CellAddr::new(1, 1), false);
+        app.paste("=SUM(A1:B2)+$A$1");
+        let (text, html) = copy(&mut app, false);
+        app.select_cell(CellAddr::new(0, 0), false);
+        app.paste_with_html(&text, Some(&html));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref-error.xlsx");
+        assert!(app.save_to(&path));
+        let restored = load_xlsx_path(&path).unwrap();
+        assert_eq!(
+            restored.active_sheet().raw(CellAddr::new(0, 0)),
+            "=SUM(#REF!)+$A$1"
+        );
+        assert_eq!(
+            restored.active_sheet().display(CellAddr::new(0, 0)),
+            "#REF!"
+        );
     }
 }
