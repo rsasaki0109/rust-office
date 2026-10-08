@@ -2,6 +2,10 @@
 
 mod read;
 mod write;
+mod xml;
+
+#[cfg(test)]
+mod tests;
 
 use std::io::{Cursor, Read, Write};
 
@@ -12,7 +16,11 @@ use crate::{DocumentFormat, FormatError};
 pub use read::{parse_document_parts, parse_document_xml, MediaMap, MediaPart};
 pub use write::build_document_xml;
 
-use read::{mime_for_media_path, parse_typed_rels, word_part_path};
+use read::{
+    document_references, mime_for_media_path, parse_hf_paragraph, parse_typed_rels,
+    resolve_reference, word_part_path, ReferenceKind,
+};
+use xml::{invalid, part_error};
 
 /// DOCX (OOXML Word) backend (ZIP package).
 #[derive(Debug, Default, Clone, Copy)]
@@ -27,53 +35,69 @@ impl DocxFormat {
         let cursor = Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(FormatError::from)?;
 
-        let mut document_xml = String::new();
-        {
-            let mut file = archive.by_name("word/document.xml").map_err(|_| {
-                FormatError::InvalidDocument("DOCX missing word/document.xml".into())
-            })?;
-            file.read_to_string(&mut document_xml)?;
-        }
-
-        let mut rels = String::new();
-        if let Ok(mut file) = archive.by_name("word/_rels/document.xml.rels") {
-            let _ = file.read_to_string(&mut rels);
-        }
-
-        let typed = parse_typed_rels(&rels);
-
+        let document_xml = read_zip_string(&mut archive, "word/document.xml")?;
+        let references = document_references(&document_xml)?;
+        let rels = read_optional_zip_bytes(&mut archive, "word/_rels/document.xml.rels")?
+            .map(|bytes| utf8_part(bytes, "word/_rels/document.xml.rels"))
+            .transpose()?;
+        let typed = rels
+            .as_deref()
+            .map(parse_typed_rels)
+            .transpose()?
+            .unwrap_or_default();
         let mut media = MediaMap::new();
-        for (id, target) in &typed.images {
-            let path = word_part_path(target);
-            if let Ok(mut file) = archive.by_name(&path) {
-                let mut data = Vec::new();
-                if file.read_to_end(&mut data).is_ok() {
+        let mut header: Option<(bool, String)> = None;
+        let mut footer: Option<(bool, String)> = None;
+        for reference in &references {
+            let relationship = resolve_reference(&typed, reference)?;
+            match reference.kind {
+                ReferenceKind::Image => {
+                    if media.contains_key(&reference.id) {
+                        continue;
+                    }
+                    let path = word_part_path(&relationship.target)
+                        .map_err(|e| part_error("word/_rels/document.xml.rels", e))?;
+                    let data = read_zip_bytes(&mut archive, &path)?;
                     media.insert(
-                        id.clone(),
+                        reference.id.clone(),
                         MediaPart {
                             mime: mime_for_media_path(&path),
                             data,
                         },
                     );
                 }
+                ReferenceKind::Header | ReferenceKind::Footer => {
+                    let path = word_part_path(&relationship.target)
+                        .map_err(|e| part_error("word/_rels/document.xml.rels", e))?;
+                    let text = read_zip_string(&mut archive, &path)?;
+                    let root = if reference.kind == ReferenceKind::Header {
+                        "hdr"
+                    } else {
+                        "ftr"
+                    };
+                    parse_hf_paragraph(&text, root).map_err(|e| part_error(&path, e))?;
+                    let selected = if reference.kind == ReferenceKind::Header {
+                        &mut header
+                    } else {
+                        &mut footer
+                    };
+                    if selected
+                        .as_ref()
+                        .is_none_or(|(is_default, _)| reference.is_default && !is_default)
+                    {
+                        *selected = Some((reference.is_default, text));
+                    }
+                }
+                ReferenceKind::Hyperlink => {}
             }
         }
 
-        let header_xml = typed.header.as_ref().and_then(|t| {
-            let path = word_part_path(t);
-            read_zip_string(&mut archive, &path)
-        });
-        let footer_xml = typed.footer.as_ref().and_then(|t| {
-            let path = word_part_path(t);
-            read_zip_string(&mut archive, &path)
-        });
-
         parse_document_parts(
             &document_xml,
-            &rels,
+            rels.as_deref().unwrap_or(""),
             &media,
-            header_xml.as_deref(),
-            footer_xml.as_deref(),
+            header.as_ref().map(|(_, text)| text.as_str()),
+            footer.as_ref().map(|(_, text)| text.as_str()),
         )
     }
 
@@ -87,11 +111,34 @@ impl DocxFormat {
 fn read_zip_string(
     archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
     path: &str,
-) -> Option<String> {
-    let mut file = archive.by_name(path).ok()?;
-    let mut s = String::new();
-    file.read_to_string(&mut s).ok()?;
-    Some(s)
+) -> Result<String, FormatError> {
+    utf8_part(read_zip_bytes(archive, path)?, path)
+}
+
+fn utf8_part(bytes: Vec<u8>, path: &str) -> Result<String, FormatError> {
+    String::from_utf8(bytes).map_err(|e| part_error(path, invalid(e.to_string())))
+}
+
+fn read_zip_bytes(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<Vec<u8>, FormatError> {
+    read_optional_zip_bytes(archive, path)?.ok_or_else(|| invalid(format!("DOCX missing {path}")))
+}
+
+fn read_optional_zip_bytes(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    let mut file = match archive.by_name(path) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(part_error(path, error.into())),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| part_error(path, e.into()))?;
+    Ok(Some(bytes))
 }
 
 impl DocumentFormat for DocxFormat {

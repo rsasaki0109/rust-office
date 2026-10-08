@@ -59,6 +59,23 @@ Run these checks before submitting changes:
   accent/background; rich shapes, notes, layouts and theme relationship selection
   are not preserved. UTF-8 XML parts with Transitional or Strict main namespaces
   are supported; arbitrary presentation-part locations are not yet supported.
+* DOCX file imports validate complete `word/document.xml`, its relationships and
+  referenced DrawingML images / header / footer parts. Missing, unreadable, invalid
+  UTF-8 or malformed referenced parts reject the whole import with the part name.
+  Relationships may be absent in documents without package references; a present
+  but empty/broken relationships part is an error. Unused relationships do not load
+  or replace document resources. Namespaced IDs, escaped attribute values and
+  absolute/relative/percent-encoded package targets are supported. External images
+  and header/footer parts fail explicitly rather than being silently omitted.
+* Failed DOCX opens retain the current document, selection, Undo/Redo history,
+  destination and unsaved edits. XML-only `parse_document_xml` / `parse_document_parts`
+  callers may still omit package resources; the file loader resolves references
+  before assigning a document. Body/header/footer text supports CDATA and escaped
+  XML. UTF-8 Transitional/Strict main namespaces are accepted.
+  DOCX remains an MVP reader, not a full OOXML schema/fidelity validator: one global
+  plain-text header/footer is retained (first default reference, otherwise first
+  reference). Rich header/footer contents, per-section variants, arbitrary main-part
+  locations and richer image placement remain outside the current model.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
   checks every edited document, including inactive apps. Cancelling retains edits,
   even after choosing Don't Save for another document in the same close attempt.
