@@ -30,13 +30,8 @@ pub fn load_json_path(path: &Path) -> Result<Presentation, JsonError> {
 }
 
 pub fn write_json_path(presentation: &Presentation, path: &Path) -> Result<(), JsonError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
     let text = serde_json::to_string_pretty(presentation)?;
-    fs::write(path, text)?;
+    office_core::storage::atomic_write(path, text.as_bytes())?;
     Ok(())
 }
 

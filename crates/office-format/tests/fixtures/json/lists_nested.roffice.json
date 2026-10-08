@@ -1,0 +1,93 @@
+{
+  "title": "",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "Parent",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15,
+            "list": {
+              "kind": "bullet",
+              "level": 0
+            }
+          }
+        },
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "Child",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15,
+            "list": {
+              "kind": "bullet",
+              "level": 1
+            }
+          }
+        },
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "Sibling",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15,
+            "list": {
+              "kind": "bullet",
+              "level": 0
+            }
+          }
+        }
+      ],
+      "paragraphs": null,
+      "page_style": {
+        "width": 595.28,
+        "height": 841.89,
+        "margin_top": 72.0,
+        "margin_bottom": 72.0,
+        "margin_left": 72.0,
+        "margin_right": 72.0
+      },
+      "header": null,
+      "footer": null
+    }
+  ],
+  "format_version": 3
+}

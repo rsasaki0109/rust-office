@@ -1,12 +1,32 @@
 # Development notes (v0.1+)
 
-## Verified locally
+## Development checks
 
-* `cargo build`
-* `cargo test --workspace`
-* `cargo test -p office-format --test golden`
-* `cargo clippy --workspace --all-targets`
-* GUI launch via `cargo run -p office-ui`
+The repository pins Rust 1.99.0 in `rust-toolchain.toml`; CI uses the same version.
+The locked egui/eframe dependencies require Rust 1.95 or newer.
+
+Run these checks before submitting changes:
+
+* `cargo build --locked --workspace`
+* `cargo test --locked --workspace`
+* `cargo test --locked -p office-format --test golden`
+* `cargo clippy --locked --workspace --all-targets -- -D warnings`
+* GUI launch via `cargo run --locked -p office-ui`
+
+## Save and close behavior
+
+* Saves and exports write a temporary file in the destination directory and replace
+  the destination only after writing succeeds. Failed writes preserve the original.
+* A successful save updates the destination and clears the unsaved marker. A failed
+  or cancelled save keeps the document, destination, and unsaved edits.
+* Calc saves include text still being edited in the formula bar. Imported XLS, XLSM,
+  and ODS files require Save As to an explicit XLSX/CSV destination.
+  Multi-sheet workbooks must use XLSX so CSV cannot silently discard other sheets.
+* After importing a PPTX, Impress Save opens Save As for a native JSON file, preserving
+  the source PPTX. Export PPTX remains a separate operation with MVP format coverage.
+* New/Open ask before replacing edited documents in all three apps. Quit/window close
+  checks every edited document, including inactive apps. Cancelling retains edits,
+  even after choosing Don't Save for another document in the same close attempt.
 
 ## Recently added
 
@@ -61,7 +81,7 @@ Not yet:
 
 ## Known limitations
 
-* No section breaks / mid-document page style changes yet
+* Section breaks work in the native model/layout; DOCX/ODT still flatten per-section page styles
 * Header / footer are single-paragraph (Enter inserts a line break, not a new para)
 * Bold rendering is still approximated in egui
 * Per-section page geometry in DOCX/ODT (export flattens section breaks to page breaks)

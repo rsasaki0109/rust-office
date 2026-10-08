@@ -7,6 +7,7 @@ description = "Spreadsheet model, formulas, CSV and XLSX for rust-office Calc"
 rust-version.workspace = true
 
 [dependencies]
+office-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 calamine = { workspace = true }

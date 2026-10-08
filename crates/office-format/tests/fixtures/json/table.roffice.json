@@ -1,0 +1,144 @@
+{
+  "title": "",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "Before",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15
+          }
+        },
+        {
+          "type": "table",
+          "rows": [
+            {
+              "cells": [
+                {
+                  "paragraphs": [
+                    {
+                      "runs": [
+                        {
+                          "text": "A1",
+                          "style": {
+                            "bold": false,
+                            "italic": false,
+                            "underline": false,
+                            "font_size": 12.0,
+                            "font_family": "Sans"
+                          }
+                        }
+                      ],
+                      "style": {
+                        "alignment": "left",
+                        "space_after": 6.0,
+                        "line_spacing": 1.15
+                      }
+                    }
+                  ]
+                },
+                {
+                  "paragraphs": [
+                    {
+                      "runs": [
+                        {
+                          "text": "B1",
+                          "style": {
+                            "bold": false,
+                            "italic": false,
+                            "underline": false,
+                            "font_size": 12.0,
+                            "font_family": "Sans"
+                          }
+                        }
+                      ],
+                      "style": {
+                        "alignment": "left",
+                        "space_after": 6.0,
+                        "line_spacing": 1.15
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "cells": [
+                {
+                  "paragraphs": [
+                    {
+                      "runs": [],
+                      "style": {
+                        "alignment": "left",
+                        "space_after": 6.0,
+                        "line_spacing": 1.15
+                      }
+                    }
+                  ]
+                },
+                {
+                  "paragraphs": [
+                    {
+                      "runs": [],
+                      "style": {
+                        "alignment": "left",
+                        "space_after": 6.0,
+                        "line_spacing": 1.15
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "After",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0,
+                "font_family": "Sans"
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "space_after": 6.0,
+            "line_spacing": 1.15
+          }
+        }
+      ],
+      "paragraphs": null,
+      "page_style": {
+        "width": 595.28,
+        "height": 841.89,
+        "margin_top": 72.0,
+        "margin_bottom": 72.0,
+        "margin_left": 72.0,
+        "margin_right": 72.0
+      },
+      "header": null,
+      "footer": null
+    }
+  ],
+  "format_version": 3
+}

@@ -16,7 +16,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/rust-office"
 authors = ["rust-office contributors"]
-rust-version = "1.85"
+rust-version = "1.99"
 
 [workspace.dependencies]
 office-core = { path = "crates/office-core" }
@@ -38,3 +38,4 @@ printpdf = { version = "0.7", default-features = true, features = ["embedded_ima
 quick-xml = "0.37"
 calamine = "0.26"
 rust_xlsxwriter = "0.79"
+tempfile = "3.27"

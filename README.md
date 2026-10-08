@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/rsasaki0109/rust-office/actions/workflows/ci.yml"><img src="https://github.com/rsasaki0109/rust-office/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange" alt="Rust 1.85+">
+  <img src="https://img.shields.io/badge/rust-1.99%2B-orange" alt="Rust 1.99+">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
 </p>
 
@@ -22,14 +22,14 @@ The long-term goal of **rust-office** is a fast, native, open-source alternative
 ## Quick start
 
 ```bash
-cargo run -p office-ui
+cargo run --locked -p office-ui
 ```
 
-Requirements: Rust 1.85+, a CJK font recommended for Japanese (e.g. Noto Sans CJK), and usual egui/eframe Linux GUI deps.
+Requirements: Rust 1.99+, a CJK font recommended for Japanese (e.g. Noto Sans CJK), and usual egui/eframe Linux GUI deps.
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 ## Project goals

@@ -10,6 +10,7 @@ use office_calc::{
 };
 
 use crate::theme::{ACCENT, CANVAS_BG, STATUS_BG, TOOLBAR_BG};
+use crate::unsaved::{self, Choice, DocumentAction};
 
 const COL_WIDTH: f32 = 88.0;
 const ROW_HEIGHT: f32 = 24.0;
@@ -19,6 +20,7 @@ const HEADER_W: f32 = 40.0;
 pub enum SwitchTo {
     Writer,
     Impress,
+    Quit,
 }
 
 pub struct CalcApp {
@@ -30,6 +32,7 @@ pub struct CalcApp {
     editing: bool,
     status_message: String,
     last_error: Option<String>,
+    pending_action: Option<DocumentAction>,
     pub pending_switch: Option<SwitchTo>,
 }
 
@@ -50,16 +53,18 @@ impl CalcApp {
         workbook.set_cell(CellAddr::new(1, 3), "=SUM(B2:B3)");
         workbook.set_cell(CellAddr::new(2, 3), "=B2*C2+B3*C3");
         workbook.mark_clean();
+        let edit_buf = workbook.active_sheet().raw(CellAddr::new(0, 0)).to_owned();
 
         Self {
             workbook,
             file_path: None,
             active: CellAddr::new(0, 0),
-            edit_buf: String::new(),
+            edit_buf,
             editing: false,
             status_message: "Ready — Calc MVP (CSV/XLSX, SUM/AVERAGE/MIN/MAX/IF/COUNT, +−*/)"
                 .into(),
             last_error: None,
+            pending_action: None,
             pending_switch: None,
         }
     }
@@ -68,14 +73,14 @@ impl CalcApp {
         self.pending_switch.take()
     }
 
-    fn title(&self) -> String {
+    pub(super) fn title(&self) -> String {
         let name = self
             .file_path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled".into());
-        let dirty = if self.workbook.is_dirty() { " *" } else { "" };
+        let dirty = if self.is_dirty() { " *" } else { "" };
         format!("rust-office — Calc — {name}{dirty}")
     }
 
@@ -97,7 +102,9 @@ impl CalcApp {
 
     fn commit_edit(&mut self) {
         if self.editing {
-            self.workbook.set_cell(self.active, self.edit_buf.clone());
+            if self.edit_buf != self.workbook.active_sheet().raw(self.active) {
+                self.workbook.set_cell(self.active, self.edit_buf.clone());
+            }
             self.editing = false;
             self.set_status(format!("Edited {}", self.active.to_a1()));
         }
@@ -127,6 +134,10 @@ impl CalcApp {
     }
 
     fn new_sheet(&mut self) {
+        self.request_action(DocumentAction::New);
+    }
+
+    fn do_new_sheet(&mut self) {
         self.workbook = Workbook::new();
         self.file_path = None;
         self.active = CellAddr::new(0, 0);
@@ -136,6 +147,10 @@ impl CalcApp {
     }
 
     fn open_file(&mut self) {
+        self.request_action(DocumentAction::Open);
+    }
+
+    fn do_open_file(&mut self) {
         let path = rfd::FileDialog::new()
             .add_filter("Excel", &["xlsx", "xlsm", "xls"])
             .add_filter("CSV", &["csv"])
@@ -167,49 +182,106 @@ impl CalcApp {
         }
     }
 
-    fn save_file(&mut self) {
-        if let Some(path) = self.file_path.clone() {
-            self.save_to(&path);
+    pub(super) fn is_dirty(&self) -> bool {
+        self.workbook.is_dirty()
+            || (self.editing && self.edit_buf != self.workbook.active_sheet().raw(self.active))
+    }
+
+    pub(super) fn cancel_pending_action(&mut self) {
+        self.pending_action = None;
+    }
+
+    fn request_action(&mut self, action: DocumentAction) {
+        if self.is_dirty() {
+            self.pending_action = Some(action);
         } else {
-            self.save_file_as();
+            self.run_action(action);
         }
     }
 
-    fn save_file_as(&mut self) {
+    fn run_action(&mut self, action: DocumentAction) {
+        match action {
+            DocumentAction::New => self.do_new_sheet(),
+            DocumentAction::Open => self.do_open_file(),
+        }
+    }
+
+    fn resolve_pending_action(&mut self, choice: Choice) {
+        if choice == Choice::Save && !self.save_file() {
+            self.pending_action = None;
+            return;
+        }
+        if let Some(action) = self.pending_action.take() {
+            if choice != Choice::Cancel {
+                self.run_action(action);
+            }
+        }
+    }
+
+    fn show_unsaved_dialog(&mut self, ctx: &Context) {
+        if self.pending_action.is_some() {
+            if let Some(choice) = unsaved::confirm(ctx, "calc_unsaved", &self.title()) {
+                self.resolve_pending_action(choice);
+            }
+        }
+    }
+
+    pub(super) fn save_file(&mut self) -> bool {
+        if let Some(path) = self.file_path.clone() {
+            if writable_extension(&path).is_some() {
+                return self.save_to(&path);
+            }
+        }
+        // Imported XLS/ODS/XLSM files need an explicit supported destination.
+        self.save_file_as()
+    }
+
+    fn save_file_as(&mut self) -> bool {
         let path = rfd::FileDialog::new()
             .add_filter("Excel", &["xlsx"])
             .add_filter("CSV", &["csv"])
             .set_file_name("sheet.xlsx")
             .save_file();
         let Some(path) = path else {
-            return;
+            return false;
         };
-        self.save_to(&path);
-        self.file_path = Some(path);
+        self.save_to(&path)
     }
 
-    fn save_to(&mut self, path: &std::path::Path) {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("xlsx")
-            .to_ascii_lowercase();
+    fn save_to(&mut self, path: &std::path::Path) -> bool {
+        let Some(ext) = writable_extension(path) else {
+            self.set_error("Save failed: choose a .xlsx or .csv file");
+            return false;
+        };
+        if ext == "csv" && self.workbook.sheet_count() > 1 {
+            self.set_error(
+                "Save failed: CSV only stores one sheet. Choose XLSX to save all sheets.",
+            );
+            return false;
+        }
+        // Include the formula-bar draft, but retain it unchanged if saving fails.
+        let mut workbook = self.workbook.clone();
+        if self.editing && self.edit_buf != workbook.active_sheet().raw(self.active) {
+            workbook.set_cell(self.active, self.edit_buf.clone());
+        }
         let result = if ext == "csv" {
-            write_csv_path(&self.workbook, path).map_err(|e| e.to_string())
+            write_csv_path(&workbook, path).map_err(|e| e.to_string())
         } else {
-            let path = if ext == "xlsx" {
-                path.to_path_buf()
-            } else {
-                path.with_extension("xlsx")
-            };
-            write_xlsx_path(&self.workbook, &path).map_err(|e| e.to_string())
+            write_xlsx_path(&workbook, path).map_err(|e| e.to_string())
         };
         match result {
             Ok(()) => {
+                self.workbook = workbook;
                 self.workbook.mark_clean();
+                self.editing = false;
+                self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Saved {}", path.display()));
+                true
             }
-            Err(e) => self.set_error(format!("Save failed: {e}")),
+            Err(e) => {
+                self.set_error(format!("Save failed: {e}"));
+                false
+            }
         }
     }
 
@@ -239,6 +311,11 @@ impl CalcApp {
                 }
                 if ui.button("Switch to Impress").clicked() {
                     self.pending_switch = Some(SwitchTo::Impress);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    self.pending_switch = Some(SwitchTo::Quit);
                     ui.close();
                 }
             });
@@ -313,10 +390,9 @@ impl CalcApp {
                     ui.allocate_exact_size(Vec2::new(HEADER_W, ROW_HEIGHT), Sense::hover());
                     for c in 0..cols {
                         let label = col_to_letters(c);
-                        let (rect, _) =
-                            ui.allocate_exact_size(Vec2::new(COL_WIDTH, ROW_HEIGHT), Sense::hover());
-                        ui.painter()
-                            .rect_filled(rect, 0.0, Color32::from_gray(230));
+                        let (rect, _) = ui
+                            .allocate_exact_size(Vec2::new(COL_WIDTH, ROW_HEIGHT), Sense::hover());
+                        ui.painter().rect_filled(rect, 0.0, Color32::from_gray(230));
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -426,7 +502,13 @@ impl App for CalcApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
-        self.handle_keys(&ctx);
+        if self.pending_action.is_none() && ui.is_enabled() {
+            self.handle_keys(&ctx);
+        }
+        self.show_unsaved_dialog(&ctx);
+        if self.pending_action.is_some() {
+            ui.disable();
+        }
 
         egui::Panel::top("calc_menu")
             .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(4.0))
@@ -464,5 +546,123 @@ impl App for CalcApp {
             .show(ui, |ui| {
                 self.grid(ui);
             });
+    }
+}
+
+fn writable_extension(path: &std::path::Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    matches!(extension.as_str(), "xlsx" | "csv").then_some(extension)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(app: &mut CalcApp, value: &str) {
+        app.begin_edit();
+        app.edit_buf = value.into();
+    }
+
+    #[test]
+    fn saving_includes_uncommitted_cell_and_records_actual_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sheet.csv");
+        let mut app = CalcApp::new();
+        draft(&mut app, "unfinished cell edit");
+        assert!(app.is_dirty());
+        assert!(app.save_to(&path));
+        let loaded = load_csv_path(&path).unwrap();
+        assert_eq!(
+            loaded.active_sheet().raw(app.active),
+            "unfinished cell edit"
+        );
+        assert_eq!(app.file_path.as_deref(), Some(path.as_path()));
+        assert!(!app.is_dirty());
+        assert!(!app.editing);
+    }
+
+    #[test]
+    fn failed_save_preserves_destination_and_uncommitted_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.csv");
+        let bad = dir.path().join("destination.csv");
+        std::fs::write(&original, "old contents").unwrap();
+        std::fs::create_dir(&bad).unwrap();
+        let mut app = CalcApp::new();
+        app.file_path = Some(original.clone());
+        draft(&mut app, "keep draft");
+        assert!(!app.save_to(&bad));
+        assert_eq!(app.file_path, Some(original.clone()));
+        assert_eq!(std::fs::read_to_string(original).unwrap(), "old contents");
+        assert_eq!(app.edit_buf, "keep draft");
+        assert!(app.editing && app.is_dirty());
+        assert_eq!(app.workbook.active_sheet().raw(app.active), "Item");
+    }
+
+    #[test]
+    fn unsupported_destination_is_not_rewritten_or_changed_to_xlsx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.ods");
+        std::fs::write(&path, "original file").unwrap();
+        let mut app = CalcApp::new();
+        draft(&mut app, "new value");
+        assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original file");
+        assert!(!path.with_extension("xlsx").exists());
+        assert!(app.file_path.is_none() && app.is_dirty());
+    }
+
+    #[test]
+    fn csv_save_cannot_mark_a_multi_sheet_workbook_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.csv");
+        std::fs::write(&path, "original file").unwrap();
+        let mut app = CalcApp::new();
+        app.workbook.add_sheet("Keep this sheet");
+        assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original file");
+        assert_eq!(app.workbook.sheet_count(), 2);
+        assert!(app.is_dirty());
+        assert!(app.file_path.is_none());
+    }
+
+    #[test]
+    fn cancel_new_or_open_preserves_formula_bar_draft() {
+        for action in [DocumentAction::New, DocumentAction::Open] {
+            let mut app = CalcApp::new();
+            draft(&mut app, "keep draft");
+            app.request_action(action);
+            assert_eq!(app.pending_action, Some(action));
+            app.resolve_pending_action(Choice::Cancel);
+            assert!(app.pending_action.is_none());
+            assert_eq!(app.edit_buf, "keep draft");
+            assert_eq!(app.workbook.active_sheet().raw(app.active), "Item");
+            assert!(app.is_dirty());
+        }
+    }
+
+    #[test]
+    fn save_failure_does_not_execute_pending_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("destination.csv");
+        std::fs::create_dir(&path).unwrap();
+        let mut app = CalcApp::new();
+        app.file_path = Some(path);
+        draft(&mut app, "keep draft");
+        app.new_sheet();
+        app.resolve_pending_action(Choice::Save);
+        assert!(app.pending_action.is_none());
+        assert_eq!(app.edit_buf, "keep draft");
+        assert_eq!(app.workbook.active_sheet().raw(app.active), "Item");
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn unchanged_cell_focus_does_not_require_saving() {
+        let mut app = CalcApp::new();
+        app.begin_edit();
+        assert!(!app.is_dirty());
+        app.commit_edit();
+        assert!(!app.is_dirty());
     }
 }

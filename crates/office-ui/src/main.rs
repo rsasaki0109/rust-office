@@ -7,6 +7,7 @@ mod impress_app;
 mod office;
 mod print_sys;
 mod theme;
+mod unsaved;
 
 use office::OfficeApp;
 

@@ -34,14 +34,19 @@ pub enum FormatError {
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("invalid document: {0}")]
     InvalidDocument(String),
+    #[error("unsupported file format: {0}")]
+    UnsupportedFormat(String),
 }
 
 /// Abstraction for load/save backends.
 pub trait DocumentFormat {
     fn extension(&self) -> &str;
     fn load_from_reader(&self, reader: &mut dyn Read) -> Result<Document, FormatError>;
-    fn save_to_writer(&self, document: &Document, writer: &mut dyn Write)
-        -> Result<(), FormatError>;
+    fn save_to_writer(
+        &self,
+        document: &Document,
+        writer: &mut dyn Write,
+    ) -> Result<(), FormatError>;
 
     fn load_path(&self, path: &Path) -> Result<Document, FormatError> {
         let mut file = fs::File::open(path)?;
@@ -49,14 +54,7 @@ pub trait DocumentFormat {
     }
 
     fn save_path(&self, document: &Document, path: &Path) -> Result<(), FormatError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        let mut file = fs::File::create(path)?;
-        self.save_to_writer(document, &mut file)?;
-        Ok(())
+        office_core::storage::atomic_save(path, |file| self.save_to_writer(document, file))
     }
 }
 
@@ -119,14 +117,15 @@ pub fn load_document(path: &Path) -> Result<Document, FormatError> {
 }
 
 pub fn save_document(document: &Document, path: &Path) -> Result<(), FormatError> {
-    let format = format_for_path(path).unwrap_or_else(|| Box::new(JsonFormat));
+    let format = format_for_path(path)
+        .ok_or_else(|| FormatError::UnsupportedFormat(path.display().to_string()))?;
     format.save_path(document, path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use office_core::{Alignment, Document, DocumentEditor, DocPosition, Selection};
+    use office_core::{Alignment, DocPosition, Document, DocumentEditor, Selection};
 
     #[test]
     fn round_trip_json() {
@@ -137,9 +136,7 @@ mod tests {
 
         let mut buf = Vec::new();
         JsonFormat.save_to_writer(&doc, &mut buf).unwrap();
-        let restored = JsonFormat
-            .load_from_reader(&mut buf.as_slice())
-            .unwrap();
+        let restored = JsonFormat.load_from_reader(&mut buf.as_slice()).unwrap();
         assert_eq!(restored.plain_text(), "Hello\n世界");
         assert_eq!(restored.format_version, Document::CURRENT_FORMAT_VERSION);
     }
@@ -152,22 +149,15 @@ mod tests {
         ed.set_named_paragraph_style(NamedParagraphStyle::Heading2)
             .unwrap();
         let mut buf = Vec::new();
-        JsonFormat
-            .save_to_writer(ed.document(), &mut buf)
-            .unwrap();
+        JsonFormat.save_to_writer(ed.document(), &mut buf).unwrap();
         let json = String::from_utf8(buf.clone()).unwrap();
         assert!(json.contains("\"named\": \"heading2\""), "json={json}");
-        let restored = JsonFormat
-            .load_from_reader(&mut buf.as_slice())
-            .unwrap();
+        let restored = JsonFormat.load_from_reader(&mut buf.as_slice()).unwrap();
         assert_eq!(
             restored.paragraph(0).unwrap().style.named,
             NamedParagraphStyle::Heading2
         );
-        assert_eq!(
-            restored.paragraph(0).unwrap().runs[0].style.font_size,
-            16.0
-        );
+        assert_eq!(restored.paragraph(0).unwrap().runs[0].style.font_size, 16.0);
     }
 
     #[test]
@@ -203,7 +193,12 @@ mod tests {
         assert!(bytes.starts_with(b"PK"));
         let restored = OdtFormat.load_from_bytes(&bytes).unwrap();
         assert_eq!(restored.plain_text(), "Hello\n世界");
-        assert!(restored.paragraph(0).unwrap().runs.iter().any(|r| r.style.bold));
+        assert!(restored
+            .paragraph(0)
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.style.bold));
         assert_eq!(
             restored.paragraph(1).unwrap().style.alignment,
             Alignment::Center
@@ -244,7 +239,12 @@ mod tests {
 </office:document-content>"#;
         let doc = parse_content_xml(xml).unwrap();
         assert_eq!(doc.plain_text(), "Plain Bold");
-        assert!(doc.paragraph(0).unwrap().runs.iter().any(|r| r.style.bold && r.text == "Bold"));
+        assert!(doc
+            .paragraph(0)
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.style.bold && r.text == "Bold"));
     }
 
     #[test]
@@ -301,9 +301,7 @@ mod tests {
         let doc = ed.document().clone();
         let mut buf = Vec::new();
         JsonFormat.save_to_writer(&doc, &mut buf).unwrap();
-        let restored = JsonFormat
-            .load_from_reader(&mut buf.as_slice())
-            .unwrap();
+        let restored = JsonFormat.load_from_reader(&mut buf.as_slice()).unwrap();
         let Block::Image(img) = &restored.blocks()[1] else {
             panic!("expected image block");
         };
@@ -561,7 +559,12 @@ mod tests {
         assert!(restored.plain_text().contains("世界"));
         assert!(restored.plain_text().contains("After"));
         assert!(restored.plain_text().contains("A1"));
-        assert!(restored.paragraph(0).unwrap().runs.iter().any(|r| r.style.bold));
+        assert!(restored
+            .paragraph(0)
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.style.bold));
         assert_eq!(
             restored.paragraph(1).unwrap().style.alignment,
             Alignment::Center

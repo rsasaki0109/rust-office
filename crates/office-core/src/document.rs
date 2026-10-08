@@ -241,7 +241,7 @@ mod serde_bytes_base64 {
             }
         }
         let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             return Err("invalid base64 length".into());
         }
         let mut out = Vec::new();

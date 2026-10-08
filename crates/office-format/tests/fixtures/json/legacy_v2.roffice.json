@@ -1,0 +1,37 @@
+{
+  "title": "",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "type": "paragraph",
+          "runs": [
+            {
+              "text": "legacy",
+              "style": {
+                "bold": false,
+                "italic": false,
+                "underline": false,
+                "font_size": 12.0
+              }
+            }
+          ],
+          "style": {
+            "alignment": "left",
+            "line_spacing": 1.15,
+            "space_after": 6.0
+          }
+        }
+      ],
+      "page_style": {
+        "width": 595.28,
+        "height": 841.89,
+        "margin_top": 72.0,
+        "margin_bottom": 72.0,
+        "margin_left": 72.0,
+        "margin_right": 72.0
+      }
+    }
+  ],
+  "format_version": 2
+}
