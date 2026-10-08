@@ -28,18 +28,29 @@ pub struct CellRange {
 }
 
 impl CellRange {
+    pub fn contains(self, addr: CellAddr) -> bool {
+        let range = self.normalize();
+        (range.start.col..=range.end.col).contains(&addr.col)
+            && (range.start.row..=range.end.row).contains(&addr.row)
+    }
+
     pub fn normalize(self) -> Self {
         Self {
-            start: CellAddr::new(self.start.col.min(self.end.col), self.start.row.min(self.end.row)),
-            end: CellAddr::new(self.start.col.max(self.end.col), self.start.row.max(self.end.row)),
+            start: CellAddr::new(
+                self.start.col.min(self.end.col),
+                self.start.row.min(self.end.row),
+            ),
+            end: CellAddr::new(
+                self.start.col.max(self.end.col),
+                self.start.row.max(self.end.row),
+            ),
         }
     }
 
     pub fn iter(self) -> impl Iterator<Item = CellAddr> {
         let r = self.normalize();
-        (r.start.row..=r.end.row).flat_map(move |row| {
-            (r.start.col..=r.end.col).map(move |col| CellAddr::new(col, row))
-        })
+        (r.start.row..=r.end.row)
+            .flat_map(move |row| (r.start.col..=r.end.col).map(move |col| CellAddr::new(col, row)))
     }
 }
 
