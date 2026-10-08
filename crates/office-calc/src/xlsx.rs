@@ -2,11 +2,12 @@
 
 use std::path::Path;
 
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{open_workbook_auto, CellErrorType, Data, Reader};
 use rust_xlsxwriter::Workbook as XlsxWriter;
 use thiserror::Error;
 
 use crate::addr::CellAddr;
+use crate::cell::CalcError;
 use crate::sheet::Sheet;
 use crate::workbook::Workbook;
 
@@ -72,7 +73,7 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
 fn data_to_raw(value: &Data) -> String {
     match value {
         Data::Empty => String::new(),
-        Data::String(s) => s.clone(),
+        Data::String(s) => text_to_input(s),
         // Use the shortest representation that parses back to the same f64.
         // Display rounding must not change stored values or later calculations.
         Data::Float(f) => f.to_string(),
@@ -84,9 +85,38 @@ fn data_to_raw(value: &Data) -> String {
                 "FALSE".into()
             }
         }
-        Data::Error(e) => format!("{e:?}"),
+        // The raw-input model represents error values as constant formulas.
+        Data::Error(e) => format!(
+            "={}",
+            match e {
+                CellErrorType::Div0 => CalcError::Div0,
+                CellErrorType::NA => CalcError::Na,
+                CellErrorType::Name => CalcError::Name,
+                CellErrorType::Null => CalcError::Null,
+                CellErrorType::Num => CalcError::Num,
+                CellErrorType::Ref => CalcError::Ref,
+                CellErrorType::Value => CalcError::Value,
+                CellErrorType::GettingData => CalcError::GettingData,
+            }
+        ),
         Data::DateTime(dt) => dt.to_string(),
         Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
+    }
+}
+
+/// Escape text that would otherwise be reinterpreted by evaluation or export.
+fn text_to_input(text: &str) -> String {
+    let trimmed = text.trim();
+    if text.starts_with('\'')
+        || trimmed.starts_with('=')
+        || trimmed.parse::<f64>().is_ok()
+        || trimmed.eq_ignore_ascii_case("TRUE")
+        || trimmed.eq_ignore_ascii_case("FALSE")
+        || (!text.is_empty() && trimmed.is_empty())
+    {
+        format!("'{text}")
+    } else {
+        text.to_owned()
     }
 }
 
@@ -118,7 +148,11 @@ pub fn write_xlsx_bytes(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
             let row = addr.row;
             let col = addr.col as u16;
             let raw = cell.raw.as_str();
-            if let Some(body) = raw.trim().strip_prefix('=') {
+            if let Some(text) = cell.literal_text() {
+                worksheet
+                    .write_string(row, col, text)
+                    .map_err(|e| XlsxError::Write(e.to_string()))?;
+            } else if let Some(body) = raw.trim().strip_prefix('=') {
                 worksheet
                     .write_formula(row, col, body)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
@@ -148,6 +182,7 @@ pub fn write_xlsx_bytes(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CellRange, Value};
     use std::io::{Cursor, Read, Write};
 
     fn reload(bytes: &[u8]) -> Result<Workbook, XlsxError> {
@@ -350,5 +385,147 @@ mod tests {
             reload(b"not an XLSX file"),
             Err(XlsxError::Read(_))
         ));
+    }
+
+    #[test]
+    fn imported_text_cells_stay_literal_after_save_and_reload() {
+        let texts = [
+            "00123",
+            "1e12",
+            "=1+1",
+            " =A1 ",
+            "TRUE",
+            "false",
+            "'apostrophe",
+            "日本語",
+            " \t ",
+            " NaN ",
+            "#REF!",
+        ];
+        let mut external = XlsxWriter::new();
+        let sheet = external.add_worksheet();
+        for (row, text) in texts.iter().enumerate() {
+            sheet.write_string(row as u32, 0, *text).unwrap();
+        }
+        sheet.write_number(0, 1, 123.0).unwrap();
+        sheet.write_boolean(1, 1, true).unwrap();
+        sheet.write_formula(2, 1, "1+1").unwrap();
+        let mut book = reload(&external.save_to_buffer().unwrap()).unwrap();
+        for _ in 0..2 {
+            for (row, text) in texts.iter().enumerate() {
+                let address = CellAddr::new(0, row as u32);
+                assert_eq!(
+                    book.active_sheet().evaluate(address),
+                    Value::Text((*text).to_owned())
+                );
+                assert!(!book.active_sheet().get(address).unwrap().is_formula());
+            }
+            assert_eq!(
+                book.active_sheet().evaluate(CellAddr::new(1, 0)),
+                Value::Number(123.0)
+            );
+            assert_eq!(book.active_sheet().raw(CellAddr::new(1, 1)), "TRUE");
+            assert_eq!(book.active_sheet().raw(CellAddr::new(1, 2)), "=1+1");
+            let bytes = write_xlsx_bytes(&book).unwrap();
+            let mut reader =
+                calamine::open_workbook_auto_from_rs(Cursor::new(bytes.clone())).unwrap();
+            let values = reader.worksheet_range("Sheet1").unwrap();
+            let formulas = reader.worksheet_formula("Sheet1").unwrap();
+            for (row, text) in texts.iter().enumerate() {
+                let position = (row as u32, 0);
+                assert_eq!(
+                    values.get_value(position),
+                    Some(&Data::String((*text).to_owned()))
+                );
+                assert!(formulas.get_value(position).is_none_or(String::is_empty));
+            }
+            assert_eq!(values.get_value((0, 1)), Some(&Data::Float(123.0)));
+            assert_eq!(values.get_value((1, 1)), Some(&Data::Bool(true)));
+            assert_eq!(formulas.get_value((2, 1)).map(String::as_str), Some("1+1"));
+            book = reload(&bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn apostrophe_input_survives_copy_history_and_xlsx() {
+        let mut book = Workbook::new();
+        let inputs = ["'00123", "'=A1", "''quoted", "' \t "];
+        let texts = ["00123", "=A1", "'quoted", " \t "];
+        for (row, input) in inputs.iter().enumerate() {
+            book.set_cell(CellAddr::new(0, row as u32), *input);
+            assert_eq!(
+                book.active_sheet().display(CellAddr::new(0, row as u32)),
+                texts[row]
+            );
+        }
+        book.mark_clean();
+        let range = CellRange {
+            start: CellAddr::new(0, 0),
+            end: CellAddr::new(0, 3),
+        };
+        let copied = book.copy_tsv(range).unwrap();
+        book.paste_tsv_with_origin(CellAddr::new(1, 5), &copied, Some(CellAddr::new(0, 0)))
+            .unwrap();
+        for (row, text) in texts.iter().enumerate() {
+            assert_eq!(
+                book.active_sheet()
+                    .display(CellAddr::new(1, 5 + row as u32)),
+                *text
+            );
+        }
+        assert!(book.undo());
+        assert!(!book.is_dirty());
+        assert_eq!(book.active_sheet().raw(CellAddr::new(1, 5)), "");
+        assert!(book.redo());
+        let restored = reload(&write_xlsx_bytes(&book).unwrap()).unwrap();
+        for (row, text) in texts.iter().enumerate() {
+            assert_eq!(
+                restored
+                    .active_sheet()
+                    .display(CellAddr::new(1, 5 + row as u32)),
+                *text
+            );
+        }
+    }
+
+    #[test]
+    fn imported_error_cells_remain_errors_after_save_and_reload() {
+        let tokens = [
+            "#DIV/0!", "#N/A", "#NAME?", "#NULL!", "#NUM!", "#REF!", "#VALUE!",
+        ];
+        let rows = tokens
+            .iter()
+            .enumerate()
+            .map(|(row, token)| {
+                format!(
+                    "<row r=\"{}\"><c r=\"A{}\" t=\"e\"><v>{token}</v></c></row>",
+                    row + 1,
+                    row + 1
+                )
+            })
+            .collect::<String>();
+        let bytes = replace_second_sheet(Some(&format!("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><dimension ref=\"A1:A7\"/><sheetData>{rows}</sheetData></worksheet>")));
+        let mut book = reload(&bytes).unwrap();
+        book.active = 1;
+        for (row, token) in tokens.iter().enumerate() {
+            let address = CellAddr::new(0, row as u32);
+            assert_eq!(book.active_sheet().display(address), *token);
+            assert!(matches!(
+                book.active_sheet().evaluate(address),
+                Value::Error(_)
+            ));
+            book.set_cell(CellAddr::new(1, row as u32), format!("=A{}+1", row + 1));
+        }
+        let restored = reload(&write_xlsx_bytes(&book).unwrap()).unwrap();
+        for (row, token) in tokens.iter().enumerate() {
+            assert_eq!(
+                restored.sheets[1].display(CellAddr::new(0, row as u32)),
+                *token
+            );
+            assert_eq!(
+                restored.sheets[1].display(CellAddr::new(1, row as u32)),
+                *token
+            );
+        }
     }
 }

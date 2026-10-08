@@ -28,6 +28,14 @@ Run these checks before submitting changes:
 * XLSX round-trip tests require exact formula text, including absolute/mixed/range
   references and `#REF!`. Imported numbers retain the available `f64` precision
   rather than being rounded for display before storage.
+* Imported spreadsheet text that resembles a number, formula or boolean is
+  protected with the literal-text input marker (`'`). XLSX exports remove the
+  marker and write an actual string cell, retaining leading zeros, whitespace
+  and literal apostrophes. CSV exports remove the marker too; CSV itself does
+  not encode cell types, so reopening it still infers numbers/formulas.
+* Imported spreadsheet error values become constant error formulas (for example,
+  `=#REF!`) in the raw-input model. Their tokens and error propagation survive
+  XLSX save/reload; they are exported as formulas rather than standalone error cells.
 * After importing a PPTX, Impress Save opens Save As for a native JSON file, preserving
   the source PPTX. Export PPTX remains a separate operation with MVP format coverage.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
@@ -123,6 +131,12 @@ to the saved revision removes the unsaved marker. A new edit after Undo drops
 the redo branch. Opening or creating a workbook resets history.
 F2 or double-click focuses the formula bar; typing on the grid starts a new
 cell value. Enter commits it and moves down; Escape cancels the draft.
+
+Start cell input with an apostrophe to force literal text: `'00123` displays
+`00123`, and `'=A1` displays `=A1` without evaluating it. The formula bar and
+raw TSV clipboard retain the marker so internal copy/paste and Undo/Redo keep
+the text interpretation. Type two initial apostrophes to display one literal
+apostrophe. Imported CSV apostrophes are treated as data, not input markers.
 
 Copying a cell range within the current Calc workbook adjusts formula references
 by the displacement from the copied top-left cell to the pasted top-left cell.

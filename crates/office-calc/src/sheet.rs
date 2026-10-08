@@ -81,7 +81,9 @@ impl Sheet {
             None => Value::Empty,
             Some(cell) => {
                 let trimmed = cell.raw.trim();
-                if trimmed.is_empty() {
+                if let Some(text) = cell.literal_text() {
+                    Value::Text(text.to_owned())
+                } else if trimmed.is_empty() {
                     Value::Empty
                 } else if let Some(body) = trimmed.strip_prefix('=') {
                     formula::eval_body(self, body, visiting)

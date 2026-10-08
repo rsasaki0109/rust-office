@@ -168,6 +168,10 @@ impl<'a> Parser<'a> {
             CalcError::Div0,
             CalcError::Cycle,
             CalcError::Name,
+            CalcError::Na,
+            CalcError::Null,
+            CalcError::Num,
+            CalcError::GettingData,
         ] {
             let token = error.to_string();
             if self.src[self.i..].starts_with(token.as_bytes()) {
@@ -490,5 +494,30 @@ mod literal_tests {
             evaluate_formula(&sheet, "IF(0,#REF!,\"日本語 \"\"A1\"\"\")", origin),
             Value::Text("日本語 \"A1\"".into())
         );
+    }
+
+    #[test]
+    fn imported_error_constants_propagate_and_unused_if_branches_stay_lazy() {
+        let sheet = Sheet::new("Sheet1");
+        let origin = CellAddr::new(0, 0);
+        for error in [
+            CalcError::Na,
+            CalcError::Null,
+            CalcError::Num,
+            CalcError::GettingData,
+        ] {
+            let token = error.to_string();
+            for body in [
+                token.clone(),
+                format!("SUM({token})"),
+                format!("IF(1,{token},3)"),
+            ] {
+                assert_eq!(evaluate_formula(&sheet, &body, origin), Value::Error(error));
+            }
+            assert_eq!(
+                evaluate_formula(&sheet, &format!("IF(0,{token},3)"), origin),
+                Value::Number(3.0)
+            );
+        }
     }
 }
