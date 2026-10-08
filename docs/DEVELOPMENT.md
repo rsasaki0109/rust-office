@@ -123,6 +123,26 @@ Not yet:
 
 ## Calc editing
 
+Aggregate functions (`SUM`, `AVERAGE`/`AVG`, `MIN`, `MAX`, `COUNT`) visit only
+stored cells in ranges, in row/column order. Referenced empty cells and text
+(including numeric-looking literal text and formula text results) are ignored.
+`AVERAGE` counts only numbers and returns `#DIV/0!` if there are none; `MIN`/`MAX`
+return zero when no numbers are present. Direct numeric string arguments are
+converted to numbers. Other direct strings cause `#VALUE!`, except in `COUNT`,
+which ignores them. `COUNT` ignores referenced spreadsheet errors; the other
+aggregates propagate them. Circular dependencies still produce `#CYCLE!`.
+
+Each cell evaluation has a fresh cache for numeric/error/empty dependency results,
+so edits and Undo/Redo cannot reuse stale calculations. Large empty ranges do not
+expand into cell-address arrays. To bound work and stack use, parsing allows at
+most 32,768 source bytes, 512 parser nodes and 64 nested parser levels. Evaluation
+allows 64 combined cell/expression levels and 100,000 work units (formula source
+bytes, referenced literal bytes, cell/expression visits and stored-cell scans).
+These are implementation limits, not full Excel formula compatibility. Exceeding
+a limit returns `#NUM!` without modifying raw formulas or saved files. References
+beyond XLSX worksheet bounds return `#REF!`. `IF` still evaluates only its chosen
+branch, while the entire formula is parsed and subject to the parser limits.
+
 The CSV library API `load_csv_str` returns `Result<Workbook, CsvError>`, matching
 `load_csv_path`, so callers can handle parse errors instead of accepting partial data.
 CSV and TSV share the quoted-field parser. CSV requires quotes to enclose a whole
