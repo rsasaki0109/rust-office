@@ -1,11 +1,11 @@
 //! Single worksheet (sparse grid).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::addr::CellAddr;
-use crate::cell::{CalcError, Cell, Value};
+use crate::cell::{Cell, Value};
 use crate::formula;
 
 /// Default visible grid size (not a hard storage limit).
@@ -69,33 +69,7 @@ impl Sheet {
 
     /// Evaluate cell for display (handles formulas and literals).
     pub fn evaluate(&self, addr: CellAddr) -> Value {
-        let mut visiting = HashSet::new();
-        self.evaluate_at(addr, &mut visiting)
-    }
-
-    pub(crate) fn evaluate_at(&self, addr: CellAddr, visiting: &mut HashSet<CellAddr>) -> Value {
-        if !visiting.insert(addr) {
-            return Value::Error(CalcError::Cycle);
-        }
-        let value = match self.get(addr) {
-            None => Value::Empty,
-            Some(cell) => {
-                let trimmed = cell.raw.trim();
-                if let Some(text) = cell.literal_text() {
-                    Value::Text(text.to_owned())
-                } else if trimmed.is_empty() {
-                    Value::Empty
-                } else if let Some(body) = trimmed.strip_prefix('=') {
-                    formula::eval_body(self, body, visiting)
-                } else if let Ok(n) = trimmed.parse::<f64>() {
-                    Value::Number(n)
-                } else {
-                    Value::Text(cell.raw.clone())
-                }
-            }
-        };
-        visiting.remove(&addr);
-        value
+        formula::evaluate_cell(self, addr)
     }
 
     pub fn display(&self, addr: CellAddr) -> String {
