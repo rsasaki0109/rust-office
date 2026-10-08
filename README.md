@@ -59,6 +59,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 * CSV + XLSX open/save (multi-sheet)
 * Rectangular selection (drag / Shift+arrow / Shift+click), tabular copy/cut/paste
 * Formula copies adjust relative, absolute and mixed A1 references (including ranges)
+* Literal text input with `'`; XLSX keeps numeric/formula-shaped text and error values
 * Undo/Redo for cell edits, range operations and adding sheets; save state tracking
 
 ### Impress

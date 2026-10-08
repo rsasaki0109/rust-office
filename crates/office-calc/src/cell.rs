@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// What the user typed into a cell (formula starts with `=`).
+/// What the user typed into a cell (formula starts with `=`, literal text with `'`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Cell {
     pub raw: String,
@@ -19,6 +19,11 @@ impl Cell {
 
     pub fn is_formula(&self) -> bool {
         self.raw.trim_start().starts_with('=')
+    }
+
+    /// An initial apostrophe forces text and is not part of the displayed value.
+    pub fn literal_text(&self) -> Option<&str> {
+        self.raw.strip_prefix('\'')
     }
 }
 
@@ -75,6 +80,10 @@ pub enum CalcError {
     Div0,
     Cycle,
     Name,
+    Na,
+    Null,
+    Num,
+    GettingData,
 }
 
 impl std::fmt::Display for CalcError {
@@ -85,6 +94,10 @@ impl std::fmt::Display for CalcError {
             CalcError::Div0 => "#DIV/0!",
             CalcError::Cycle => "#CYCLE!",
             CalcError::Name => "#NAME?",
+            CalcError::Na => "#N/A",
+            CalcError::Null => "#NULL!",
+            CalcError::Num => "#NUM!",
+            CalcError::GettingData => "#GETTING_DATA",
         })
     }
 }

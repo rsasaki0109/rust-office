@@ -25,7 +25,13 @@ pub fn load_csv_str(text: &str) -> Workbook {
     for (r, line) in text.lines().enumerate() {
         for (c, field) in parse_csv_line(line).into_iter().enumerate() {
             if !field.is_empty() {
-                sheet.set_raw(CellAddr::new(c as u32, r as u32), field);
+                // CSV contains values, so an apostrophe here belongs to the data.
+                let input = if field.starts_with('\'') {
+                    format!("'{field}")
+                } else {
+                    field
+                };
+                sheet.set_raw(CellAddr::new(c as u32, r as u32), input);
             }
         }
     }
@@ -58,7 +64,9 @@ pub fn sheet_to_csv(sheet: &Sheet) -> String {
     for r in 0..=max_r {
         let mut fields = Vec::new();
         for c in 0..=max_c {
-            let raw = sheet.raw(CellAddr::new(c, r));
+            let raw = sheet
+                .get(CellAddr::new(c, r))
+                .map_or("", |cell| cell.literal_text().unwrap_or(&cell.raw));
             fields.push(escape_csv_field(raw));
         }
         while fields.last().is_some_and(|f| f.is_empty()) {
@@ -134,5 +142,29 @@ mod tests {
             restored.active_sheet().raw(CellAddr::new(0, 2)),
             "Hello, world"
         );
+    }
+
+    #[test]
+    fn csv_exports_literal_text_without_the_input_marker() {
+        let mut book = Workbook::new();
+        for (col, input) in ["'00123", "'=A1", "''quoted", "'hello, world"]
+            .iter()
+            .enumerate()
+        {
+            book.set_cell(CellAddr::new(col as u32, 0), *input);
+        }
+        assert_eq!(
+            sheet_to_csv(book.active_sheet()),
+            "00123,=A1,'quoted,\"hello, world\"\n"
+        );
+    }
+
+    #[test]
+    fn csv_apostrophes_belong_to_the_data_and_survive_round_trip() {
+        let csv = "'quoted,''two,plain\n";
+        let book = load_csv_str(csv);
+        assert_eq!(book.active_sheet().display(CellAddr::new(0, 0)), "'quoted");
+        assert_eq!(book.active_sheet().display(CellAddr::new(1, 0)), "''two");
+        assert_eq!(sheet_to_csv(book.active_sheet()), csv);
     }
 }
