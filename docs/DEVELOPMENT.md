@@ -76,6 +76,24 @@ Run these checks before submitting changes:
   plain-text header/footer is retained (first default reference, otherwise first
   reference). Rich header/footer contents, per-section variants, arbitrary main-part
   locations and richer image placement remain outside the current model.
+* ODT file imports require complete UTF-8 `content.xml` with an
+  `office:document-content` root and `office:body/office:text`. Referenced
+  `draw:image` package parts are loaded by namespace-qualified `xlink:href`;
+  missing parts and ZIP read/CRC failures reject the whole import with the part
+  name. Relative/absolute package paths, dot segments and percent-encoded names
+  are resolved within the ZIP. Unreferenced images are ignored. External image
+  links and inline binary image data are unsupported and fail explicitly.
+* ODT `styles.xml` is optional when absent, but a present empty, unreadable,
+  invalid UTF-8 or malformed part fails the import. Body/header/footer CDATA,
+  escaped links, spaces, tabs and line breaks are retained. Compact `text:s`
+  expansion is limited to 1,000,000 spaces per XML part; invalid counts fail
+  before repeated strings are allocated. Failed opens retain the Writer document,
+  selection, caret preference, destination, dirty state and Undo/Redo history.
+  XML-only parsing helpers may still omit image bytes, and failed
+  `apply_styles_xml` calls leave their document unchanged. This is MVP structure
+  validation, not full ODF schema/manifest validation: rich header/footer
+  resources, master-page selection, per-section variants, floating images and
+  images within table cells remain outside the current model.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
   checks every edited document, including inactive apps. Cancelling retains edits,
   even after choosing Don't Save for another document in the same close attempt.

@@ -9,7 +9,9 @@ use office_core::{
 };
 use quick_xml::events::Event;
 use quick_xml::name::QName;
-use quick_xml::reader::Reader;
+use quick_xml::reader::NsReader;
+
+use super::xml::{self, content_images, image_part_path, part_error, XLINK_NS};
 
 use crate::FormatError;
 
@@ -37,7 +39,10 @@ pub fn parse_content_xml_with_pictures(
     xml: &str,
     pictures: &HashMap<String, Vec<u8>>,
 ) -> Result<Document, FormatError> {
-    let mut reader = Reader::from_str(xml);
+    // XML-only callers may omit images. The package loader reads all actual
+    // references before calling this parser.
+    content_images(xml)?;
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
 
     let mut text_styles: HashMap<String, TextProps> = HashMap::new();
@@ -120,7 +125,7 @@ pub fn parse_content_xml_with_pictures(
                         list_stack.push(kind);
                     }
                     "a" if in_paragraph => {
-                        current_link = attr(&e, "href");
+                        current_link = xml::namespaced_attr(&e, &reader, "href", XLINK_NS)?;
                     }
                     "table" if in_text => {
                         in_table = true;
@@ -154,7 +159,7 @@ pub fn parse_content_xml_with_pictures(
                         }
                     }
                     "image" if in_frame => {
-                        if let Some(href) = attr(&e, "href") {
+                        if let Some(href) = xml::namespaced_attr(&e, &reader, "href", XLINK_NS)? {
                             frame_href = Some(href);
                         }
                     }
@@ -162,9 +167,7 @@ pub fn parse_content_xml_with_pictures(
                         current_span_style = attr(&e, "style-name");
                     }
                     "s" if in_paragraph => {
-                        let count = attr(&e, "c")
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let count = xml::space_count(&e, &reader)?;
                         push_text(
                             &mut current_runs,
                             &" ".repeat(count),
@@ -216,9 +219,7 @@ pub fn parse_content_xml_with_pictures(
                         }
                     }
                     "s" if in_paragraph => {
-                        let count = attr(&e, "c")
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .unwrap_or(1);
+                        let count = xml::space_count(&e, &reader)?;
                         push_text(
                             &mut current_runs,
                             &" ".repeat(count),
@@ -249,7 +250,7 @@ pub fn parse_content_xml_with_pictures(
                         saw_soft_page_break = true;
                     }
                     "image" if in_frame => {
-                        if let Some(href) = attr(&e, "href") {
+                        if let Some(href) = xml::namespaced_attr(&e, &reader, "href", XLINK_NS)? {
                             frame_href = Some(href);
                         }
                     }
@@ -300,7 +301,9 @@ pub fn parse_content_xml_with_pictures(
             }
             Ok(Event::Text(t)) => {
                 if in_paragraph {
-                    let text = t.unescape().unwrap_or_default();
+                    let text = t
+                        .unescape()
+                        .map_err(|e| part_error("content.xml", xml::invalid(e.to_string())))?;
                     if !text.is_empty() {
                         push_text(
                             &mut current_runs,
@@ -311,6 +314,17 @@ pub fn parse_content_xml_with_pictures(
                         );
                     }
                 }
+            }
+            Ok(Event::CData(t)) if in_paragraph => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|e| part_error("content.xml", xml::invalid(e.to_string())))?;
+                push_text(
+                    &mut current_runs,
+                    text,
+                    current_span_style.as_deref(),
+                    &text_styles,
+                    current_link.as_deref(),
+                );
             }
             Ok(Event::End(e)) => {
                 let local = local_name(e.name());
@@ -577,7 +591,6 @@ fn is_pagebreak_style(name: Option<&str>, para_styles: &HashMap<String, ParaProp
     }
 }
 
-
 fn finish_frame_image(
     href: &Option<String>,
     name: &str,
@@ -586,12 +599,12 @@ fn finish_frame_image(
     pictures: &HashMap<String, Vec<u8>>,
 ) -> Option<Image> {
     let href = href.as_ref()?;
-    let data = pictures.get(href).cloned().or_else(|| {
-        // Also try without leading "./"
-        let trimmed = href.trim_start_matches("./");
-        pictures.get(trimmed).cloned()
-    })?;
-    let mime = mime_from_path(href).to_string();
+    let path = image_part_path(href).ok()?;
+    let data = pictures
+        .get(href)
+        .or_else(|| pictures.get(&path))
+        .cloned()?;
+    let mime = mime_from_path(&path).to_string();
     Some(Image::from_embedded(
         mime,
         data,
