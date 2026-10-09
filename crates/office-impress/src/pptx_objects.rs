@@ -626,6 +626,9 @@ pub(super) fn read_slide<Rd: Read + Seek>(
             ));
         }
         let sp = object.find(P, "spPr")?;
+        if picture {
+            sp.allowed(&[(A, "xfrm"), (A, "prstGeom")])?;
+        }
         let bounds = shape_properties(
             sp,
             if name == "rust-office:ellipse" {
@@ -999,6 +1002,7 @@ mod tests {
             ),
             xml.replace("</p:sld>", "<p:transition/></p:sld>"),
             xml.replace("prst=\"ellipse\"", "prst=\"triangle\""),
+            xml.replace("</a:prstGeom></p:spPr></p:pic>","</a:prstGeom><a:solidFill><a:srgbClr val=\"FFFFFF\"/></a:solidFill></p:spPr></p:pic>"),
             xml.replace("<a:stretch>", "<a:srcRect l=\"20000\"/><a:stretch>"),
             xml.replace("</p:spTree>", "<p:graphicFrame/></p:spTree>"),
             xml.replace("sz=\"2375\"", "sz=\"2375\" i=\"1\""),
