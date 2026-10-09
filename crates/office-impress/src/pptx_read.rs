@@ -398,6 +398,16 @@ fn parse_slide_xml(xml: &str) -> Result<Slide, PptxError> {
     let mut para = String::new();
     read_xml(xml, "sld", PRESENTATION_NS, |event, reader, _| {
         match event {
+            Event::Start(e) | Event::Empty(e)
+                if ["pic", "graphicFrame", "grpSp", "cxnSp", "contentPart"]
+                    .iter()
+                    .any(|name| element(reader, e.name(), name, PRESENTATION_NS)) =>
+            {
+                return Err(parse_error(format!(
+                    "unsupported slide object {}: importing it would lose content; only title/body text is supported",
+                    local_name(e.name())
+                )));
+            }
             Event::Start(e) => {
                 if element(reader, e.name(), "sp", PRESENTATION_NS) {
                     in_sp = true;
@@ -415,6 +425,11 @@ fn parse_slide_xml(xml: &str) -> Result<Slide, PptxError> {
                 }
             }
             Event::Empty(e) => {
+                if element(reader, e.name(), "sp", PRESENTATION_NS) {
+                    return Err(parse_error(
+                        "unsupported slide shape without text: importing it would lose content",
+                    ));
+                }
                 if in_sp && element(reader, e.name(), "br", DRAWING_NS) {
                     para.push('\n');
                 } else if in_sp && element(reader, e.name(), "p", DRAWING_NS) {
@@ -435,9 +450,12 @@ fn parse_slide_xml(xml: &str) -> Result<Slide, PptxError> {
                 } else if in_sp && element(reader, e.name(), "p", DRAWING_NS) {
                     paragraphs.push(std::mem::take(&mut para));
                 } else if in_sp && element(reader, e.name(), "sp", PRESENTATION_NS) {
-                    if has_text {
-                        shapes.push(paragraphs.join("\n"));
+                    if !has_text {
+                        return Err(parse_error(
+                            "unsupported slide shape without text: importing it would lose content",
+                        ));
                     }
+                    shapes.push(paragraphs.join("\n"));
                     in_sp = false;
                 }
             }
@@ -559,6 +577,55 @@ mod tests {
     fn original_part(path: &str) -> String {
         let bytes = crate::write_pptx_bytes(&Presentation::demo()).unwrap();
         read_zip_string(&mut ZipArchive::new(Cursor::new(bytes)).unwrap(), path).unwrap()
+    }
+
+    #[test]
+    fn unsupported_objects_reject_the_whole_package_with_part_context() {
+        let path = "ppt/slides/slide2.xml";
+        for object in [
+            "<p:pic/>",
+            "<p:pic><p:nvPicPr/></p:pic>",
+            "<p:graphicFrame/>",
+            "<p:grpSp><p:sp><p:txBody/></p:sp></p:grpSp>",
+            "<p:cxnSp/>",
+            "<p:contentPart/>",
+            "<p:sp/>",
+            "<p:sp><p:spPr/></p:sp>",
+        ] {
+            let xml = original_part(path).replace("</p:spTree>", &format!("{object}</p:spTree>"));
+            let error = load_pptx_bytes(&package(&[(path, Some(xml.as_bytes()))]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(path), "{error}");
+            assert!(error.contains("would lose content"), "{error}");
+        }
+    }
+
+    #[test]
+    fn object_guard_respects_namespace_aliases_and_strict_ooxml() {
+        for namespace in PRESENTATION_NS {
+            let xml = format!(
+                r#"<s:sld xmlns:s="{namespace}"><s:cSld><s:spTree><s:pic/></s:spTree></s:cSld></s:sld>"#
+            );
+            assert!(parse_slide_xml(&xml)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported slide object pic"));
+        }
+        let xml = format!(
+            r#"<p:sld xmlns:p="{}" xmlns:foreign="urn:example"><p:cSld><p:spTree><foreign:pic/></p:spTree></p:cSld></p:sld>"#,
+            PRESENTATION_NS[0]
+        );
+        assert!(parse_slide_xml(&xml).is_ok());
+    }
+
+    #[test]
+    fn unlisted_slide_with_unsupported_objects_does_not_block_import() {
+        let path = "ppt/slides/orphan.xml";
+        let xml =
+            original_part("ppt/slides/slide1.xml").replace("</p:spTree>", "<p:pic/></p:spTree>");
+        let loaded = load_pptx_bytes(&package(&[(path, Some(xml.as_bytes()))])).unwrap();
+        assert_eq!(loaded.slides, Presentation::demo().slides);
     }
 
     #[test]
