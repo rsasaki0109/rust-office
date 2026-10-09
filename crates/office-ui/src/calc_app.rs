@@ -751,6 +751,10 @@ impl CalcApp {
         let Some(path) = path else {
             return;
         };
+        self.open_path(&path);
+    }
+
+    fn open_path(&mut self, path: &std::path::Path) {
         let result = match path
             .extension()
             .and_then(|e| e.to_str())
@@ -758,15 +762,15 @@ impl CalcApp {
             .to_ascii_lowercase()
             .as_str()
         {
-            "csv" => load_csv_path(&path).map_err(|e| e.to_string()),
-            _ => load_xlsx_path(&path).map_err(|e| e.to_string()),
+            "csv" => load_csv_path(path).map_err(|e| e.to_string()),
+            _ => load_xlsx_path(path).map_err(|e| e.to_string()),
         };
         match result {
             Ok(wb) => {
                 self.reset_copy();
                 self.workbook = wb;
                 self.clear_recovery();
-                self.file_path = Some(path.clone());
+                self.file_path = Some(path.to_path_buf());
                 self.editing = false;
                 self.select_cell(CellAddr::new(0, 0), false);
                 self.scroll_to_active = true;
@@ -2312,5 +2316,43 @@ mod recovery_tests {
         app.enable_recovery(Ok(root));
         assert!(app.recovery.is_none() && app.last_error.is_some());
         assert!(app.save_to(&dir.path().join("normal.xlsx")));
+    }
+}
+
+#[cfg(test)]
+mod input_limit_tests {
+    use super::*;
+    #[test]
+    fn refused_open_keeps_draft_original_path_and_redo_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.xlsx");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        let mut app = CalcApp::new();
+        let original = dir.path().join("original.xlsx");
+        app.workbook.set_cell(CellAddr::new(0, 0), "first");
+        app.workbook.set_cell(CellAddr::new(0, 0), "second");
+        app.workbook.undo();
+        app.file_path = Some(original.clone());
+        app.editing = true;
+        app.edit_buf = "pending draft".into();
+        app.open_path(&huge);
+        assert_eq!(app.file_path, Some(original));
+        assert!(app.is_dirty() && app.editing);
+        assert_eq!(app.edit_buf, "pending draft");
+        assert!(app.workbook.can_redo());
+        assert_eq!(
+            app.workbook.active_sheet().raw(CellAddr::new(0, 0)),
+            "first"
+        );
+        app.editing = false;
+        assert!(app.workbook.redo());
+        assert_eq!(
+            app.workbook.active_sheet().raw(CellAddr::new(0, 0)),
+            "second"
+        );
+        assert!(app.save_to(&dir.path().join("after-refusal.xlsx")));
     }
 }

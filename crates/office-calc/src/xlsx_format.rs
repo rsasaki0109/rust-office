@@ -1,26 +1,26 @@
 //! Read supported XLSX presentation without relying on worksheet ZIP ordering.
 use crate::{parse_a1, CellFormat, Workbook, MAX_SHEET_COLS, MAX_SHEET_ROWS};
 use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
-use std::{collections::HashMap, fs::File, io::Read, path::Path};
+use std::{collections::HashMap, io::{Cursor, Read}};
 
 const MAIN: &[u8] = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const RELS: &[u8] = b"http://schemas.openxmlformats.org/package/2006/relationships";
 const DOCUMENT_RELS: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 type Attributes = HashMap<String, String>;
-type Archive = zip::ZipArchive<File>;
+type Archive<'a> = zip2::ZipArchive<Cursor<&'a [u8]>>;
 
-fn part(archive: &mut Archive, path: &str) -> Result<String, String> {
+fn part(archive: &mut Archive<'_>, path: &str) -> Result<String, String> {
     let mut file = archive.by_name(path).map_err(|e| format!("{path}: {e}"))?;
-    if file.size() > 32 * 1024 * 1024 {
-        return Err(format!("{path}: presentation XML exceeds 32 MiB"));
+    if file.size() > 8 * 1024 * 1024 {
+        return Err(format!("{path}: presentation XML exceeds 8 MiB"));
     }
     let mut bytes = Vec::new();
     file.by_ref()
-        .take(32 * 1024 * 1024 + 1)
+        .take(8 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() > 32 * 1024 * 1024 {
-        return Err(format!("{path}: presentation XML exceeds 32 MiB"));
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(format!("{path}: presentation XML exceeds 8 MiB"));
     }
     String::from_utf8(bytes).map_err(|e| format!("{path}: {e}"))
 }
@@ -166,9 +166,10 @@ fn builtin(id: usize) -> Option<&'static str> {
     })
 }
 
-pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
-    let mut archive = zip::ZipArchive::new(File::open(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+pub(crate) fn load(bytes: &[u8], workbook: &mut Workbook) -> Result<(), String> {
+    let mut archive = zip2::ZipArchive::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let mut copied_text = 0usize;
+    let mut entries = 0usize;
     let mut sheets = Vec::new();
     scan(
         &part(&mut archive, "xl/workbook.xml")?,
@@ -254,6 +255,10 @@ pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
                     ("xf", "cellXfs") => {
                         let id = integer(attrs, "numFmtId", 0)?;
                         let (code, builtin_number_format) = if let Some(code) = numbers.get(&id) {
+                            copied_text = copied_text.saturating_add(code.len());
+                            if copied_text > crate::xlsx_limits::MAX_TEXT_BYTES {
+                                return Err("XLSX presentation text exceeds 32 MiB".into());
+                            }
                             (code.clone(), None)
                         } else if let Some(code) = builtin(id) {
                             (code.to_owned(), None)
@@ -266,6 +271,9 @@ pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
                         let &(bold, italic) = fonts
                             .get(font_id)
                             .ok_or("Missing font referenced by cell format")?;
+                        if formats.len() >= crate::xlsx_limits::MAX_CELLS {
+                            return Err("XLSX exceeds the style count limit".into());
+                        }
                         formats.push(CellFormat {
                             number_format: code,
                             builtin_number_format,
@@ -319,6 +327,10 @@ pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
                     // XLSX column widths use a Calibri-11 digit width of seven pixels.
                     let width = (size("width")? * 7.0).round();
                     DimensionAxis::Columns.validate(width).map_err(|e| e.to_string())?;
+                    entries = entries.saturating_add(last - first + 1);
+                    if entries > crate::xlsx_limits::MAX_CELLS {
+                        return Err("XLSX presentation exceeds 100000 entries".into());
+                    }
                     for col in first - 1..last { sheet.set_dimension(DimensionAxis::Columns, col as u32, width); }
                 }
                 if name == "row" && parent == "sheetData" && attrs.contains_key("ht") {
@@ -326,6 +338,10 @@ pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
                     if row == 0 || row > MAX_SHEET_ROWS as usize { return Err("Invalid row-size index".into()); }
                     let height = size("ht")?;
                     DimensionAxis::Rows.validate(height).map_err(|e| e.to_string())?;
+                    entries = entries.saturating_add(1);
+                    if entries > crate::xlsx_limits::MAX_CELLS {
+                        return Err("XLSX presentation exceeds 100000 entries".into());
+                    }
                     sheet.set_dimension(DimensionAxis::Rows, row as u32 - 1, height);
                 }
                 if name == "c" && parent == "row" {
@@ -338,6 +354,11 @@ pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
                             .map_err(|e| e.to_string())?;
                         if addr.col >= MAX_SHEET_COLS || addr.row >= MAX_SHEET_ROWS {
                             return Err("Styled cell exceeds XLSX worksheet bounds".into());
+                        }
+                        copied_text = copied_text.saturating_add(format.number_format.len());
+                        entries = entries.saturating_add(1);
+                        if copied_text > crate::xlsx_limits::MAX_TEXT_BYTES || entries > crate::xlsx_limits::MAX_CELLS {
+                            return Err("XLSX presentation exceeds entry or text limits".into());
                         }
                         sheet.set_format(addr, format.clone());
                     }
@@ -407,6 +428,28 @@ mod tests {
             output.write_all(xml.as_bytes()).unwrap();
         }
         output.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn repeated_format_codes_are_bounded_before_copying() {
+        let bytes = write_xlsx_bytes(&fixture()).unwrap();
+        for repeat_definitions in [true, false] {
+            let code = "0".repeat(1024 * 1024);
+            let definitions = if repeat_definitions { 40 } else { 1 };
+            let styles = format!("<styleSheet xmlns=\"{}\"><numFmts><numFmt numFmtId=\"164\" formatCode=\"{code}\"/></numFmts><fonts><font/></fonts><cellXfs>{}</cellXfs></styleSheet>",
+                std::str::from_utf8(MAIN).unwrap(), "<xf numFmtId=\"164\" fontId=\"0\"/>".repeat(definitions));
+            let cells = (1..=40).map(|row| format!("<row r=\"{row}\"><c r=\"A{row}\" s=\"0\"/></row>"))
+                .collect::<String>();
+            let worksheet = format!("<worksheet xmlns=\"{}\"><sheetData>{cells}</sheetData></worksheet>",
+                std::str::from_utf8(MAIN).unwrap());
+            let changed = rewrite(&bytes, |name, xml| {
+                let xml = if name == "xl/styles.xml" { styles.clone() }
+                    else if name.starts_with("xl/worksheets/") { worksheet.clone() } else { xml };
+                (name.into(), xml)
+            });
+            crate::xlsx_limits::package(&changed).unwrap();
+            assert!(load(&changed, &mut fixture()).unwrap_err().contains("text"));
+        }
     }
 
     #[test]

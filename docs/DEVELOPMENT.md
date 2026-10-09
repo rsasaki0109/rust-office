@@ -594,9 +594,72 @@ copy cleanup and normal close were verified.
 Native Windows/macOS crash recovery remains unverified. Recovery across all three
 modules is implemented in the pending PR stack; aggregate admission limits for
 other formats and main acceptance remain outstanding. Completion stays 65%.
+
+
+### XLSX input admission
+
+Spreadsheet path reads check file metadata and use a bounded read capped at 64 MiB,
+including a second check if the file grows. Parsing uses those same bytes rather
+than reopening the path. ZIP directory admission checks the end record before
+creating the ZIP reader (the same zip 2.x implementation as calamine) and caps entry count at 4096 and total declared expanded
+size at 128 MiB, including orphan parts. ZIP64 directories, ambiguous part names
+(case-insensitive or leading-slash aliases) and XLSB packages are unsupported.
+Other legacy spreadsheet formats receive file/directory and final model checks;
+XLS/ODS dense allocations and ODS repeat expansion still need separate protection.
+
+XLSX is identified by its workbook part, even under a renamed extension, and goes
+directly to calamine's XLSX reader after admission. Each XML/rels part and each
+part in the worksheet/chartsheet/dialogsheet folders is limited to 8 MiB declared
+and actual bytes. The folder checks include unusual non-XML extensions. Bounded
+reads validate actual XML and CRC errors, and actual XML totals are also capped.
+Admission supports UTF-8 XML and rejects document types/truncation. Worksheet
+paths are treated as sheets even with unexpected XML root names, matching the
+underlying reader's allocation behavior.
+
+Before dense ranges are allocated, XML admission limits total cell records to
+100,000, workbook sheet declarations to 1000, Excel grid coordinates, each declared
+dimension/actual cell span to 1,000,000 cells and the sum of actual sheet spans to
+1,000,000. Missing dimensions and implicit row/cell coordinates are checked too.
+Shared-formula indices must be below 100,000; reference ranges share a separate
+1,000,000-cell aggregate budget. Expanded formula strings have a 32 MiB estimated
+budget, using a conservative factor of 16 for coordinate substitution in shared
+formulas. The estimate can reject files below their actual expanded byte size.
+
+Shared strings are inspected before sheets, regardless of ZIP order. References
+are charged against a 32 MiB replicated-text budget before calamine clones them.
+A table holds at most 1,000,000 entries. Records with no supported text/rich-text
+content are rejected because calamine omits them; this keeps reference-size indices
+aligned. Missing string/base-formula indices are errors. Inline/imported raw text
+and formulas also share a 32 MiB import budget. The final model checks sheet/cell
+counts, coordinates, dense spans and raw text size. These are admission bounds,
+not precise peak RAM or processing-time guarantees.
+
+XLSX export applies model checks before column conversion, preventing out-of-grid
+columns from wrapping to `u16`. Output passes the same package admission before
+atomic replacement, so refused exports leave existing destination bytes intact.
+Refused Open preserves the current workbook, formula-bar draft, path and history;
+subsequent editing and Save As remain available.
+
+Regression coverage includes dense boundaries, implicit cells, oversized shared
+indices/ranges/text replication, empty shared-string index alignment, malformed
+XML, unusual sheet extensions/roots, orphan sizes, ZIP aliases, file caps, renamed
+XLSX and failed-export retention. Linux Xvfb/Openbox verification refused oversized
+files, sparse-range expansion and declared ZIP expansion, retained the original
+save destination and redo history, then saved edited Japanese cells/formulas to a
+new XLSX path verified with openpyxl. DOCX/ODT and legacy spreadsheet aggregate
+limits remain pending; completion stays 65% until main acceptance of the full
+stability milestone.
 ### Calc 復旧と書式・寸法の統合確認
 
 復旧データはセルの値・数式・編集中の入力に加え、書式付きの空セル、
 数値書式、太字・斜体、既定の行高／列幅と個別の寸法を保持する。
 書式情報のない従来の復旧データも読み込める。復旧前にアドレスの範囲、
 重複、寸法の値と総エントリ数を検証する。
+
+### XLSX 入力制限と書式・寸法の統合確認
+
+書式の読込にも、上限検査済みの同じファイル内容と ZIP パーサーを使用する。
+XML は 8 MiB、複製される数値書式の文字列は 32 MiB、書式・寸法の読込は
+100,000 エントリを上限とする。書式付きの空セルも保存前のアドレス・範囲検査に
+含め、行高・列幅の値と添字も検査する。既定の列幅を反映した最終 ZIP に対して
+再度パッケージ検査を行ってから保存先を置き換える。
