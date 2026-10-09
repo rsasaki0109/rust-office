@@ -68,6 +68,7 @@ impl OfficeApp {
     }
 
     fn request_close(&mut self, ctx: &egui::Context) {
+        self.impress.end_show(ctx);
         if self.dirty_modes().is_empty() {
             self.close_authorized = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

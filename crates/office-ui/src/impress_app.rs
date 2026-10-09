@@ -9,6 +9,7 @@ use office_impress::{
     Presentation, ShapeKind, SlideObject, Theme, SLIDE_HEIGHT_PT, SLIDE_WIDTH_PT,
 };
 
+use crate::slideshow::{self, Navigation, SlideShow};
 use crate::theme::{CANVAS_BG, STATUS_BG, TOOLBAR_BG};
 use crate::unsaved::{self, Choice, DocumentAction};
 
@@ -31,6 +32,8 @@ pub struct ImpressApp {
     selection_slide: usize,
     drag_session: Option<(usize, usize, bool)>,
     textures: HashMap<usize, (Arc<Vec<u8>>, egui::TextureHandle)>,
+    show: Option<SlideShow>,
+    pending_show: Option<bool>,
     pub pending_switch: Option<SwitchTo>,
 }
 
@@ -48,6 +51,8 @@ impl ImpressApp {
             selection_slide: 0,
             drag_session: None,
             textures: HashMap::new(),
+            show: None,
+            pending_show: None,
             pending_switch: None,
         }
     }
@@ -254,6 +259,17 @@ impl ImpressApp {
         {
             return;
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            Self::toggle_fullscreen(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F5)) {
+            self.pending_show = Some(true);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+            self.pending_show = Some(false);
+            return;
+        }
         let command = egui::Modifiers::COMMAND;
         if ctx.input_mut(|i| {
             i.consume_key(command | egui::Modifiers::SHIFT, egui::Key::Z)
@@ -389,6 +405,21 @@ impl ImpressApp {
                     {
                         self.insert_image_path(&path);
                     }
+                    ui.close();
+                }
+            });
+            ui.menu_button("Slide Show", |ui| {
+                if ui.button("Window fullscreen  F11").clicked() {
+                    Self::toggle_fullscreen(ui.ctx());
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("From beginning  F5").clicked() {
+                    self.pending_show = Some(false);
+                    ui.close();
+                }
+                if ui.button("From current slide  Shift+F5").clicked() {
+                    self.pending_show = Some(true);
                     ui.close();
                 }
             });
@@ -607,7 +638,6 @@ impl ImpressApp {
         let Some(mut slide) = self.presentation.active_slide().cloned() else {
             return;
         };
-        let theme = self.presentation.theme.clone();
         let avail = ui.available_size();
         let aspect = SLIDE_WIDTH_PT / SLIDE_HEIGHT_PT;
         let w = (avail.x - 16.0)
@@ -616,34 +646,7 @@ impl ImpressApp {
         let h = w / aspect;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
         let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, rgb(theme.background));
-        let scale = h / SLIDE_HEIGHT_PT;
         self.selected_object = self.selected_object.min(slide.objects.len() + 1);
-        let mut active_images = Vec::new();
-        for (index, object) in slide.objects.iter().enumerate() {
-            if let ObjectKind::Image { data } = &object.kind {
-                let key = Arc::as_ptr(data) as usize;
-                active_images.push(key);
-                if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(key) {
-                    if let Ok(image) = office_impress::decode_image(data) {
-                        let rgba = image.thumbnail(2048, 2048).to_rgba8();
-                        let color = egui::ColorImage::from_rgba_unmultiplied(
-                            [rgba.width() as usize, rgba.height() as usize],
-                            rgba.as_raw(),
-                        );
-                        entry.insert((
-                            data.clone(),
-                            ui.ctx().load_texture(
-                                format!("impress_image_{index}"),
-                                color,
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        self.textures.retain(|key, _| active_images.contains(key));
         let mut drag = None;
         // Register in paint order: the last (frontmost) interaction wins overlaps.
         for index in 0..slide.objects.len() + 2 {
@@ -697,8 +700,53 @@ impl ImpressApp {
         } else {
             self.drag_session = None;
         }
+        self.paint_slide(ui, rect, &slide);
+        let selected_rect = bounds_rect(rect, object_bounds(&slide, self.selected_object));
+        painter.rect_stroke(
+            selected_rect,
+            0.0,
+            egui::Stroke::new(1.5, Color32::from_rgb(50, 120, 220)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            egui::Rect::from_center_size(selected_rect.right_bottom(), Vec2::splat(8.0)),
+            0.0,
+            Color32::from_rgb(50, 120, 220),
+        );
+    }
+    /// Editor and slide show deliberately share the same object rendering.
+    fn paint_slide(&mut self, ui: &Ui, rect: egui::Rect, slide: &office_impress::Slide) {
+        let theme = &self.presentation.theme;
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, rgb(theme.background));
+        let scale = rect.height() / SLIDE_HEIGHT_PT;
+        let mut active_images = Vec::new();
+        for (index, object) in slide.objects.iter().enumerate() {
+            if let ObjectKind::Image { data } = &object.kind {
+                let key = Arc::as_ptr(data) as usize;
+                active_images.push(key);
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(key) {
+                    if let Ok(image) = office_impress::decode_image(data) {
+                        let rgba = image.thumbnail(2048, 2048).to_rgba8();
+                        let color = egui::ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        );
+                        entry.insert((
+                            data.clone(),
+                            ui.ctx().load_texture(
+                                format!("impress_image_{index}"),
+                                color,
+                                egui::TextureOptions::LINEAR,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        self.textures.retain(|key, _| active_images.contains(key));
         for index in 0..slide.objects.len() + 2 {
-            let object_rect = bounds_rect(rect, object_bounds(&slide, index));
+            let object_rect = bounds_rect(rect, object_bounds(slide, index));
             let clipped = painter.with_clip_rect(object_rect.intersect(rect));
             if index < 2 {
                 let (text, font, color) = if index == 0 {
@@ -740,18 +788,122 @@ impl ImpressApp {
                 }
             }
         }
-        let selected_rect = bounds_rect(rect, object_bounds(&slide, self.selected_object));
-        painter.rect_stroke(
-            selected_rect,
-            0.0,
-            egui::Stroke::new(1.5, Color32::from_rgb(50, 120, 220)),
-            egui::StrokeKind::Inside,
-        );
-        painter.rect_filled(
-            egui::Rect::from_center_size(selected_rect.right_bottom(), Vec2::splat(8.0)),
-            0.0,
-            Color32::from_rgb(50, 120, 220),
-        );
+    }
+
+    fn toggle_fullscreen(ctx: &egui::Context) {
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        ctx.request_repaint();
+    }
+
+    fn start_show(&mut self, ctx: &egui::Context, from_current: bool) {
+        if self.pending_action.is_some() || self.pending_delete.is_some() || self.show.is_some() {
+            return;
+        }
+        let index = if from_current {
+            self.presentation.active
+        } else {
+            0
+        };
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+        let Some(show) = SlideShow::new(index, self.presentation.slides.len(), fullscreen) else {
+            return;
+        };
+        self.show = Some(show);
+        self.edit_session = None;
+        self.drag_session = None;
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        ctx.request_repaint();
+    }
+
+    pub(super) fn end_show(&mut self, ctx: &egui::Context) {
+        self.pending_show = None;
+        if let Some(show) = self.show.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(show.was_fullscreen));
+            ctx.request_repaint();
+        }
+    }
+
+    fn navigate_show(&mut self, ctx: &egui::Context, navigation: Navigation) {
+        if let Some(show) = &mut self.show {
+            if !show.navigate(navigation, self.presentation.slides.len()) {
+                self.end_show(ctx);
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn slide_show_ui(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let enabled = ui.is_enabled() && !ctx.memory(|m| m.top_modal_layer().is_some());
+        if enabled {
+            if let Some(navigation) = slideshow::keyboard_navigation(&ctx) {
+                self.navigate_show(&ctx, navigation);
+            }
+        }
+        let Some(show) = self.show else {
+            return;
+        };
+        let count = self.presentation.slides.len();
+        let mut navigation = None;
+        egui::Panel::bottom("impress_show_controls")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_gray(25))
+                    .inner_margin(8.0),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(show.index > 0, egui::Button::new("Previous"))
+                        .clicked()
+                    {
+                        navigation = Some(Navigation::Previous);
+                    }
+                    ui.label(
+                        RichText::new(format!("{} / {count}", show.index + 1))
+                            .color(Color32::WHITE),
+                    );
+                    if ui
+                        .add_enabled(show.index + 1 < count, egui::Button::new("Next"))
+                        .clicked()
+                    {
+                        navigation = Some(Navigation::Next);
+                    }
+                    ui.label(
+                        RichText::new("Arrows / Space · Home / End").color(Color32::LIGHT_GRAY),
+                    );
+                    if ui.button("Exit (Esc)").clicked() {
+                        navigation = Some(Navigation::Exit);
+                    }
+                });
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::BLACK))
+            .show(ui, |ui| {
+                let area = ui.max_rect();
+                let rect = fitted_slide_rect(area);
+                if let Some(slide) = self.presentation.slides.get(show.index).cloned() {
+                    self.paint_slide(ui, rect, &slide);
+                }
+                let response =
+                    ui.interact(area, egui::Id::new("impress_show_canvas"), Sense::click());
+                if enabled && response.clicked() {
+                    navigation = Some(Navigation::Next);
+                } else if enabled && response.secondary_clicked() {
+                    navigation = Some(Navigation::Previous);
+                }
+            });
+        if enabled {
+            if let Some(navigation) = navigation {
+                self.navigate_show(&ctx, navigation);
+            }
+        }
     }
 }
 
@@ -763,9 +915,21 @@ impl Default for ImpressApp {
 
 impl App for ImpressApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.document_ui(ui);
+    }
+}
+
+impl ImpressApp {
+    fn document_ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
-        self.handle_keys(&ctx);
+        if self.show.is_some() {
+            self.slide_show_ui(ui);
+            return;
+        }
+        if ui.is_enabled() {
+            self.handle_keys(&ctx);
+        }
         self.show_unsaved_dialog(&ctx);
         self.show_delete_dialog(&ctx);
         if self.pending_action.is_some() || self.pending_delete.is_some() {
@@ -857,6 +1021,12 @@ impl App for ImpressApp {
             .show(ui, |ui| {
                 self.canvas(ui);
             });
+        // Apply text events in this frame before entering the read-only presentation.
+        if let Some(from_current) = self.pending_show.take() {
+            if ui.is_enabled() {
+                self.start_show(&ctx, from_current);
+            }
+        }
     }
 }
 
@@ -1221,5 +1391,194 @@ mod canvas_tests {
         assert!(app.presentation.slides[0].objects[0].bounds.x > bounds.x);
         app.history(false);
         assert_eq!(app.presentation.slides[0].objects[0].bounds, bounds);
+    }
+}
+
+fn fitted_slide_rect(area: egui::Rect) -> egui::Rect {
+    let aspect = SLIDE_WIDTH_PT / SLIDE_HEIGHT_PT;
+    let width = area.width().min(area.height() * aspect).max(0.0);
+    egui::Rect::from_center_size(area.center(), egui::vec2(width, width / aspect))
+}
+
+#[cfg(test)]
+mod show_tests {
+    use super::*;
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        app: &mut ImpressApp,
+        events: Vec<egui::Event>,
+        fullscreen: bool,
+    ) -> Vec<egui::ViewportCommand> {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .fullscreen = Some(fullscreen);
+        let mut output = ctx.run_ui(input, |ui| app.document_ui(ui));
+        output.textures_delta.clear();
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .clone()
+    }
+
+    #[test]
+    fn start_current_navigate_exit_preserves_document_selection_destination_and_history() {
+        use egui::{Key, Modifiers};
+        let ctx = egui::Context::default();
+        let mut app = ImpressApp::new();
+        app.presentation.set_active(1);
+        app.insert_object(SlideObject::shape(ShapeKind::Rectangle));
+        app.selection_slide = 1;
+        let dir = tempfile::tempdir().unwrap();
+        app.file_path = Some(dir.path().join("original.json"));
+        let original = app.presentation.clone();
+        let path = app.file_path.clone();
+        let selected = app.selected_object;
+        let commands = frame(&ctx, &mut app, vec![key(Key::F5, Modifiers::SHIFT)], false);
+        assert!(commands
+            .iter()
+            .any(|cmd| matches!(cmd, egui::ViewportCommand::Fullscreen(true))));
+        assert_eq!(app.show.unwrap().index, 1);
+        for (key_value, index) in [
+            (Key::Home, 0),
+            (Key::Space, 1),
+            (Key::Enter, 2),
+            (Key::PageDown, 2),
+            (Key::PageUp, 1),
+            (Key::End, 2),
+            (Key::ArrowUp, 1),
+            (Key::ArrowRight, 2),
+        ] {
+            frame(&ctx, &mut app, vec![key(key_value, Modifiers::NONE)], true);
+            assert_eq!(app.show.unwrap().index, index);
+        }
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::Text("ignored".into()),
+                key(Key::Z, Modifiers::COMMAND),
+                key(Key::N, Modifiers::COMMAND),
+            ],
+            true,
+        );
+        assert_eq!(app.presentation, original);
+        let commands = frame(
+            &ctx,
+            &mut app,
+            vec![key(Key::Escape, Modifiers::NONE)],
+            true,
+        );
+        assert!(commands
+            .iter()
+            .any(|cmd| matches!(cmd, egui::ViewportCommand::Fullscreen(false))));
+        assert!(app.show.is_none());
+        frame(&ctx, &mut app, vec![], false);
+        assert_eq!(app.presentation, original);
+        assert_eq!(app.file_path, path);
+        assert_eq!(app.selected_object, selected);
+        app.history(false);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn final_text_input_is_committed_before_f5_and_show_typing_is_ignored() {
+        use egui::{Key, Modifiers};
+        let ctx = egui::Context::default();
+        let mut app = ImpressApp::new();
+        frame(&ctx, &mut app, vec![], false);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("impress_text", 0usize, 0usize))));
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::Text("追加".into()),
+                key(Key::F5, Modifiers::NONE),
+            ],
+            false,
+        );
+        assert!(app.show.is_some());
+        assert!(app.presentation.slides[0].title.text.contains("追加"));
+        let edited = app.presentation.clone();
+        frame(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::Text("unwanted".into()),
+                key(Key::Space, Modifiers::NONE),
+            ],
+            true,
+        );
+        assert_eq!(app.presentation, edited);
+        frame(
+            &ctx,
+            &mut app,
+            vec![key(Key::Escape, Modifiers::NONE)],
+            true,
+        );
+        app.history(false);
+        assert!(!app.presentation.slides[0].title.text.contains("追加"));
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn restore_already_fullscreen_and_block_start_during_confirmation_or_empty_deck() {
+        use egui::{Key, Modifiers};
+        let ctx = egui::Context::default();
+        let mut app = ImpressApp::new();
+        app.presentation.set_active(2);
+        frame(&ctx, &mut app, vec![key(Key::F5, Modifiers::NONE)], true);
+        assert_eq!(app.show.unwrap().index, 0);
+        let commands = frame(
+            &ctx,
+            &mut app,
+            vec![key(Key::Escape, Modifiers::NONE)],
+            true,
+        );
+        assert!(commands
+            .iter()
+            .any(|cmd| matches!(cmd, egui::ViewportCommand::Fullscreen(true))));
+        assert_eq!(app.presentation.active, 2);
+        app.pending_delete = Some(2);
+        frame(&ctx, &mut app, vec![key(Key::F5, Modifiers::NONE)], true);
+        assert!(app.show.is_none());
+        app.pending_delete = None;
+        app.pending_action = Some(DocumentAction::New);
+        app.start_show(&ctx, false);
+        assert!(app.show.is_none());
+        app.pending_action = None;
+        app.presentation.slides.clear();
+        app.start_show(&ctx, false);
+        assert!(app.show.is_none());
+    }
+
+    #[test]
+    fn fitted_slide_has_centered_letterboxing_in_wide_and_tall_windows() {
+        for size in [egui::vec2(1800.0, 700.0), egui::vec2(700.0, 1800.0)] {
+            let area = egui::Rect::from_min_size(egui::pos2(20.0, 40.0), size);
+            let slide = fitted_slide_rect(area);
+            assert_eq!(slide.center(), area.center());
+            assert!((slide.width() / slide.height() - 16.0 / 9.0).abs() < 0.0001);
+            assert!(area.contains_rect(slide));
+        }
     }
 }
