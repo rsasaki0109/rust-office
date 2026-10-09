@@ -25,6 +25,8 @@ pub struct ImpressApp {
     status_message: String,
     last_error: Option<String>,
     pending_action: Option<DocumentAction>,
+    pending_delete: Option<usize>,
+    edit_session: Option<(usize, usize)>,
     pub pending_switch: Option<SwitchTo>,
 }
 
@@ -36,6 +38,8 @@ impl ImpressApp {
             status_message: "Ready — Impress MVP (themes, slides, JSON, PPTX open/export)".into(),
             last_error: None,
             pending_action: None,
+            pending_delete: None,
+            edit_session: None,
             pending_switch: None,
         }
     }
@@ -75,6 +79,7 @@ impl ImpressApp {
     }
 
     fn do_new_deck(&mut self) {
+        self.edit_session = None;
         self.presentation = Presentation::new();
         self.file_path = None;
         self.set_status("New presentation");
@@ -108,6 +113,7 @@ impl ImpressApp {
         };
         match result {
             Ok(p) => {
+                self.edit_session = None;
                 self.presentation = p;
                 self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Opened {}", path.display()));
@@ -214,6 +220,73 @@ impl ImpressApp {
         }
     }
 
+    fn history(&mut self, redo: bool) {
+        self.edit_session = None;
+        let changed = if redo {
+            self.presentation.redo()
+        } else {
+            self.presentation.undo()
+        };
+        if changed {
+            self.set_status(if redo { "Redone" } else { "Undone" });
+        }
+    }
+
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if self.pending_action.is_some()
+            || self.pending_delete.is_some()
+            || ctx.memory(|m| m.top_modal_layer().is_some())
+        {
+            return;
+        }
+        let command = egui::Modifiers::COMMAND;
+        if ctx.input_mut(|i| {
+            i.consume_key(command | egui::Modifiers::SHIFT, egui::Key::Z)
+                || i.consume_key(command, egui::Key::Y)
+        }) {
+            self.history(true);
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::Z)) {
+            self.history(false);
+        }
+        if ctx.input_mut(|i| i.consume_key(command | egui::Modifiers::SHIFT, egui::Key::S)) {
+            self.save_json_as();
+        } else if ctx.input_mut(|i| i.consume_key(command, egui::Key::S)) {
+            self.save_file();
+        }
+        if ctx.input_mut(|i| i.consume_key(command, egui::Key::O)) {
+            self.open_file();
+        }
+        if ctx.input_mut(|i| i.consume_key(command, egui::Key::N)) {
+            self.new_deck();
+        }
+    }
+
+    fn show_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_delete else {
+            return;
+        };
+        let response = egui::Modal::new(egui::Id::new("impress_delete_slide")).show(ctx, |ui| {
+            ui.heading("Delete slide?");
+            ui.label(format!("Delete slide {}? Undo can restore it.", index + 1));
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    self.pending_delete = None;
+                }
+                if ui.button("Delete").clicked() {
+                    self.pending_delete = None;
+                    self.edit_session = None;
+                    if self.presentation.active == index && self.presentation.delete_active_slide()
+                    {
+                        self.set_status("Slide deleted");
+                    }
+                }
+            });
+        });
+        if response.should_close() {
+            self.pending_delete = None;
+        }
+    }
+
     fn menu_bar(&mut self, ui: &mut Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
@@ -252,8 +325,31 @@ impl ImpressApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(
+                        self.presentation.can_undo(),
+                        egui::Button::new("Undo  Ctrl+Z"),
+                    )
+                    .clicked()
+                {
+                    self.history(false);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.presentation.can_redo(),
+                        egui::Button::new("Redo  Ctrl+Shift+Z"),
+                    )
+                    .clicked()
+                {
+                    self.history(true);
+                    ui.close();
+                }
+            });
             ui.menu_button("Insert", |ui| {
                 if ui.button("New Slide").clicked() {
+                    self.edit_session = None;
                     self.presentation.insert_slide_after_current();
                     self.set_status("Slide inserted");
                     ui.close();
@@ -263,6 +359,7 @@ impl ImpressApp {
                 for theme in Theme::builtins() {
                     let selected = self.presentation.theme.name == theme.name;
                     if ui.selectable_label(selected, theme.name.clone()).clicked() {
+                        self.edit_session = None;
                         self.presentation.apply_theme(theme);
                         self.set_status("Theme applied");
                         ui.close();
@@ -288,16 +385,45 @@ impl ImpressApp {
                     .map(|s| format!("{}. {s}", i + 1))
                     .unwrap_or_else(|| format!("{}. (untitled)", i + 1));
                 if ui.selectable_label(i == active, label).clicked() {
+                    self.edit_session = None;
                     self.presentation.set_active(i);
                 }
             }
             ui.separator();
             if ui.button("+ Slide").clicked() {
+                self.edit_session = None;
                 self.presentation.add_slide();
             }
-            if ui.button("Delete slide").clicked() {
-                self.presentation.delete_active_slide();
-                self.set_status("Slide deleted");
+            if ui.button("Duplicate slide").clicked() {
+                self.edit_session = None;
+                self.presentation.duplicate_active_slide();
+            }
+            let active = self.presentation.active;
+            if ui
+                .add_enabled(active > 0, egui::Button::new("Move up"))
+                .clicked()
+            {
+                self.edit_session = None;
+                self.presentation.move_active_slide(active - 1);
+            }
+            if ui
+                .add_enabled(
+                    active + 1 < self.presentation.slides.len(),
+                    egui::Button::new("Move down"),
+                )
+                .clicked()
+            {
+                self.edit_session = None;
+                self.presentation.move_active_slide(active + 1);
+            }
+            if ui
+                .add_enabled(
+                    self.presentation.slides.len() > 1,
+                    egui::Button::new("Delete slide…"),
+                )
+                .clicked()
+            {
+                self.pending_delete = Some(self.presentation.active);
             }
         });
     }
@@ -376,8 +502,10 @@ impl App for ImpressApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        self.handle_keys(&ctx);
         self.show_unsaved_dialog(&ctx);
-        if self.pending_action.is_some() {
+        self.show_delete_dialog(&ctx);
+        if self.pending_action.is_some() || self.pending_delete.is_some() {
             ui.disable();
         }
 
@@ -414,7 +542,6 @@ impl App for ImpressApp {
                 self.slide_list(ui);
             });
 
-        let mut edited = false;
         egui::Panel::right("impress_edit")
             .resizable(true)
             .default_size(280.0)
@@ -422,47 +549,41 @@ impl App for ImpressApp {
             .show(ui, |ui| {
                 ui.label(RichText::new("Edit").strong());
                 ui.separator();
-                if let Some(slide) = self.presentation.active_slide_mut() {
-                    ui.label("Title");
-                    if ui
-                        .add(
-                            egui::TextEdit::multiline(&mut slide.title.text)
-                                .desired_rows(2)
+                if let Some(mut slide) = self.presentation.active_slide().cloned() {
+                    let mut changed_field = None;
+                    let mut focused = false;
+                    for (field, label, text, rows) in [
+                        (0, "Title", &mut slide.title.text, 2),
+                        (1, "Body", &mut slide.body.text, 10),
+                        (2, "Notes", &mut slide.notes, 3),
+                    ] {
+                        ui.label(label);
+                        let response = ui.add(
+                            egui::TextEdit::multiline(text)
+                                .id(egui::Id::new((
+                                    "impress_text",
+                                    self.presentation.active,
+                                    field,
+                                )))
+                                .desired_rows(rows)
                                 .desired_width(f32::INFINITY),
-                        )
-                        .changed()
-                    {
-                        edited = true;
+                        );
+                        focused |= response.has_focus();
+                        if response.changed() {
+                            changed_field = Some(field);
+                        }
+                        ui.add_space(8.0);
                     }
-                    ui.add_space(8.0);
-                    ui.label("Body");
-                    if ui
-                        .add(
-                            egui::TextEdit::multiline(&mut slide.body.text)
-                                .desired_rows(10)
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed()
-                    {
-                        edited = true;
-                    }
-                    ui.add_space(8.0);
-                    ui.label("Notes");
-                    if ui
-                        .add(
-                            egui::TextEdit::multiline(&mut slide.notes)
-                                .desired_rows(3)
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed()
-                    {
-                        edited = true;
+                    if let Some(field) = changed_field {
+                        let session = (self.presentation.active, field);
+                        self.presentation
+                            .update_active_slide(slide, self.edit_session == Some(session));
+                        self.edit_session = Some(session);
+                    } else if !focused {
+                        self.edit_session = None;
                     }
                 }
             });
-        if edited {
-            self.presentation.mark_dirty();
-        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(CANVAS_BG).inner_margin(12.0))
@@ -618,5 +739,50 @@ mod tests {
         assert!(!app.is_dirty());
         assert!(app.file_path.is_none());
         assert_eq!(app.presentation.slides.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn failed_open_and_save_keep_history_then_successful_save_tracks_revision() {
+        let mut app = ImpressApp::new();
+        app.presentation.duplicate_active_slide();
+        let slides = app.presentation.slides.clone();
+        app.open_path(std::path::Path::new("/nonexistent/impress.pptx"));
+        assert_eq!(app.presentation.slides, slides);
+        assert!(app.presentation.can_undo());
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        assert!(!app.save_json_to(&blocked.join("deck.json")));
+        assert!(app.presentation.is_dirty());
+        assert!(app.presentation.can_undo());
+        let path = dir.path().join("deck.json");
+        assert!(app.save_json_to(&path));
+        app.presentation.move_active_slide(3);
+        app.history(false);
+        assert!(!app.is_dirty());
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+        assert_eq!(load_json_path(&path).unwrap().slides, slides);
+    }
+
+    #[test]
+    fn duplicate_and_reorder_export_in_pptx_slide_order() {
+        let mut app = ImpressApp::new();
+        app.presentation.duplicate_active_slide();
+        app.presentation.move_active_slide(3);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reordered.pptx");
+        write_pptx_path(&app.presentation, &path).unwrap();
+        let loaded = load_pptx_path(&path).unwrap();
+        let text = |p: &Presentation| p.slides.iter().map(|s| s.plain_text()).collect::<Vec<_>>();
+        assert_eq!(text(&loaded), text(&app.presentation));
+        assert!(app.is_dirty());
     }
 }

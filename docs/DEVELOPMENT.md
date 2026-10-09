@@ -251,3 +251,14 @@ cannot exchange HTML clipboard data, plain-text copy/paste remains available
 without reference translation. Sheet-qualified references can be translated,
 but evaluating cross-sheet formulas, named ranges and structured references is
 still outside the current formula engine.
+
+
+Impress slide operations support duplicate, move up/down, confirmed deletion
+(with the last slide protected), and bounded 100-operation Undo/Redo. History
+covers existing title/body text boxes, notes and themes; consecutive typing in
+one field is grouped until focus changes, another operation or a save boundary.
+Undo back to the saved revision clears the unsaved marker. Native JSON stores
+slide order, text box geometry and notes, but never runtime history. PPTX remains
+the existing basic title/body import/export subset; this change does not add
+speaker-note or arbitrary shape fidelity. Direct model mutation followed by
+`mark_dirty` clears history to avoid replaying operations against unrelated data.
