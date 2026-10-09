@@ -1724,6 +1724,35 @@ mod pdf_tests {
 mod pptx_object_tests {
     use super::*;
     #[test]
+    fn oversized_pptx_open_retains_unsaved_document_destination_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("original.rimpress.json");
+        let oversized = dir.path().join("oversized.pptx");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        let mut app = ImpressApp::new();
+        app.file_path = Some(native.clone());
+        assert!(app.save_file());
+        app.presentation.duplicate_active_slide();
+        let before = app.presentation.clone();
+        app.open_path(&oversized);
+        assert_eq!(app.presentation, before);
+        assert_eq!(app.file_path, Some(native));
+        assert!(app
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("64 MiB file limit"));
+        assert!(app.presentation.undo());
+        assert!(!app.is_dirty());
+        assert!(app.presentation.redo());
+        assert_eq!(app.presentation.slides, before.slides);
+        assert!(app.save_file());
+    }
+
+    #[test]
     fn queued_export_contains_text_entered_in_the_export_frame() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("final-text.pptx");

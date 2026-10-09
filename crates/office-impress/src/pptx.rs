@@ -28,10 +28,20 @@ pub fn write_pptx_path(presentation: &Presentation, path: &Path) -> Result<(), P
 pub fn write_pptx_bytes(presentation: &Presentation) -> Result<Vec<u8>, PptxError> {
     let mut cursor = Cursor::new(Vec::new());
     write_pptx(presentation, &mut cursor)?;
-    Ok(cursor.into_inner())
+    let bytes = cursor.into_inner();
+    crate::pptx_limits::package_size(bytes.len() as u64)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))?;
+    crate::pptx_limits::archive(&mut archive)?;
+    Ok(bytes)
 }
 
 fn write_pptx<W: Write + Seek>(presentation: &Presentation, writer: W) -> Result<(), PptxError> {
+    if presentation.title.len() > 8 * 1024 * 1024 || presentation.theme.name.len() > 8 * 1024 * 1024
+    {
+        return Err(PptxError::Parse(
+            "PPTX metadata exceeds the XML part limit".into(),
+        ));
+    }
     crate::pptx_objects::valid_text(&presentation.title)?;
     crate::pptx_objects::valid_text(&presentation.theme.name)?;
     let mut zip = ZipWriter::new(writer);
@@ -43,10 +53,17 @@ fn write_pptx<W: Write + Seek>(presentation: &Presentation, writer: W) -> Result
     } else {
         &presentation.slides
     };
+    let mut model_budget = crate::pptx_limits::ModelBudget::default();
+    for slide in slides {
+        model_budget.add(slide)?;
+    }
+    let mut output_budget = crate::pptx_limits::OutputBudget::default();
     let parts = slides
         .iter()
         .enumerate()
-        .map(|(i, s)| crate::pptx_objects::slide_parts(s, &presentation.theme, i + 1))
+        .map(|(i, s)| {
+            crate::pptx_objects::slide_parts(s, &presentation.theme, i + 1, &mut output_budget)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let n = slides.len();
 

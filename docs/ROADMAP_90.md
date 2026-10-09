@@ -34,6 +34,7 @@
   部分的な読み込みによる内容欠落を防ぐ。ODT は [PR #10](https://github.com/rsasaki0109/rust-office/pull/10) で完了。
 - [ ] クラッシュ後の復旧用コピーと、読み込み・展開・描画の大きな入力に対する
   制限を備える。強制終了と復旧、制限超過後の編集継続を確認する。
+  PPTX の全体容量・モデル件数制限を進行中。復旧と他形式の制限が揃うまで加点しない。
 
 ### Writer（25点）
 
@@ -67,7 +68,7 @@
 - [ ] 全画面の発表、次／前・終了操作、PDF 共有と PPTX の基本図形出力を備える。
   発表モード [PR #18](https://github.com/rsasaki0109/rust-office/pull/18)、
   画像形式の PDF 共有 [PR #19](https://github.com/rsasaki0109/rust-office/pull/19)、
-  基本オブジェクトの PPTX 出力・再読込が進行中。
+  基本オブジェクトの PPTX 出力・再読込 [PR #21](https://github.com/rsasaki0109/rust-office/pull/21) が進行中。
   各 PR のマージと受け入れ確認が揃うまで加点しない。
 
 ### 配布・使いやすさ（15点）

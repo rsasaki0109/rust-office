@@ -425,9 +425,9 @@ Missing/corrupt/external image relationships, invalid image decoding, malformed
 notes, missing basic-profile themes and invalid geometry reject the entire import
 before changing the current document. XML parts have an 8 MiB expanded limit;
 slide/notes trees are limited to depth 128 and 100,000 nodes per part. Image limits
-remain 8 MiB encoded, 4096 pixels per edge and 64 MiB decode allocation. These are
-part limits, not an aggregate ZIP/deck memory limit or the complete input-limit
-roadmap milestone.
+remain 8 MiB encoded, 4096 pixels per edge and 64 MiB decode allocation. The package/model admission limits below additionally bound total input sizes.
+Neither these checks nor their totals are an exact process-memory bound or the
+complete input-limit roadmap milestone.
 
 File → Export PPTX captures text events from the export frame before generating
 the file. Generation completes before atomic destination replacement. A failure
@@ -445,3 +445,33 @@ Save and Undo/Redo after export, and retained the document/redo after a failed
 image import. Independent python-pptx checks confirmed editable shape types,
 geometry, fills, text styles, images, theme backgrounds, metadata and notes.
 Microsoft PowerPoint / LibreOffice rendering has not been manually verified.
+
+
+PPTX package admission now limits the compressed file to 64 MiB, the ZIP directory
+to 4096 entries, total declared expanded parts to 128 MiB, and every XML/rels part
+to 8 MiB. Entry counts are checked in the ZIP end record before constructing the
+ZIP reader; expanded sizes and duplicate part names are checked in the directory
+before reading XML or decoding pictures. ZIP64 central directories are unsupported
+for these bounded packages. Orphan parts also count against package limits, even
+though their slide contents are not imported. Declared sizes are admission checks;
+actual XML/image reads retain bounded readers and format/CRC validation.
+
+Editable PPTX data is limited to 1000 slides, 1000 objects per slide and 10,000
+objects across the deck, counting title/body boxes, plus 64 MiB of UTF-8 title/body,
+added text and speaker-note content. Repeated slide references count again against
+model totals. Image relationships resolving to the same package part reuse one
+validated Arc-backed byte buffer across slides; URI aliases resolve before cache
+lookup. This prevents repeated references from copying or decoding the same asset
+on each occurrence. The cache exists only during import; model/history references
+retain the shared bytes afterward.
+
+Path imports check file metadata first and use a bounded read, including a second
+size check if the file grows during reading. In-memory imports apply the same
+package and directory checks. Export applies the same model/package limits and
+checks XML part sizes and accumulated output parts before atomic replacement,
+so refused exports leave the old destination intact. A refusal never replaces the
+current document; Undo/Redo and the native save path remain usable.
+
+These limits bound admitted input/model sizes, not exact peak RAM or processing
+time. Recovery copies and equivalent aggregate limits for other formats remain
+unfinished, so this does not complete the data-protection roadmap milestone.
