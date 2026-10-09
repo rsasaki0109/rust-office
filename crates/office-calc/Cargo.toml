@@ -12,6 +12,8 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 calamine = { workspace = true }
 rust_xlsxwriter = { workspace = true }
+zip2 = { package = "zip", version = "2.4", default-features = false, features = ["deflate"] }
+quick-xml = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

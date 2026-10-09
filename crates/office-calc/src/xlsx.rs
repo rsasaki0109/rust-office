@@ -1,8 +1,12 @@
 //! XLSX import / export via calamine + rust_xlsxwriter.
 
-use std::path::Path;
+use std::{
+    io::{Cursor, Read},
+    path::Path,
+};
 
-use calamine::{open_workbook_auto, CellErrorType, Data, Reader};
+use crate::xlsx_limits;
+use calamine::{open_workbook_auto_from_rs, CellErrorType, Data, Reader, Sheets, Xlsx};
 use rust_xlsxwriter::Workbook as XlsxWriter;
 use thiserror::Error;
 
@@ -24,13 +28,35 @@ pub enum XlsxError {
 /// Load a workbook from an `.xlsx` / `.xlsm` / `.xls` / `.ods` path.
 /// A values or formulas read error on any sheet rejects the entire import.
 pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
-    let mut excel = open_workbook_auto(path).map_err(|e| XlsxError::Read(e.to_string()))?;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > xlsx_limits::MAX_FILE_BYTES {
+        return Err(xlsx_limits::error(
+            "Spreadsheet exceeds the 64 MiB file limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(xlsx_limits::MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let is_xlsx = xlsx_limits::package(&bytes)?;
+    let cursor = Cursor::new(bytes.as_slice());
+    // Once identified as XLSX, do not retry it through an unguarded legacy parser.
+    let mut excel = if is_xlsx {
+        Sheets::Xlsx(Xlsx::new(cursor).map_err(|e| XlsxError::Read(e.to_string()))?)
+    } else {
+        open_workbook_auto_from_rs(cursor).map_err(|e| XlsxError::Read(e.to_string()))?
+    };
     let names = excel.sheet_names().to_vec();
+    if names.len() > xlsx_limits::MAX_SHEETS {
+        return Err(xlsx_limits::error(
+            "Spreadsheet exceeds the 1000-sheet limit",
+        ));
+    }
     if names.is_empty() {
         return Ok(Workbook::new());
     }
 
     let mut sheets = Vec::new();
+    let mut text_bytes = 0usize;
     for name in names {
         let mut sheet = Sheet::new(name.clone());
         let range = excel.worksheet_range(&name).map_err(|error| {
@@ -40,6 +66,12 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
         for (r, c, value) in range.used_cells() {
             let raw = data_to_raw(value);
             if !raw.is_empty() {
+                text_bytes = text_bytes.saturating_add(raw.len());
+                if text_bytes > xlsx_limits::MAX_TEXT_BYTES {
+                    return Err(xlsx_limits::error(
+                        "Spreadsheet imported text exceeds the 32 MiB limit",
+                    ));
+                }
                 sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), raw);
             }
         }
@@ -57,6 +89,12 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
                 } else {
                     format!("={f}")
                 };
+                text_bytes = text_bytes.saturating_add(text.len());
+                if text_bytes > xlsx_limits::MAX_TEXT_BYTES {
+                    return Err(xlsx_limits::error(
+                        "Spreadsheet imported text exceeds the 32 MiB limit",
+                    ));
+                }
                 sheet.set_raw(CellAddr::new(sc + c as u32, sr + r as u32), text);
             }
         }
@@ -66,6 +104,7 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
     let mut wb = Workbook::new();
     wb.sheets = sheets;
     wb.active = 0;
+    xlsx_limits::model(&wb)?;
     wb.mark_clean();
     Ok(wb)
 }
@@ -128,6 +167,7 @@ pub fn write_xlsx_path(workbook: &Workbook, path: &Path) -> Result<(), XlsxError
 }
 
 pub fn write_xlsx_bytes(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
+    xlsx_limits::model(workbook).map_err(|e| XlsxError::Write(e.to_string()))?;
     let mut xlsx = XlsxWriter::new();
     for (i, sheet) in workbook.sheets.iter().enumerate() {
         let name = if sheet.name.trim().is_empty() {
@@ -175,8 +215,11 @@ pub fn write_xlsx_bytes(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
             }
         }
     }
-    xlsx.save_to_buffer()
-        .map_err(|e| XlsxError::Write(e.to_string()))
+    let bytes = xlsx
+        .save_to_buffer()
+        .map_err(|e| XlsxError::Write(e.to_string()))?;
+    xlsx_limits::package(&bytes).map_err(|e| XlsxError::Write(e.to_string()))?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -347,7 +390,10 @@ mod tests {
         assert!(reader.worksheet_range("壊れたシート").is_err());
         let error = reload(&bytes).expect_err("a broken sheet must not become an empty sheet");
         assert!(matches!(error, XlsxError::Read(_)));
-        assert!(error.to_string().contains("壊れたシート"));
+        assert!(
+            error.to_string().contains("壊れたシート")
+                || error.to_string().contains("xl/worksheets/sheet2.xml")
+        );
         assert!(error.to_string().contains("values"));
     }
 
@@ -367,8 +413,11 @@ mod tests {
         assert!(reader.worksheet_formula("壊れたシート").is_err());
         let error = reload(&bytes).expect_err("cached values must not hide a formula read error");
         assert!(matches!(error, XlsxError::Read(_)));
-        assert!(error.to_string().contains("壊れたシート"));
-        assert!(error.to_string().contains("formulas"));
+        assert!(
+            error.to_string().contains("壊れたシート")
+                || error.to_string().contains("xl/worksheets/sheet2.xml")
+        );
+        assert!(error.to_string().contains("formula"));
     }
 
     #[test]
@@ -376,7 +425,10 @@ mod tests {
         let bytes = replace_second_sheet(None);
         let error = reload(&bytes).expect_err("missing sheets must not be silently skipped");
         assert!(matches!(error, XlsxError::Read(_)));
-        assert!(error.to_string().contains("壊れたシート"));
+        assert!(
+            error.to_string().contains("壊れたシート")
+                || error.to_string().contains("xl/worksheets/sheet2.xml")
+        );
     }
 
     #[test]
@@ -527,5 +579,44 @@ mod tests {
                 *token
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn file_cap_rejects_before_parsing_and_renamed_xlsx_keeps_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.xlsx");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(xlsx_limits::MAX_FILE_BYTES + 1)
+            .unwrap();
+        assert!(load_xlsx_path(&huge)
+            .unwrap_err()
+            .to_string()
+            .contains("64 MiB"));
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(0, 0), "日本語");
+        let renamed = dir.path().join("renamed.xls");
+        std::fs::write(&renamed, write_xlsx_bytes(&book).unwrap()).unwrap();
+        assert_eq!(
+            load_xlsx_path(&renamed)
+                .unwrap()
+                .active_sheet()
+                .raw(CellAddr::new(0, 0)),
+            "日本語"
+        );
+    }
+    #[test]
+    fn refused_export_retains_existing_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.xlsx");
+        std::fs::write(&path, b"existing bytes").unwrap();
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(65536, 0), "must not wrap to column A");
+        assert!(write_xlsx_path(&book, &path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"existing bytes");
     }
 }
