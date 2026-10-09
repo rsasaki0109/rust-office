@@ -7,6 +7,7 @@ mod calc_clipboard;
 mod calc_geometry;
 mod fonts;
 mod impress_app;
+mod impress_recovery;
 mod office;
 mod print_sys;
 mod recovery;

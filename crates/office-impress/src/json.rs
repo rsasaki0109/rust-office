@@ -20,7 +20,7 @@ pub enum JsonError {
 pub fn load_json_path(path: &Path) -> Result<Presentation, JsonError> {
     let text = fs::read_to_string(path)?;
     let mut p: Presentation = serde_json::from_str(&text)?;
-    validate(&p)?;
+    validate_json_presentation(&p)?;
     p.mark_clean();
     if p.slides.is_empty() {
         p.slides.push(crate::model::Slide::blank());
@@ -33,7 +33,7 @@ pub fn load_json_path(path: &Path) -> Result<Presentation, JsonError> {
 }
 
 pub fn write_json_path(presentation: &Presentation, path: &Path) -> Result<(), JsonError> {
-    validate(presentation)?;
+    validate_json_presentation(presentation)?;
     let text = serde_json::to_string_pretty(presentation)?;
     office_core::storage::atomic_write(path, text.as_bytes())?;
     Ok(())
@@ -49,7 +49,8 @@ pub fn is_impress_json_path(path: &Path) -> bool {
             .is_some_and(|n| n.contains("impress") || n.ends_with(".rimpress.json"))
 }
 
-fn validate(p: &Presentation) -> Result<(), JsonError> {
+/// Validate native slide geometry, objects and embedded images without saving.
+pub fn validate_json_presentation(p: &Presentation) -> Result<(), JsonError> {
     for slide in &p.slides {
         for text in [&slide.title, &slide.body] {
             if !(crate::Bounds {

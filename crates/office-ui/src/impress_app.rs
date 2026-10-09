@@ -26,6 +26,10 @@ struct PdfExport {
 }
 
 pub struct ImpressApp {
+    recovery: Option<crate::recovery::Recovery<crate::impress_recovery::ImpressSnapshot>>,
+    recovery_open: bool,
+    recovery_selected: usize,
+    recovery_delete: Option<usize>,
     presentation: Presentation,
     file_path: Option<PathBuf>,
     status_message: String,
@@ -48,6 +52,10 @@ pub struct ImpressApp {
 impl ImpressApp {
     pub fn new() -> Self {
         Self {
+            recovery: None,
+            recovery_open: false,
+            recovery_selected: 0,
+            recovery_delete: None,
             presentation: Presentation::demo(),
             file_path: None,
             status_message: "Ready — Impress MVP (themes, slides, JSON, PPTX open/export)".into(),
@@ -65,6 +73,202 @@ impl ImpressApp {
             show: None,
             pending_show: None,
             pending_switch: None,
+        }
+    }
+
+    pub(super) fn has_pending_recovery(&self) -> bool {
+        self.recovery_open
+    }
+
+    pub(super) fn enable_recovery(&mut self, root: Result<PathBuf, String>) {
+        match root.and_then(|root| crate::recovery::Recovery::new(&root)) {
+            Ok(store) => {
+                self.recovery_open = !store.entries.is_empty();
+                self.recovery = Some(store);
+            }
+            Err(e) => self.set_error(format!("Impress recovery unavailable: {e}")),
+        }
+    }
+    pub(super) fn recovery_tick(&mut self, ctx: &egui::Context) {
+        let label = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled Impress document".into());
+        let dirty = self.is_dirty();
+        if let Some(store) = &mut self.recovery {
+            ctx.request_repaint_after(crate::recovery::INTERVAL);
+            if dirty && store.due(std::time::Instant::now()) {
+                let snapshot =
+                    crate::impress_recovery::ImpressSnapshot::capture(&self.presentation);
+                if let Err(e) = store.tick(&snapshot, true, &label, std::time::Instant::now()) {
+                    self.set_error(format!("Impress recovery copy failed: {e}"));
+                }
+            } else if !dirty {
+                self.clear_recovery();
+            }
+        }
+    }
+    pub(super) fn clear_recovery(&mut self) {
+        if let Some(store) = &mut self.recovery {
+            if let Err(e) = store.clear() {
+                self.set_error(format!("Impress recovery cleanup failed: {e}"));
+            }
+        }
+    }
+    fn open_recovery(&mut self) {
+        let Some(store) = &mut self.recovery else {
+            self.set_error("Impress recovery is unavailable");
+            return;
+        };
+        match store.refresh() {
+            Ok(()) => {
+                self.recovery_selected = 0;
+                self.recovery_open = true;
+            }
+            Err(e) => self.set_error(format!("Could not list recovery copies: {e}")),
+        }
+    }
+    fn restore_recovery(&mut self, index: usize, ctx: &egui::Context) -> bool {
+        if self.is_dirty() {
+            self.set_error("Save the current document before recovering another copy");
+            return false;
+        }
+        let Some(store) = &mut self.recovery else {
+            return false;
+        };
+        match store.restore(index) {
+            Ok(doc) => {
+                let warning = store.cleanup_warning.take();
+                self.end_show(ctx);
+                self.presentation = doc.into_presentation();
+                self.file_path = None;
+                self.textures.clear();
+                self.edit_session = None;
+                self.drag_session = None;
+                self.selected_object = 0;
+                self.selection_slide = self.presentation.active;
+                self.pending_action = None;
+                self.pending_delete = None;
+                self.pending_show = None;
+                self.pending_pdf = None;
+                self.pending_pptx = None;
+                self.recovery_open = false;
+                self.recovery_delete = None;
+                self.recovery.as_mut().unwrap().postpone();
+                self.set_status("Recovered unsaved Impress document — use Save As to keep it");
+                if let Some(e) = warning {
+                    self.set_error(format!(
+                        "Recovered document; older copy cleanup failed: {e}"
+                    ));
+                }
+                true
+            }
+            Err(e) => {
+                self.set_error(format!("Recovery failed: {e}"));
+                false
+            }
+        }
+    }
+    fn show_recovery_dialog(&mut self, ctx: &egui::Context) {
+        if !self.recovery_open {
+            return;
+        }
+        let mut restore = None;
+        let mut delete = None;
+        let mut later = false;
+        let response = egui::Modal::new(egui::Id::new("impress_recovery")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            if let Some(index) = self.recovery_delete {
+                ui.heading("Delete recovery copy?");
+                ui.label("Permanently delete this recovery copy?");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        delete = Some(index);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.recovery_delete = None;
+                    }
+                });
+            } else {
+                ui.heading("Unsaved Impress documents found");
+                ui.label("Select a copy to recover. Recovered documents use Save As.");
+                let entries = self.recovery.as_ref().map(|s| &s.entries);
+                let count = entries.map_or(0, Vec::len);
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        if let Some(entries) = entries {
+                            for (index, entry) in entries.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.recovery_selected,
+                                    index,
+                                    &entry.label,
+                                );
+                            }
+                        }
+                    });
+                if count == 0 {
+                    ui.label("No available recovery copies.");
+                }
+                if self.is_dirty() {
+                    ui.label("Save your current document before recovering another copy.");
+                }
+                if let Some(error) = &self.last_error {
+                    ui.colored_label(Color32::RED, error);
+                }
+                let can_restore = count > 0 && !self.is_dirty();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_restore, egui::Button::new("Recover (Enter)"))
+                        .clicked()
+                    {
+                        restore = Some(self.recovery_selected);
+                    }
+                    if ui.button("Keep for later").clicked() {
+                        later = true;
+                    }
+                    if ui
+                        .add_enabled(count > 0, egui::Button::new("Delete copy…"))
+                        .clicked()
+                    {
+                        self.recovery_delete = Some(self.recovery_selected);
+                    }
+                });
+                if can_restore
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                {
+                    restore = Some(self.recovery_selected);
+                }
+            }
+        });
+        if response.should_close() {
+            if self.recovery_delete.is_some() {
+                self.recovery_delete = None;
+            } else {
+                later = true;
+            }
+        }
+        if let Some(index) = delete {
+            let result = self.recovery.as_mut().unwrap().delete(index);
+            match result {
+                Ok(()) => {
+                    self.recovery_selected = 0;
+                    self.recovery_delete = None;
+                }
+                Err(e) => self.set_error(format!("Recovery copy deletion failed: {e}")),
+            }
+        }
+        if let Some(index) = restore {
+            self.restore_recovery(index, ctx);
+        }
+        if later {
+            self.recovery_open = false;
+            self.recovery_delete = None;
+            if let Some(store) = &mut self.recovery {
+                store.postpone();
+            }
         }
     }
 
@@ -108,6 +312,7 @@ impl ImpressApp {
         self.selected_object = 0;
         self.drag_session = None;
         self.presentation = Presentation::new();
+        self.clear_recovery();
         self.file_path = None;
         self.set_status("New presentation");
     }
@@ -145,6 +350,7 @@ impl ImpressApp {
                 self.selected_object = 0;
                 self.drag_session = None;
                 self.presentation = p;
+                self.clear_recovery();
                 self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Opened {}", path.display()));
             }
@@ -225,6 +431,7 @@ impl ImpressApp {
         match write_json_path(&self.presentation, path) {
             Ok(()) => {
                 self.presentation.mark_clean();
+                self.clear_recovery();
                 self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Saved {}", path.display()));
                 true
@@ -446,6 +653,10 @@ impl ImpressApp {
                 }
                 if ui.button("Save As…").clicked() {
                     self.save_json_as();
+                    ui.close();
+                }
+                if ui.button("Recovery copies…").clicked() {
+                    self.open_recovery();
                     ui.close();
                 }
                 if ui
@@ -983,12 +1194,14 @@ impl ImpressApp {
             self.slide_show_ui(ui);
             return;
         }
-        if ui.is_enabled() {
+        let recovery_was_open = self.recovery_open;
+        self.show_recovery_dialog(&ctx);
+        if ui.is_enabled() && !recovery_was_open {
             self.handle_keys(&ctx);
         }
         self.show_unsaved_dialog(&ctx);
         self.show_delete_dialog(&ctx);
-        if self.pending_action.is_some() || self.pending_delete.is_some() {
+        if self.pending_action.is_some() || self.pending_delete.is_some() || recovery_was_open {
             ui.disable();
         }
 
@@ -1822,5 +2035,88 @@ mod pptx_object_tests {
         assert!(app.presentation.redo());
         assert_eq!(app.presentation.slides, before.slides);
         assert_eq!(app.file_path, Some(native));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::{impress_recovery::ImpressSnapshot, recovery::Recovery};
+    fn crash_copy(root: &std::path::Path) {
+        let mut p = Presentation::demo();
+        p.slides[0].notes = "日本語 notes".into();
+        p.slides[0]
+            .objects
+            .push(SlideObject::shape(ShapeKind::Rectangle));
+        let mut store = Recovery::new(root).unwrap();
+        store
+            .tick(
+                &ImpressSnapshot::capture(&p),
+                true,
+                "original.pptx",
+                std::time::Instant::now(),
+            )
+            .unwrap();
+    }
+    #[test]
+    fn recovered_deck_uses_new_destination_and_failed_save_keeps_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        crash_copy(dir.path());
+        let original = dir.path().join("original.pptx");
+        std::fs::write(&original, b"original bytes").unwrap();
+        let mut app = ImpressApp::new();
+        app.file_path = Some(original.clone());
+        app.enable_recovery(Ok(dir.path().into()));
+        assert!(app.restore_recovery(0, &egui::Context::default()));
+        assert!(app.is_dirty() && app.file_path.is_none() && !app.presentation.can_undo());
+        std::fs::write(dir.path().join("blocked"), b"file").unwrap();
+        assert!(!app.save_json_to(&dir.path().join("blocked/deck.json")));
+        assert!(app.recovery.as_ref().unwrap().has_snapshot);
+        assert_eq!(std::fs::read(&original).unwrap(), b"original bytes");
+        let target = dir.path().join("recovered.rimpress.json");
+        assert!(app.save_json_to(&target));
+        assert!(!app.is_dirty() && !app.recovery.as_ref().unwrap().has_snapshot);
+        assert_eq!(
+            load_json_path(&target).unwrap().slides[0].notes,
+            "日本語 notes"
+        );
+    }
+    #[test]
+    fn dirty_current_deck_blocks_recovery_and_postponed_copy_survives_new() {
+        let dir = tempfile::tempdir().unwrap();
+        crash_copy(dir.path());
+        let mut app = ImpressApp::new();
+        app.enable_recovery(Ok(dir.path().into()));
+        app.presentation.add_slide();
+        let count = app.presentation.slides.len();
+        assert!(!app.restore_recovery(0, &egui::Context::default()));
+        assert_eq!(app.presentation.slides.len(), count);
+        app.recovery.as_mut().unwrap().postpone();
+        app.do_new_deck();
+        drop(app);
+        assert_eq!(
+            Recovery::<ImpressSnapshot>::new(dir.path())
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn background_copy_does_not_change_selection_or_undo_and_unavailable_storage_allows_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ImpressApp::new();
+        app.enable_recovery(Ok(dir.path().into()));
+        app.presentation.add_slide();
+        app.selected_object = 1;
+        let before = serde_json::to_value(&app.presentation).unwrap();
+        app.recovery_tick(&egui::Context::default());
+        assert_eq!(serde_json::to_value(&app.presentation).unwrap(), before);
+        assert_eq!(app.selected_object, 1);
+        assert!(app.presentation.can_undo());
+        let mut unavailable = ImpressApp::new();
+        unavailable.enable_recovery(Err("no state directory".into()));
+        assert!(unavailable.recovery.is_none());
+        assert!(unavailable.save_json_to(&dir.path().join("normal.json")));
     }
 }

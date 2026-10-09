@@ -552,6 +552,48 @@ Writer's native crash/restart check is repeated after sharing the storage code.
 Windows/macOS native recovery remains unverified. Impress recovery and the rest of
 the stability milestone remain unfinished; completion stays 65%.
 
+
+### Impress crash recovery
+
+Impress now uses the shared recovery storage in the sibling state directory
+`rust-office/recovery/impress`. A version-1 envelope contains the native
+presentation model: title, theme, all slides, active slide, speaker notes, text,
+object geometry/colors and embedded image bytes. Capture copies only current
+model fields and shares image byte buffers; it does not clone Undo/Redo history.
+Text inspector changes already update the model and are included on the next
+successful recovery tick. Runtime selection, dragging, presentation mode,
+exports and Undo/Redo are not restored.
+
+Snapshots share the 32 MiB serialized limit and first-dirty/15-second cadence.
+Before transfer, admission rejects unsupported envelope versions, empty decks,
+invalid active slides, more than 1000 slides, more than 1000 objects per slide
+(including title/body), or more than 10,000 objects across the deck. Native JSON
+validation checks text/object geometry and embedded image validity with the
+existing image limits. Theme font sizes must be finite and between 1 and 200 pt.
+Malformed copies remain available for explicit deletion or later inspection.
+Snapshot serialization, validation (including image decoding) and disk I/O run on
+the UI thread; these limits do not establish exact peak RAM or latency bounds.
+
+Recovery opens a dirty presentation with no inherited file destination. Undo to
+the recovered baseline stays dirty until explicit Save. Successful native Save,
+New, Open or an authorized suite close clears only the current session copy;
+failed operations, cancelled close dialogs and postponed copies retain data.
+PDF/PPTX export is separate from native Save and does not clear recovery copies.
+The suite selects the first module with pending recovery in Writer, Calc, Impress
+order; each module's File → Recovery copies menu remains available. Ticks run for
+all three modules while another editor or presentation mode is active.
+
+Regression coverage checks native object/image/note preservation, consecutive
+recoveries, invalid versions/selection/geometry/fonts/images, slide/object limits,
+failed Save, dirty/history state, selection isolation and unavailable storage.
+A Linux Xvfb/Openbox SIGKILL/restart test recovered an unsaved slide duplication
+and active slide, then compared the complete saved native model with the recovery
+copy, including Japanese notes, theme, object geometry and embedded image bytes.
+Original-file bytes remained unchanged; a newly chosen Save destination, recovery
+copy cleanup and normal close were verified.
+Native Windows/macOS crash recovery remains unverified. Recovery across all three
+modules is implemented in the pending PR stack; aggregate admission limits for
+other formats and main acceptance remain outstanding. Completion stays 65%.
 ### Calc 復旧と書式・寸法の統合確認
 
 復旧データはセルの値・数式・編集中の入力に加え、書式付きの空セル、
