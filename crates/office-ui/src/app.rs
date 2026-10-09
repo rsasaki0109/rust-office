@@ -66,6 +66,7 @@ pub struct WriterApp {
     find_focus_requested: bool,
     find_message: String,
     find_scroll_pending: bool,
+    find_restore_focus: bool,
     /// Suite mode switch request.
     pub pending_switch: Option<SwitchTo>,
 }
@@ -116,6 +117,7 @@ impl WriterApp {
             find_focus_requested: false,
             find_message: String::new(),
             find_scroll_pending: false,
+            find_restore_focus: false,
             pending_switch: None,
         }
     }
@@ -819,8 +821,22 @@ impl WriterApp {
         }
         if close {
             self.find_open = false;
-            self.focus_document = true;
-            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("writer_document")));
+            // The modal still owns this frame's focus layer. Restore body focus
+            // next frame, after that layer has gone away.
+            self.find_restore_focus = true;
+            ctx.request_repaint();
+        }
+    }
+
+    fn restore_find_focus(&mut self, ctx: &Context) {
+        if self.find_restore_focus && !self.find_open {
+            if ctx.memory(|memory| memory.top_modal_layer().is_none()) {
+                self.find_restore_focus = false;
+                self.focus_document = true;
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("writer_document")));
+            } else {
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -1782,6 +1798,8 @@ impl App for WriterApp {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
 
+        self.restore_find_focus(&ctx);
+
         // Focus the document canvas on first frame so typing works immediately.
         if self.focus_document && ctx.memory(|m| m.focused().is_none()) {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("writer_document")));
@@ -1852,6 +1870,57 @@ impl App for WriterApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_from_find_returns_keyboard_input_to_body_after_modal_layer_expires() {
+        let mut app = WriterApp::new();
+        app.editor
+            .replace_document(office_core::Document::with_text("original"));
+        app.open_find();
+        let ctx = Context::default();
+        let escape = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for events in [
+            vec![],
+            vec![escape],
+            vec![],
+            vec![],
+            vec![egui::Event::Text("typed ".into())],
+        ] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.restore_find_focus(&ctx);
+                    app.handle_text_input(&ctx);
+                    app.show_find_dialog(&ctx);
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.interact(
+                            ui.available_rect_before_wrap(),
+                            egui::Id::new("writer_document"),
+                            Sense::click_and_drag(),
+                        );
+                        app.focus_document =
+                            ui.memory(|memory| memory.has_focus(egui::Id::new("writer_document")));
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(!app.find_open);
+        assert!(app.focus_document);
+        assert_eq!(app.editor.document().plain_text(), "typed original");
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.document().plain_text(), "original");
+    }
 
     #[test]
     fn find_navigation_and_changed_query_do_not_replace_stale_selection() {
