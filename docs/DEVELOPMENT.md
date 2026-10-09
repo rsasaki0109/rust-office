@@ -175,8 +175,12 @@ Not yet:
 * Named styles beyond Normal/Heading 1–3; custom user style registry
 * Layout PDF glyph metrics still approximate (egui ≠ embedded PDF fonts)
 * Calc: charting / pivot not started; formula set still limited vs Excel
-* Calc stores numbers as `f64`; XLSX number formatting and cell styling are not
-  preserved. Numeric text may be normalized on import, and display uses rounded values.
+* Calc stores numbers as `f64`. Direct cell number formats and bold/italic are
+  preserved in XLSX; borders, fills, alignment, inherited row/column styling and
+  richer fonts are not. Only General, integer/two-decimal number/percent and
+  `yyyy-mm-dd` codes have formatted display; other imported codes are retained
+  for export with General display. XLSX 1904-date workbooks are rejected; XLS/ODS
+  imports still preserve values/formulas only. Numeric text may be normalized.
 * Calc copies raw values/formulas as tab-separated text. Formatting is not
   exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.
@@ -190,6 +194,53 @@ Not yet:
 3. Calc charting MVP / Impress richer shapes
 
 ## Calc editing
+
+The Sheet menu can rename and delete worksheets. Names must be unique (case
+insensitive) and satisfy XLSX naming rules; Add Sheet chooses an unused default
+name even after deletions or renames. Deletion requires confirmation and the last
+worksheet cannot be deleted. Rename/delete are undoable, including deleted cell
+contents, formulas, sheet position and the saved revision's dirty state. Opening
+these actions commits a pending formula-bar edit to its original worksheet.
+Cancel/Escape leaves the sheet name and sheet list unchanged.
+
+XLSX preserves the resulting sheet names and contents; CSV still stores only one
+sheet. Cross-sheet formulas are not supported yet; rename does not rewrite their
+raw text. Row heights and column widths are editable and preserved in XLSX.
+
+The Format menu applies General, two-decimal number, percentage, ISO date,
+bold/italic and Clear Formatting to the selected range as one undoable edit.
+Ctrl+B/Ctrl+I toggle decoration when the grid has keyboard focus. Formatting
+commits a pending formula-bar draft first. Values and formula results remain
+unchanged, and clearing values retains cell presentation. Blank-cell formatting
+is also saved in XLSX. Formatting is limited to 1,000,000 cells per operation.
+
+Dates use Excel's 1900 serial convention (including its fictitious 1900-02-29).
+The date format displays numeric serials; it does not parse date strings or show
+times. Invalid/out-of-range serials use General display. XLSX presentation follows
+worksheet/styles relationships; missing referenced styles/fonts/number formats,
+malformed XML and unsupported 1904 epochs reject the entire import. Presentation
+XML is limited to 32 MiB per part; this is not a global workbook memory limit.
+
+CSV cannot store formatting: Save/Save As refuses a styled workbook and asks for
+XLSX instead, preserving the existing file, destination, draft and dirty state.
+Clipboard copy/paste still exchanges raw text/formulas and retains destination
+presentation; it does not transfer source formatting.
+
+Format → Column Width / Row Height applies a size to all columns/rows intersecting
+the selection, as one Undo/Redo edit. Widths use integer pixels (1–1790), heights
+use points (1–409.5; 1 point is 4/3 screen pixels). Reset to Default restores the
+current sheet default; Cancel/Escape changes no sizes. Opening the dialog commits
+a pending formula-bar draft to its original cell. Clearing cell formatting does
+not reset row/column sizes.
+
+Sizing is sparse. Drawing, hit testing and scrolling share prefix offsets for
+custom sizes and only visit visible cells; there is no offset array per empty row.
+XLSX retains individual/range sizes, blank rows/columns and sheet defaults. Column
+conversion assumes the standard Calibri-11 seven-pixel digit metric and rounds to
+physical pixels. Hidden rows/columns and sizes outside the supported limits reject
+an XLSX import to preserve layout; hiding, merged cells and font-dependent autofit
+remain unsupported. CSV Save/Save As also refuses custom sizes rather than silently
+losing them, preserving the current file, destination and pending edits.
 
 Aggregate functions (`SUM`, `AVERAGE`/`AVG`, `MIN`, `MAX`, `COUNT`) visit only
 stored cells in ranges, in row/column order. Referenced empty cells and text
@@ -543,3 +594,9 @@ copy cleanup and normal close were verified.
 Native Windows/macOS crash recovery remains unverified. Recovery across all three
 modules is implemented in the pending PR stack; aggregate admission limits for
 other formats and main acceptance remain outstanding. Completion stays 65%.
+### Calc 復旧と書式・寸法の統合確認
+
+復旧データはセルの値・数式・編集中の入力に加え、書式付きの空セル、
+数値書式、太字・斜体、既定の行高／列幅と個別の寸法を保持する。
+書式情報のない従来の復旧データも読み込める。復旧前にアドレスの範囲、
+重複、寸法の値と総エントリ数を検証する。

@@ -34,13 +34,49 @@ struct CellChange {
     after: Option<Cell>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SheetError {
+    #[error("Worksheet does not exist")]
+    Missing,
+    #[error("Invalid worksheet name: {0}")]
+    InvalidName(String),
+    #[error("A worksheet with this name already exists")]
+    DuplicateName,
+    #[error("The last worksheet cannot be deleted")]
+    LastSheet,
+}
+
 #[derive(Debug, Clone)]
 enum Change {
+    Dimensions {
+        sheet: usize,
+        axis: crate::DimensionAxis,
+        sizes: Vec<(u32, f64, f64)>,
+        before_bounds: (u32, u32),
+        after_bounds: (u32, u32),
+    },
+    Formats {
+        sheet: usize,
+        cells: Vec<(CellAddr, crate::CellFormat, crate::CellFormat)>,
+        before_bounds: (u32, u32),
+        after_bounds: (u32, u32),
+    },
     Cells {
         sheet: usize,
         cells: Vec<CellChange>,
         before_bounds: (u32, u32),
         after_bounds: (u32, u32),
+    },
+    RenameSheet {
+        index: usize,
+        before: String,
+        after: String,
+    },
+    DeleteSheet {
+        sheet: Sheet,
+        index: usize,
+        previous_active: usize,
+        next_active: usize,
     },
     AddSheet {
         sheet: Sheet,
@@ -127,6 +163,83 @@ impl Workbook {
             before_bounds,
             after_bounds,
         });
+    }
+
+    /// Apply a presentation change without touching raw values or formulas.
+    pub fn format_range(
+        &mut self,
+        range: CellRange,
+        update: crate::FormatChange,
+    ) -> Result<bool, ClipboardError> {
+        let range = clipboard::validate_range(range)?;
+        let sheet = self.active_sheet();
+        let before_bounds = (sheet.rows, sheet.cols);
+        let cells: Vec<_> = range
+            .iter()
+            .filter_map(|addr| {
+                let before = sheet.format(addr);
+                let after = update.apply(before.clone());
+                (before != after).then_some((addr, before, after))
+            })
+            .collect();
+        if cells.is_empty() {
+            return Ok(false);
+        }
+        for (addr, _, after) in &cells {
+            self.active_sheet_mut().set_format(*addr, after.clone());
+        }
+        let sheet = self.active_sheet();
+        let after_bounds = (sheet.rows, sheet.cols);
+        self.record(Change::Formats {
+            sheet: self.active,
+            cells,
+            before_bounds,
+            after_bounds,
+        });
+        Ok(true)
+    }
+
+    /// Resize a row/column range as one undoable edit; None restores its sheet default.
+    pub fn resize_range(
+        &mut self,
+        axis: crate::DimensionAxis,
+        first: u32,
+        last: u32,
+        size: Option<f64>,
+    ) -> Result<bool, crate::DimensionError> {
+        let limit = match axis {
+            crate::DimensionAxis::Columns => crate::MAX_SHEET_COLS,
+            crate::DimensionAxis::Rows => crate::MAX_SHEET_ROWS,
+        };
+        if first > last || last >= limit {
+            return Err(crate::DimensionError::OutOfBounds);
+        }
+        let sheet = self.active_sheet();
+        let size = size.unwrap_or(sheet.default_dimension(axis));
+        axis.validate(size)?;
+        let before_bounds = (sheet.rows, sheet.cols);
+        let sizes: Vec<_> = (first..=last)
+            .filter_map(|index| {
+                let before = sheet.dimensions.get(axis, index);
+                (before != size).then_some((index, before, size))
+            })
+            .collect();
+        if sizes.is_empty() {
+            return Ok(false);
+        }
+        for &(index, _, after) in &sizes {
+            self.active_sheet_mut().set_dimension(axis, index, after);
+        }
+        let sheet = self.active_sheet();
+        let after_bounds = (sheet.rows, sheet.cols);
+        self.record(Change::Dimensions {
+            sheet: self.active,
+            axis,
+            sizes,
+            before_bounds,
+            after_bounds,
+        });
+        Ok(true)
     }
 
     pub fn copy_tsv(&self, range: CellRange) -> Result<String, ClipboardError> {
@@ -273,6 +386,48 @@ impl Workbook {
 
     fn apply(&mut self, change: &Change, forward: bool) {
         match change {
+            Change::Dimensions {
+                sheet,
+                axis,
+                sizes,
+                before_bounds,
+                after_bounds,
+            } => {
+                self.active = *sheet;
+                for &(index, before, after) in sizes {
+                    self.active_sheet_mut().set_dimension(
+                        *axis,
+                        index,
+                        if forward { after } else { before },
+                    );
+                }
+                let (rows, cols) = if forward {
+                    *after_bounds
+                } else {
+                    *before_bounds
+                };
+                self.active_sheet_mut().rows = rows;
+                self.active_sheet_mut().cols = cols;
+            }
+            Change::Formats {
+                sheet,
+                cells,
+                before_bounds,
+                after_bounds,
+            } => {
+                self.active = *sheet;
+                for (addr, before, after) in cells {
+                    self.active_sheet_mut()
+                        .set_format(*addr, if forward { after } else { before }.clone());
+                }
+                let (rows, cols) = if forward {
+                    *after_bounds
+                } else {
+                    *before_bounds
+                };
+                self.active_sheet_mut().rows = rows;
+                self.active_sheet_mut().cols = cols;
+            }
             Change::Cells {
                 sheet,
                 cells,
@@ -298,6 +453,28 @@ impl Workbook {
                 };
                 self.active_sheet_mut().rows = rows;
                 self.active_sheet_mut().cols = cols;
+            }
+            Change::RenameSheet {
+                index,
+                before,
+                after,
+            } => {
+                self.sheets[*index].name = if forward { after } else { before }.clone();
+                self.active = *index;
+            }
+            Change::DeleteSheet {
+                sheet,
+                index,
+                previous_active,
+                next_active,
+            } => {
+                if forward {
+                    self.sheets.remove(*index);
+                    self.active = *next_active;
+                } else {
+                    self.sheets.insert(*index, sheet.clone());
+                    self.active = *previous_active;
+                }
             }
             Change::AddSheet {
                 sheet,
@@ -325,6 +502,86 @@ impl Workbook {
         self.sheets.len()
     }
 
+    /// Generate a name that remains unique after deletions and custom renames.
+    pub fn next_sheet_name(&self) -> String {
+        for n in 1.. {
+            let name = format!("Sheet{n}");
+            if !self
+                .sheets
+                .iter()
+                .any(|sheet| sheet.name.eq_ignore_ascii_case(&name))
+            {
+                return name;
+            }
+        }
+        unreachable!()
+    }
+
+    /// Rename without changing values, formulas, or history on failure/no-op.
+    pub fn rename_sheet(
+        &mut self,
+        index: usize,
+        name: impl Into<String>,
+    ) -> Result<bool, SheetError> {
+        let before = self
+            .sheets
+            .get(index)
+            .ok_or(SheetError::Missing)?
+            .name
+            .clone();
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(SheetError::InvalidName("Name cannot be blank".into()));
+        }
+        rust_xlsxwriter::Worksheet::new()
+            .set_name(&name)
+            .map_err(|error| SheetError::InvalidName(error.to_string()))?;
+        if self
+            .sheets
+            .iter()
+            .enumerate()
+            .any(|(i, sheet)| i != index && sheet.name.to_lowercase() == name.to_lowercase())
+        {
+            return Err(SheetError::DuplicateName);
+        }
+        if before == name {
+            return Ok(false);
+        }
+        self.sheets[index].name = name.clone();
+        self.record(Change::RenameSheet {
+            index,
+            before,
+            after: name,
+        });
+        Ok(true)
+    }
+
+    /// Retain the deleted sheet and its position in history for lossless undo.
+    pub fn delete_sheet(&mut self, index: usize) -> Result<(), SheetError> {
+        if index >= self.sheets.len() {
+            return Err(SheetError::Missing);
+        }
+        if self.sheets.len() == 1 {
+            return Err(SheetError::LastSheet);
+        }
+        let previous_active = self.active;
+        let sheet = self.sheets.remove(index);
+        self.active = if previous_active > index {
+            previous_active - 1
+        } else if previous_active == index {
+            index.min(self.sheets.len() - 1)
+        } else {
+            previous_active
+        };
+        self.record(Change::DeleteSheet {
+            sheet,
+            index,
+            previous_active,
+            next_active: self.active,
+        });
+        Ok(())
+    }
+
     pub fn add_sheet(&mut self, name: impl Into<String>) {
         let sheet = Sheet::new(name);
         let index = self.sheets.len();
@@ -343,6 +600,267 @@ impl Workbook {
 mod tests {
     use super::*;
     use crate::{MAX_SHEET_COLS, MAX_SHEET_ROWS};
+
+    #[test]
+    fn resizing_ranges_tracks_saved_revisions_without_changing_cell_data() {
+        use crate::DimensionAxis::*;
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(0, 0), "=1+2");
+        book.mark_clean();
+        book.clear_history();
+        book.resize_range(Columns, 0, 2, Some(160.0)).unwrap();
+        assert_eq!(book.active_sheet().column_width(2), 160.0);
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "=1+2");
+        book.undo();
+        assert!(!book.is_dirty() && !book.can_undo());
+        book.redo();
+        book.mark_clean();
+        book.resize_range(Rows, 0, 1, Some(31.5)).unwrap();
+        assert_eq!(book.active_sheet().row_height(1), 31.5);
+        book.undo();
+        assert!(!book.is_dirty());
+        book.redo();
+        book.resize_range(Rows, 0, 1, None).unwrap();
+        assert_eq!(book.active_sheet().row_height(0), crate::DEFAULT_ROW_HEIGHT);
+        book.undo();
+        assert_eq!(book.active_sheet().row_height(0), 31.5);
+    }
+
+    #[test]
+    fn invalid_or_unchanged_sizes_preserve_redo_and_clean_state() {
+        use crate::DimensionAxis::*;
+        let mut book = Workbook::new();
+        book.resize_range(Columns, 0, 0, Some(100.0)).unwrap();
+        book.undo();
+        for (axis, value) in [
+            (Columns, f64::NAN),
+            (Columns, f64::INFINITY),
+            (Columns, 0.0),
+            (Columns, 1791.0),
+            (Columns, 1.5),
+            (Rows, 0.0),
+            (Rows, 410.0),
+            (Rows, f64::NEG_INFINITY),
+        ] {
+            assert!(book.resize_range(axis, 0, 0, Some(value)).is_err());
+        }
+        assert!(book.resize_range(Columns, 1, 0, Some(100.0)).is_err());
+        assert!(book
+            .resize_range(Columns, 0, MAX_SHEET_COLS, Some(100.0))
+            .is_err());
+        assert!(book
+            .resize_range(Rows, 0, MAX_SHEET_ROWS, Some(25.0))
+            .is_err());
+        assert!(!book.resize_range(Columns, 0, 0, None).unwrap());
+        assert!(!book.is_dirty() && book.can_redo() && !book.can_undo());
+    }
+
+    #[test]
+    fn resized_empty_rows_restore_bounds_and_survive_sheet_deletion_undo() {
+        use crate::DimensionAxis::*;
+        let mut book = Workbook::new();
+        let before = (book.active_sheet().rows, book.active_sheet().cols);
+        book.resize_range(Rows, 100, 100, Some(36.0)).unwrap();
+        assert_eq!(book.active_sheet().rows, 101);
+        book.undo();
+        assert_eq!((book.active_sheet().rows, book.active_sheet().cols), before);
+        book.redo();
+        book.add_sheet("Other");
+        book.delete_sheet(0).unwrap();
+        book.undo();
+        assert_eq!(book.sheets[0].row_height(100), 36.0);
+        assert_eq!(book.sheets[0].rows, 101);
+    }
+
+    #[test]
+    fn formatting_is_one_edit_and_never_changes_values_or_formula_results() {
+        let mut book = Workbook::new();
+        book.paste_tsv(CellAddr::new(0, 0), "0.125\t=A1*2").unwrap();
+        book.mark_clean();
+        book.clear_history();
+        let range = CellRange {
+            start: CellAddr::new(0, 0),
+            end: CellAddr::new(1, 0),
+        };
+        book.format_range(range, crate::FormatChange::Number("0.00%".into()))
+            .unwrap();
+        assert_eq!(book.active_sheet().display(range.start), "12.50%");
+        assert_eq!(book.active_sheet().display(range.end), "25.00%");
+        assert_eq!(
+            book.active_sheet().evaluate(range.end),
+            crate::Value::Number(0.25)
+        );
+        assert_eq!(book.copy_tsv(range).unwrap(), "0.125\t=A1*2\n");
+        assert!(book.undo());
+        assert!(!book.is_dirty() && !book.can_undo());
+        assert_eq!(book.active_sheet().display(range.end), "0.25");
+        book.redo();
+        book.format_range(range, crate::FormatChange::Bold(true))
+            .unwrap();
+        book.set_cell(range.start, "0.5");
+        assert_eq!(book.active_sheet().display(range.start), "50.00%");
+        assert!(book.active_sheet().format(range.start).bold);
+        book.clear_range(range);
+        assert!(book.active_sheet().format(range.start).bold);
+        assert!(book.active_sheet().has_formatting());
+        book.undo();
+        assert_eq!(book.active_sheet().display(range.start), "50.00%");
+    }
+
+    #[test]
+    fn formatting_blank_cells_restores_bounds_and_survives_sheet_deletion_undo() {
+        let mut book = Workbook::new();
+        let before = (book.active_sheet().rows, book.active_sheet().cols);
+        let addr = CellAddr::new(40, 100);
+        let range = CellRange {
+            start: addr,
+            end: addr,
+        };
+        book.format_range(range, crate::FormatChange::Italic(true))
+            .unwrap();
+        assert_eq!(
+            (book.active_sheet().rows, book.active_sheet().cols),
+            (101, 41)
+        );
+        book.undo();
+        assert_eq!((book.active_sheet().rows, book.active_sheet().cols), before);
+        assert!(!book.active_sheet().has_formatting());
+        book.redo();
+        book.add_sheet("Other");
+        book.delete_sheet(0).unwrap();
+        book.undo();
+        assert!(book.sheets[0].format(addr).italic);
+    }
+
+    #[test]
+    fn invalid_or_unchanged_formatting_preserves_redo_and_clean_state() {
+        let mut book = Workbook::new();
+        let addr = CellAddr::new(0, 0);
+        let range = CellRange {
+            start: addr,
+            end: addr,
+        };
+        book.format_range(range, crate::FormatChange::Bold(true))
+            .unwrap();
+        book.undo();
+        assert!(!book
+            .format_range(range, crate::FormatChange::Bold(false))
+            .unwrap());
+        for end in [
+            CellAddr::new(MAX_SHEET_COLS, 0),
+            CellAddr::new(0, MAX_SHEET_ROWS),
+            CellAddr::new(1000, 1000),
+        ] {
+            assert!(book
+                .format_range(
+                    CellRange { start: addr, end },
+                    crate::FormatChange::Bold(true)
+                )
+                .is_err());
+        }
+        assert!(!book.is_dirty() && book.can_redo() && !book.can_undo());
+        book.redo();
+        book.format_range(range, crate::FormatChange::Clear)
+            .unwrap();
+        assert!(!book.active_sheet().has_formatting());
+        book.undo();
+        assert!(book.active_sheet().format(addr).bold);
+    }
+
+    #[test]
+    fn rename_validation_preserves_redo_and_saved_state() {
+        let mut book = Workbook::new();
+        book.add_sheet("Résumé");
+        book.mark_clean();
+        book.clear_history();
+        book.rename_sheet(0, "売上 & <集計>").unwrap();
+        book.undo();
+        assert!(!book.is_dirty() && book.can_redo());
+        for name in [
+            "",
+            "   ",
+            "bad/name",
+            "bad:name",
+            "bad?name",
+            "bad*name",
+            "bad[name]",
+            "bad\\name",
+            "'bad",
+            "bad'",
+            "RÉSUMÉ",
+            "abcdefghijklmnopqrstuvwxyz123456",
+        ] {
+            assert!(book.rename_sheet(0, name).is_err(), "{name:?}");
+            assert_eq!(book.sheets[0].name, "Sheet1");
+            assert!(!book.is_dirty() && book.can_redo() && !book.can_undo());
+        }
+        assert!(!book.rename_sheet(0, "Sheet1").unwrap());
+        assert_eq!(book.rename_sheet(99, "Valid"), Err(SheetError::Missing));
+        assert!(book.redo());
+        assert_eq!(book.sheets[0].name, "売上 & <集計>");
+        book.rename_sheet(0, "日".repeat(31)).unwrap();
+        assert!(book.rename_sheet(0, "日".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn deletion_restores_position_contents_formulas_and_saved_revision() {
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(0, 0), "first");
+        book.add_sheet("売上");
+        book.set_cell(CellAddr::new(0, 80), "=1+2");
+        book.add_sheet("Last");
+        book.set_cell(CellAddr::new(0, 0), "last");
+        book.mark_clean();
+        book.clear_history();
+        book.set_active_sheet(1);
+        book.delete_sheet(1).unwrap();
+        assert_eq!(book.active_sheet().name, "Last");
+        assert!(book.is_dirty());
+        assert!(book.undo());
+        assert_eq!(book.active, 1);
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 80)), "=1+2");
+        assert_eq!(book.active_sheet().rows, 81);
+        assert!(!book.is_dirty());
+        assert!(book.redo());
+        assert_eq!(book.sheet_count(), 2);
+        book.mark_clean();
+        book.undo();
+        assert!(book.is_dirty());
+        book.redo();
+        assert!(!book.is_dirty());
+        book.delete_sheet(1).unwrap();
+        assert_eq!(book.active, 0);
+        assert_eq!(book.delete_sheet(0), Err(SheetError::LastSheet));
+        assert_eq!(book.delete_sheet(1), Err(SheetError::Missing));
+        book.undo();
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "last");
+    }
+
+    #[test]
+    fn deleting_inactive_sheets_tracks_active_indices_and_prior_edits() {
+        let mut book = Workbook::new();
+        book.add_sheet("Sheet2");
+        book.add_sheet("Sheet3");
+        book.set_cell(CellAddr::new(0, 0), "third");
+        book.delete_sheet(0).unwrap();
+        assert_eq!(book.active, 1);
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "third");
+        book.undo();
+        assert_eq!(book.active, 2);
+        book.undo();
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "");
+        book.redo();
+        book.redo();
+        book.set_active_sheet(0);
+        book.delete_sheet(1).unwrap();
+        assert_eq!(book.active, 0);
+        book.undo();
+        assert_eq!(book.active, 0);
+        assert_eq!(book.sheets[1].raw(CellAddr::new(0, 0)), "third");
+        assert_eq!(book.next_sheet_name(), "Sheet1");
+        book.add_sheet(book.next_sheet_name());
+        assert_eq!(book.next_sheet_name(), "Sheet4");
+    }
 
     #[test]
     fn paste_and_clear_are_single_undoable_operations_with_formulas() {

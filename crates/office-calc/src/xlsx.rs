@@ -25,6 +25,7 @@ pub enum XlsxError {
 /// A values or formulas read error on any sheet rejects the entire import.
 pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
     let mut excel = open_workbook_auto(path).map_err(|e| XlsxError::Read(e.to_string()))?;
+    let has_xlsx_presentation = matches!(&excel, calamine::Sheets::Xlsx(_));
     let names = excel.sheet_names().to_vec();
     if names.is_empty() {
         return Ok(Workbook::new());
@@ -66,6 +67,9 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
     let mut wb = Workbook::new();
     wb.sheets = sheets;
     wb.active = 0;
+    if has_xlsx_presentation {
+        crate::xlsx_format::load(path, &mut wb).map_err(XlsxError::Read)?;
+    }
     wb.mark_clean();
     Ok(wb)
 }
@@ -144,38 +148,127 @@ pub fn write_xlsx_bytes(workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
             .set_name(&name)
             .map_err(|e| XlsxError::Write(e.to_string()))?;
 
+        worksheet.set_default_row_height(sheet.default_dimension(crate::DimensionAxis::Rows));
+        worksheet
+            .set_column_range_width_pixels(
+                0,
+                (crate::MAX_SHEET_COLS - 1) as u16,
+                sheet.default_dimension(crate::DimensionAxis::Columns) as u16,
+            )
+            .map_err(|e| XlsxError::Write(e.to_string()))?;
+        for (col, width) in sheet.dimension_overrides(crate::DimensionAxis::Columns) {
+            worksheet
+                .set_column_width_pixels(col as u16, width as u16)
+                .map_err(|e| XlsxError::Write(e.to_string()))?;
+        }
+        for (row, height) in sheet.dimension_overrides(crate::DimensionAxis::Rows) {
+            worksheet
+                .set_row_height(row, height)
+                .map_err(|e| XlsxError::Write(e.to_string()))?;
+        }
+
         for (addr, cell) in sheet.occupied() {
             let row = addr.row;
             let col = addr.col as u16;
             let raw = cell.raw.as_str();
+            let style = sheet.format(addr);
+            let format = style.xlsx_format();
             if let Some(text) = cell.literal_text() {
                 worksheet
-                    .write_string(row, col, text)
+                    .write_string_with_format(row, col, text, &format)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
             } else if let Some(body) = raw.trim().strip_prefix('=') {
                 worksheet
-                    .write_formula(row, col, body)
+                    .write_formula_with_format(row, col, body, &format)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
             } else if let Ok(n) = raw.trim().parse::<f64>() {
                 worksheet
-                    .write_number(row, col, n)
+                    .write_number_with_format(row, col, n, &format)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
             } else if raw.eq_ignore_ascii_case("TRUE") {
                 worksheet
-                    .write_boolean(row, col, true)
+                    .write_boolean_with_format(row, col, true, &format)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
             } else if raw.eq_ignore_ascii_case("FALSE") {
                 worksheet
-                    .write_boolean(row, col, false)
+                    .write_boolean_with_format(row, col, false, &format)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
             } else {
                 worksheet
-                    .write_string(row, col, raw)
+                    .write_string_with_format(row, col, raw, &format)
+                    .map_err(|e| XlsxError::Write(e.to_string()))?;
+            }
+        }
+        for (addr, style) in sheet.formatted() {
+            if sheet.get(addr).is_none() {
+                let format = style.xlsx_format();
+                worksheet
+                    .write_blank(addr.row, addr.col as u16, &format)
                     .map_err(|e| XlsxError::Write(e.to_string()))?;
             }
         }
     }
-    xlsx.save_to_buffer()
+    let bytes = xlsx
+        .save_to_buffer()
+        .map_err(|e| XlsxError::Write(e.to_string()))?;
+    with_default_column_widths(bytes, workbook)
+}
+
+/// rust_xlsxwriter exposes a default row height but no default-column setter.
+/// Preserve that worksheet default in its generated sheetFormatPr as well as
+/// writing explicit physical widths for interoperability with desktop Excel.
+fn with_default_column_widths(bytes: Vec<u8>, workbook: &Workbook) -> Result<Vec<u8>, XlsxError> {
+    use std::io::{Cursor, Read, Write};
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| XlsxError::Write(e.to_string()))?;
+    let mut output = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| XlsxError::Write(e.to_string()))?;
+        let sheet_index = file
+            .name()
+            .strip_prefix("xl/worksheets/sheet")
+            .and_then(|name| name.strip_suffix(".xml"))
+            .and_then(|name| name.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1));
+        if let Some(index) = sheet_index {
+            let sheet = workbook
+                .sheets
+                .get(index)
+                .ok_or_else(|| XlsxError::Write("Unexpected generated worksheet index".into()))?;
+            let mut xml = String::new();
+            file.read_to_string(&mut xml)?;
+            if !xml.contains("<sheetFormatPr ") {
+                return Err(XlsxError::Write(
+                    "Generated worksheet lacks sheetFormatPr".into(),
+                ));
+            }
+            let xml = xml.replacen(
+                "<sheetFormatPr ",
+                &format!(
+                    "<sheetFormatPr defaultColWidth=\"{}\" ",
+                    sheet.default_dimension(crate::DimensionAxis::Columns) / 7.0
+                ),
+                1,
+            );
+            output
+                .start_file(
+                    file.name(),
+                    zip::write::FileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .map_err(|e| XlsxError::Write(e.to_string()))?;
+            output.write_all(xml.as_bytes())?;
+        } else {
+            output
+                .raw_copy_file(file)
+                .map_err(|e| XlsxError::Write(e.to_string()))?;
+        }
+    }
+    output
+        .finish()
+        .map(|cursor| cursor.into_inner())
         .map_err(|e| XlsxError::Write(e.to_string()))
 }
 

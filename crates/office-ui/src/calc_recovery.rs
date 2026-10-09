@@ -16,6 +16,8 @@ struct SheetSnapshot {
     rows: u32,
     cols: u32,
     cells: Vec<(u32, u32, String)>,
+    #[serde(default)]
+    presentation: Option<office_calc::SheetPresentation>,
 }
 
 impl CalcSnapshot {
@@ -47,6 +49,7 @@ impl CalcSnapshot {
                     rows,
                     cols,
                     cells,
+                    presentation: Some(sheet.presentation()),
                 }
             })
             .collect();
@@ -68,6 +71,11 @@ impl CalcSnapshot {
                 }
                 sheet.rows = snapshot.rows;
                 sheet.cols = snapshot.cols;
+                if let Some(presentation) = snapshot.presentation {
+                    sheet
+                        .restore_presentation(presentation)
+                        .expect("recovery data must be validated before restoration");
+                }
                 sheet
             })
             .collect();
@@ -97,6 +105,13 @@ impl crate::recovery::RecoveryData for CalcSnapshot {
             {
                 return Err("Calc recovery exceeds cell or grid limits".into());
             }
+            if let Some(presentation) = &sheet.presentation {
+                presentation.validate(sheet.rows, sheet.cols)?;
+                total = total.saturating_add(presentation.entry_count());
+                if total > 100_000 {
+                    return Err("Calc recovery exceeds presentation limits".into());
+                }
+            }
             let mut seen = std::collections::HashSet::new();
             for (col, row, _) in &sheet.cells {
                 if *col >= sheet.cols || *row >= sheet.rows || !seen.insert((*col, *row)) {
@@ -115,6 +130,111 @@ impl crate::recovery::RecoveryData for CalcSnapshot {
 mod tests {
     use super::*;
     use crate::recovery::{Recovery, RecoveryData};
+    #[test]
+    fn recovery_preserves_formats_blank_cells_dimensions_and_xlsx_export() {
+        use office_calc::{CellRange, DimensionAxis, FormatChange};
+        let mut book = Workbook::new();
+        let cell = CellAddr::new(0, 0);
+        let blank = CellAddr::new(2, 3);
+        book.set_cell(cell, "0.125");
+        book.format_range(
+            CellRange {
+                start: cell,
+                end: cell,
+            },
+            FormatChange::Number("0.00%".into()),
+        )
+        .unwrap();
+        book.format_range(
+            CellRange {
+                start: blank,
+                end: blank,
+            },
+            FormatChange::Bold(true),
+        )
+        .unwrap();
+        book.resize_range(DimensionAxis::Columns, 0, 0, Some(140.0))
+            .unwrap();
+        book.resize_range(DimensionAxis::Rows, 3, 3, Some(32.5))
+            .unwrap();
+        // Imported worksheet defaults must survive along with sparse overrides.
+        let mut presentation = serde_json::to_value(book.active_sheet().presentation()).unwrap();
+        presentation["dimensions"]["default_column"] = 120.0.into();
+        presentation["dimensions"]["default_row"] = 23.5.into();
+        book.active_sheet_mut()
+            .restore_presentation(serde_json::from_value(presentation).unwrap())
+            .unwrap();
+        book.add_sheet("Second");
+        book.active = 0;
+        let snapshot = CalcSnapshot::capture(&book, Some((cell, "0.25")));
+        let decoded = CalcSnapshot::decode(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        decoded.validate().unwrap();
+        let restored = decoded.into_workbook();
+        let sheet = restored.active_sheet();
+        assert_eq!(sheet.display(cell), "25.00%");
+        assert_eq!(sheet.raw(blank), "");
+        assert!(sheet.format(blank).bold);
+        assert_eq!(sheet.column_width(0), 140.0);
+        assert_eq!(sheet.row_height(3), 32.5);
+        assert_eq!(sheet.column_width(1), 120.0);
+        assert_eq!(sheet.row_height(1), 23.5);
+        assert_eq!(restored.sheets.len(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored.xlsx");
+        office_calc::write_xlsx_path(&restored, &path).unwrap();
+        let reopened = office_calc::load_xlsx_path(&path).unwrap();
+        assert_eq!(reopened.sheets[0].format(cell), sheet.format(cell));
+        assert_eq!(reopened.sheets[0].format(blank), sheet.format(blank));
+        assert_eq!(reopened.sheets[0].column_width(0), 140.0);
+        assert_eq!(reopened.sheets[0].row_height(3), 32.5);
+        assert_eq!(reopened.sheets[0].column_width(1), 120.0);
+        assert_eq!(reopened.sheets[0].row_height(1), 23.5);
+    }
+
+    #[test]
+    fn legacy_snapshot_without_presentation_still_restores() {
+        let mut value =
+            serde_json::to_value(CalcSnapshot::capture(&Workbook::new(), None)).unwrap();
+        value["sheets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("presentation");
+        let snapshot = CalcSnapshot::decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+        snapshot.validate().unwrap();
+        assert!(!snapshot.into_workbook().active_sheet().has_formatting());
+    }
+
+    #[test]
+    fn invalid_recovery_presentation_is_rejected() {
+        let value = serde_json::to_value(CalcSnapshot::capture(&Workbook::new(), None)).unwrap();
+        for mutation in ["address", "duplicate", "width", "height", "row", "unknown"] {
+            let mut bad = value.clone();
+            let p = &mut bad["sheets"][0]["presentation"];
+            match mutation {
+                "address" => {
+                    p["formats"] =
+                        serde_json::json!([[16384, 0, office_calc::CellFormat::default()]])
+                }
+                "duplicate" => {
+                    p["formats"] = serde_json::json!([
+                        [0, 0, office_calc::CellFormat::default()],
+                        [0, 0, office_calc::CellFormat::default()]
+                    ])
+                }
+                "width" => p["dimensions"]["default_column"] = (-1).into(),
+                "height" => p["dimensions"]["default_row"] = 1000.into(),
+                "row" => p["dimensions"]["rows"] = serde_json::json!({"1048576": 32.0}),
+                _ => p["dimensions"]["unknown"] = true.into(),
+            }
+            assert!(
+                CalcSnapshot::decode(&serde_json::to_vec(&bad).unwrap())
+                    .and_then(|s| s.validate())
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+    }
+
     #[test]
     fn sparse_multisheet_formula_and_draft_survive_two_restarts() {
         let root = tempfile::tempdir().unwrap();
