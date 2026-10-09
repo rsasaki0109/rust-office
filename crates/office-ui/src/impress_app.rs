@@ -1,6 +1,6 @@
 //! Impress (presentation) application UI.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::mpsc};
 
 use eframe::App;
 use egui::{self, Color32, RichText, Sense, Ui, Vec2};
@@ -20,6 +20,11 @@ pub enum SwitchTo {
     Quit,
 }
 
+struct PdfExport {
+    path: PathBuf,
+    result: mpsc::Receiver<Result<(), String>>,
+}
+
 pub struct ImpressApp {
     presentation: Presentation,
     file_path: Option<PathBuf>,
@@ -31,7 +36,9 @@ pub struct ImpressApp {
     selected_object: usize,
     selection_slide: usize,
     drag_session: Option<(usize, usize, bool)>,
-    textures: HashMap<usize, (Arc<Vec<u8>>, egui::TextureHandle)>,
+    textures: office_render::SlideTextures,
+    pdf_export: Option<PdfExport>,
+    pending_pdf: Option<PathBuf>,
     show: Option<SlideShow>,
     pending_show: Option<bool>,
     pub pending_switch: Option<SwitchTo>,
@@ -50,7 +57,9 @@ impl ImpressApp {
             selected_object: 0,
             selection_slide: 0,
             drag_session: None,
-            textures: HashMap::new(),
+            textures: office_render::SlideTextures::default(),
+            pdf_export: None,
+            pending_pdf: None,
             show: None,
             pending_show: None,
             pending_switch: None,
@@ -225,6 +234,88 @@ impl ImpressApp {
         }
     }
 
+    fn export_pdf(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF (slides as images)", &["pdf"])
+            .set_file_name("slides.pdf")
+            .save_file()
+        else {
+            return;
+        };
+        self.pending_pdf = Some(path);
+    }
+
+    fn export_pdf_to(&mut self, ctx: &egui::Context, path: &std::path::Path) -> bool {
+        if self.pdf_export.is_some() {
+            return false;
+        }
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        {
+            self.set_error("PDF export failed: choose a .pdf destination");
+            return false;
+        }
+        let fonts = ctx.fonts(|fonts| fonts.definitions().clone());
+        let presentation = self.presentation.clone();
+        let path = path.to_path_buf();
+        let destination = path.clone();
+        let repaint = ctx.clone();
+        let (sender, result) = mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("impress-pdf".into())
+            .spawn(move || {
+                let context = egui::Context::default();
+                context.set_fonts(fonts);
+                let mut snapshot = Some(presentation);
+                let mut exported = None;
+                let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                    if let Some(presentation) = snapshot.take() {
+                        exported = Some(office_render::write_presentation_pdf_path(
+                            ui.ctx(),
+                            &presentation,
+                            &destination,
+                        ));
+                    }
+                });
+                output.textures_delta.clear();
+                let _ = sender
+                    .send(exported.unwrap_or_else(|| Err("PDF worker did not render".into())));
+                repaint.request_repaint();
+            });
+        match spawn {
+            Ok(_) => {
+                self.pdf_export = Some(PdfExport { path, result });
+                self.set_status("Exporting PDF — slides as images; editing remains available");
+                true
+            }
+            Err(error) => {
+                self.set_error(format!("PDF export failed: {error}"));
+                false
+            }
+        }
+    }
+
+    fn poll_pdf_export(&mut self) {
+        let Some(job) = &self.pdf_export else {
+            return;
+        };
+        let result = match job.result.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("PDF export worker stopped".into()),
+        };
+        let path = self.pdf_export.take().unwrap().path;
+        match result {
+            Ok(()) => self.set_status(format!(
+                "Exported PDF {} — 144 dpi, slides as images",
+                path.display()
+            )),
+            Err(error) => self.set_error(format!("PDF export failed: {error}")),
+        }
+    }
+
     fn export_pptx(&mut self) {
         let path = rfd::FileDialog::new()
             .add_filter("PowerPoint", &["pptx"])
@@ -335,6 +426,16 @@ impl ImpressApp {
                 }
                 if ui.button("Save As…").clicked() {
                     self.save_json_as();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.pdf_export.is_none() && self.pending_pdf.is_none(),
+                        egui::Button::new("Export PDF (slides as images)…"),
+                    )
+                    .clicked()
+                {
+                    self.export_pdf();
                     ui.close();
                 }
                 if ui.button("Export PPTX…").clicked() {
@@ -716,77 +817,11 @@ impl ImpressApp {
     }
     /// Editor and slide show deliberately share the same object rendering.
     fn paint_slide(&mut self, ui: &Ui, rect: egui::Rect, slide: &office_impress::Slide) {
-        let theme = &self.presentation.theme;
-        let painter = ui.painter().with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, rgb(theme.background));
-        let scale = rect.height() / SLIDE_HEIGHT_PT;
-        let mut active_images = Vec::new();
-        for (index, object) in slide.objects.iter().enumerate() {
-            if let ObjectKind::Image { data } = &object.kind {
-                let key = Arc::as_ptr(data) as usize;
-                active_images.push(key);
-                if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(key) {
-                    if let Ok(image) = office_impress::decode_image(data) {
-                        let rgba = image.thumbnail(2048, 2048).to_rgba8();
-                        let color = egui::ColorImage::from_rgba_unmultiplied(
-                            [rgba.width() as usize, rgba.height() as usize],
-                            rgba.as_raw(),
-                        );
-                        entry.insert((
-                            data.clone(),
-                            ui.ctx().load_texture(
-                                format!("impress_image_{index}"),
-                                color,
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        self.textures.retain(|key, _| active_images.contains(key));
-        for index in 0..slide.objects.len() + 2 {
-            let object_rect = bounds_rect(rect, object_bounds(slide, index));
-            let clipped = painter.with_clip_rect(object_rect.intersect(rect));
-            if index < 2 {
-                let (text, font, color) = if index == 0 {
-                    (&slide.title.text, theme.title_font_pt, theme.title_color)
-                } else {
-                    (&slide.body.text, theme.body_font_pt, theme.body_color)
-                };
-                paint_text(&clipped, object_rect, text, font * scale, rgb(color));
-            } else {
-                match &slide.objects[index - 2].kind {
-                    ObjectKind::Text {
-                        text,
-                        font_pt,
-                        color,
-                    } => paint_text(&clipped, object_rect, text, font_pt * scale, rgb(*color)),
-                    ObjectKind::Shape { shape, fill } => match shape {
-                        ShapeKind::Rectangle => {
-                            clipped.rect_filled(object_rect, 0.0, rgb(*fill));
-                        }
-                        ShapeKind::Ellipse => {
-                            clipped.add(egui::epaint::EllipseShape::filled(
-                                object_rect.center(),
-                                object_rect.size() / 2.0,
-                                rgb(*fill),
-                            ));
-                        }
-                    },
-                    ObjectKind::Image { data } => {
-                        if let Some((_, texture)) = self.textures.get(&(Arc::as_ptr(data) as usize))
-                        {
-                            clipped.image(
-                                texture.id(),
-                                object_rect,
-                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                        }
-                    }
-                }
-            }
+        if let Err(error) = self
+            .textures
+            .paint(ui, rect, slide, &self.presentation.theme)
+        {
+            self.set_error(format!("Slide rendering failed: {error}"));
         }
     }
 
@@ -922,6 +957,7 @@ impl App for ImpressApp {
 impl ImpressApp {
     fn document_ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        self.poll_pdf_export();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
         if self.show.is_some() {
             self.slide_show_ui(ui);
@@ -1021,6 +1057,11 @@ impl ImpressApp {
             .show(ui, |ui| {
                 self.canvas(ui);
             });
+        if let Some(path) = self.pending_pdf.take() {
+            if ui.is_enabled() {
+                self.export_pdf_to(&ctx, &path);
+            }
+        }
         // Apply text events in this frame before entering the read-only presentation.
         if let Some(from_current) = self.pending_show.take() {
             if ui.is_enabled() {
@@ -1224,9 +1265,6 @@ mod history_tests {
     }
 }
 
-fn rgb(color: [u8; 3]) -> Color32 {
-    Color32::from_rgb(color[0], color[1], color[2])
-}
 fn object_label(slide: &office_impress::Slide, index: usize) -> String {
     match index {
         0 => "Title".into(),
@@ -1283,16 +1321,6 @@ fn bounds_rect(rect: egui::Rect, bounds: Bounds) -> egui::Rect {
         egui::vec2(bounds.w * rect.width(), bounds.h * rect.height()),
     )
 }
-fn paint_text(painter: &egui::Painter, rect: egui::Rect, text: &str, size: f32, color: Color32) {
-    let galley = painter.layout(
-        text.into(),
-        egui::FontId::proportional(size),
-        color,
-        rect.width(),
-    );
-    painter.galley(rect.min, galley, color);
-}
-
 #[cfg(test)]
 mod object_tests {
     use super::*;
@@ -1580,5 +1608,89 @@ mod show_tests {
             assert!((slide.width() / slide.height() - 16.0 / 9.0).abs() < 0.0001);
             assert!(area.contains_rect(slide));
         }
+    }
+}
+
+#[cfg(test)]
+mod pdf_tests {
+    use super::*;
+
+    fn begin(ctx: &egui::Context, app: &mut ImpressApp, path: &std::path::Path) -> bool {
+        let mut started = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            started = app.export_pdf_to(ui.ctx(), path);
+        });
+        output.textures_delta.clear();
+        started
+    }
+
+    fn finish(app: &mut ImpressApp) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.pdf_export.is_some() {
+            app.poll_pdf_export();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PDF export did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn asynchronous_pdf_uses_snapshot_and_keeps_later_edits_selection_path_and_history() {
+        let ctx = egui::Context::default();
+        let mut app = ImpressApp::new();
+        app.presentation.set_active(2);
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("native.json");
+        app.file_path = Some(native.clone());
+        let pdf = dir.path().join("slides.pdf");
+        assert!(begin(&ctx, &mut app, &pdf));
+        app.presentation.add_slide();
+        let edited = app.presentation.clone();
+        assert!(!begin(&ctx, &mut app, &dir.path().join("second.pdf")));
+        finish(&mut app);
+        assert!(app.last_error.is_none());
+        assert_eq!(app.presentation, edited);
+        assert_eq!(app.file_path, Some(native));
+        assert_eq!(app.presentation.active, 3);
+        assert!(app.is_dirty());
+        let bytes = std::fs::read(pdf).unwrap();
+        assert!(bytes.starts_with(b"%PDF"));
+        assert!(String::from_utf8_lossy(&bytes).contains("/Count 3"));
+        app.history(false);
+        assert!(!app.is_dirty());
+        assert_eq!(app.presentation.active, 2);
+    }
+
+    #[test]
+    fn rejected_destination_and_failed_render_keep_old_file_and_unsaved_history() {
+        let ctx = egui::Context::default();
+        let mut app = ImpressApp::new();
+        let mut slide = app.presentation.active_slide().unwrap().clone();
+        slide.objects.push(SlideObject {
+            bounds: Bounds::default(),
+            kind: ObjectKind::Image {
+                data: std::sync::Arc::new(b"corrupt".to_vec()),
+            },
+        });
+        app.presentation.update_active_slide(slide, false);
+        let original = app.presentation.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("native.json");
+        std::fs::write(&native, b"original native").unwrap();
+        app.file_path = Some(native.clone());
+        assert!(!begin(&ctx, &mut app, &native));
+        assert_eq!(std::fs::read(&native).unwrap(), b"original native");
+        let pdf = dir.path().join("existing.pdf");
+        std::fs::write(&pdf, b"original pdf").unwrap();
+        assert!(begin(&ctx, &mut app, &pdf));
+        finish(&mut app);
+        assert!(app.last_error.is_some());
+        assert_eq!(std::fs::read(pdf).unwrap(), b"original pdf");
+        assert_eq!(app.presentation, original);
+        assert_eq!(app.file_path, Some(native));
+        app.history(false);
+        assert!(!app.is_dirty());
     }
 }

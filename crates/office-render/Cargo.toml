@@ -11,3 +11,7 @@ office-core = { workspace = true }
 egui = { workspace = true }
 image = { workspace = true }
 printpdf = { workspace = true }
+office-impress = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

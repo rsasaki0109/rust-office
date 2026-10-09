@@ -178,7 +178,7 @@ Not yet:
 * Calc copies raw values/formulas as tab-separated text. Formatting is not
   exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.
-* Impress: added shape/image PPTX interchange, PDF sharing and animations remain unsupported
+* Impress: added shape/image PPTX interchange, searchable/vector slide PDF and animations remain unsupported
 * Packaging: CI builds Linux binary; no signed macOS/Windows installers yet
 
 ## Suggested next PRs
@@ -309,6 +309,33 @@ Show exit restores the fullscreen flag reported at start. External window-manage
 fullscreen changes were not reported by the X11 backend in the native test;
 application F11 is the tested way to manage and restore fullscreen state. Other
 OS/Wayland behavior still requires the separate platform acceptance checks.
-PDF sharing, PPTX interchange for added objects, presenter-notes views and
-animations remain later work. Completing slide show alone does not complete the
+PPTX interchange for added objects, presenter-notes views and animations remain
+later work. Raster PDF sharing is implemented below. Completing slide show alone does not complete the
 roadmap milestone that also requires PDF and basic-shape PPTX output.
+
+
+Impress PDF export is File → Export PDF (slides as images). Every slide produces
+one 960×540-point PDF page with a 1920×1080 image (144 dpi, JPEG quality 95).
+The editor, slide show and PDF use a shared scene for theme backgrounds, text
+wrapping/clipping, object order, rectangles, ellipses and embedded images. Raster
+text uses the application's font definitions, including installed CJK fallback;
+no font substitution occurs in the PDF viewer. Speaker notes, editing handles
+and show controls are excluded. Text is not selectable/searchable and JPEG can
+introduce slight image artifacts; vector/searchable export remains future work.
+
+The UI worker captures the document after the export frame's text events, copies
+font definitions to an isolated egui context and renders off the UI thread.
+Editing can continue; the output uses the captured snapshot. Only one export may
+run at a time. Export never changes the document's native destination, dirty
+revision, selection or history, even if later edits occur or generation fails.
+Success/failure wakes the UI for status reporting. Cancelling the file picker
+starts no worker. Closing the application can cancel an unfinished background
+export; destination writes remain atomic rather than exposing a partial PDF.
+
+PDF supports 1–200 slides per export. Invalid geometry, font sizes, corrupt images
+and unsupported paint callbacks are errors. Image limits from the native object
+model also apply. The writer generates the whole PDF before atomically replacing
+the destination; failure leaves a prior file intact. The UI requires a .pdf
+extension, protecting a selected native JSON destination from accidental export.
+This does not complete the combined presentation/PDF/PPTX roadmap milestone until
+basic-object PPTX output is implemented and the corresponding PRs are merged.

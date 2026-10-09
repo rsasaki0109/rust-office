@@ -69,6 +69,9 @@ compatibility. Unmerged work is tracked separately.
 
 ### Impress
 
+* Background PDF export: one 144-dpi raster slide per widescreen page, using the same text/shape/image scene as the editor
+* Export snapshots leave later edits, the native save destination and Undo/Redo intact; text is not searchable/selectable
+
 * Slide Show from the beginning (F5) or current slide (Shift+F5); arrows/Space, Home/End and Esc
 * F11 window fullscreen, mouse/button navigation and return to the unchanged editor
 
@@ -107,7 +110,7 @@ rust-office/
 * Named styles beyond Heading 1–3; floating images; footnotes
 * Exact PDF glyph metrics / richer table borders
 * Calc charts / full Excel function library
-* Impress shape/image PPTX interchange, PDF sharing and animations
+* Impress shape/image PPTX interchange, searchable/vector slide PDF and animations
 * Spell check; full accessibility tree
 * Signed Win / macOS installers
 

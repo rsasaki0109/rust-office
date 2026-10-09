@@ -5,6 +5,11 @@
 
 mod images;
 mod layout_pdf;
+mod slide_pdf;
+mod slides;
+
+pub use slide_pdf::{presentation_pdf_bytes, write_presentation_pdf_path, SLIDE_PDF_DPI};
+pub use slides::SlideTextures;
 
 #[cfg(test)]
 mod smoke_tests;

@@ -2476,7 +2476,9 @@ dependencies = [
  "egui",
  "image 0.25.10",
  "office-core",
+ "office-impress",
  "printpdf",
+ "tempfile",
 ]
 
 [[package]]

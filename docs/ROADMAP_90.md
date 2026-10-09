@@ -65,7 +65,9 @@
 - [x] スライド複製・並べ替え・削除、オブジェクト操作の Undo/Redo を備える。
   既存テキスト枠・ノート・テーマを含む [PR #16](https://github.com/rsasaki0109/rust-office/pull/16) で実装・検証・マージ済み。
 - [ ] 全画面の発表、次／前・終了操作、PDF 共有と PPTX の基本図形出力を備える。
-  発表モードを [PR #18](https://github.com/rsasaki0109/rust-office/pull/18) で進行中。PDF・PPTX 出力が揃うまで加点しない。
+  発表モード [PR #18](https://github.com/rsasaki0109/rust-office/pull/18)、
+  画像形式の PDF 共有 [PR #19](https://github.com/rsasaki0109/rust-office/pull/19) が進行中。
+  PPTX 基本図形出力と各 PR のマージが揃うまで加点しない。
 
 ### 配布・使いやすさ（15点）
 
