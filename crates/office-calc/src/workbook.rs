@@ -34,6 +34,18 @@ struct CellChange {
     after: Option<Cell>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SheetError {
+    #[error("Worksheet does not exist")]
+    Missing,
+    #[error("Invalid worksheet name: {0}")]
+    InvalidName(String),
+    #[error("A worksheet with this name already exists")]
+    DuplicateName,
+    #[error("The last worksheet cannot be deleted")]
+    LastSheet,
+}
+
 #[derive(Debug, Clone)]
 enum Change {
     Cells {
@@ -41,6 +53,17 @@ enum Change {
         cells: Vec<CellChange>,
         before_bounds: (u32, u32),
         after_bounds: (u32, u32),
+    },
+    RenameSheet {
+        index: usize,
+        before: String,
+        after: String,
+    },
+    DeleteSheet {
+        sheet: Sheet,
+        index: usize,
+        previous_active: usize,
+        next_active: usize,
     },
     AddSheet {
         sheet: Sheet,
@@ -290,6 +313,28 @@ impl Workbook {
                 self.active_sheet_mut().rows = rows;
                 self.active_sheet_mut().cols = cols;
             }
+            Change::RenameSheet {
+                index,
+                before,
+                after,
+            } => {
+                self.sheets[*index].name = if forward { after } else { before }.clone();
+                self.active = *index;
+            }
+            Change::DeleteSheet {
+                sheet,
+                index,
+                previous_active,
+                next_active,
+            } => {
+                if forward {
+                    self.sheets.remove(*index);
+                    self.active = *next_active;
+                } else {
+                    self.sheets.insert(*index, sheet.clone());
+                    self.active = *previous_active;
+                }
+            }
             Change::AddSheet {
                 sheet,
                 index,
@@ -316,6 +361,86 @@ impl Workbook {
         self.sheets.len()
     }
 
+    /// Generate a name that remains unique after deletions and custom renames.
+    pub fn next_sheet_name(&self) -> String {
+        for n in 1.. {
+            let name = format!("Sheet{n}");
+            if !self
+                .sheets
+                .iter()
+                .any(|sheet| sheet.name.eq_ignore_ascii_case(&name))
+            {
+                return name;
+            }
+        }
+        unreachable!()
+    }
+
+    /// Rename without changing values, formulas, or history on failure/no-op.
+    pub fn rename_sheet(
+        &mut self,
+        index: usize,
+        name: impl Into<String>,
+    ) -> Result<bool, SheetError> {
+        let before = self
+            .sheets
+            .get(index)
+            .ok_or(SheetError::Missing)?
+            .name
+            .clone();
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(SheetError::InvalidName("Name cannot be blank".into()));
+        }
+        rust_xlsxwriter::Worksheet::new()
+            .set_name(&name)
+            .map_err(|error| SheetError::InvalidName(error.to_string()))?;
+        if self
+            .sheets
+            .iter()
+            .enumerate()
+            .any(|(i, sheet)| i != index && sheet.name.to_lowercase() == name.to_lowercase())
+        {
+            return Err(SheetError::DuplicateName);
+        }
+        if before == name {
+            return Ok(false);
+        }
+        self.sheets[index].name = name.clone();
+        self.record(Change::RenameSheet {
+            index,
+            before,
+            after: name,
+        });
+        Ok(true)
+    }
+
+    /// Retain the deleted sheet and its position in history for lossless undo.
+    pub fn delete_sheet(&mut self, index: usize) -> Result<(), SheetError> {
+        if index >= self.sheets.len() {
+            return Err(SheetError::Missing);
+        }
+        if self.sheets.len() == 1 {
+            return Err(SheetError::LastSheet);
+        }
+        let previous_active = self.active;
+        let sheet = self.sheets.remove(index);
+        self.active = if previous_active > index {
+            previous_active - 1
+        } else if previous_active == index {
+            index.min(self.sheets.len() - 1)
+        } else {
+            previous_active
+        };
+        self.record(Change::DeleteSheet {
+            sheet,
+            index,
+            previous_active,
+            next_active: self.active,
+        });
+        Ok(())
+    }
+
     pub fn add_sheet(&mut self, name: impl Into<String>) {
         let sheet = Sheet::new(name);
         let index = self.sheets.len();
@@ -334,6 +459,101 @@ impl Workbook {
 mod tests {
     use super::*;
     use crate::{MAX_SHEET_COLS, MAX_SHEET_ROWS};
+
+    #[test]
+    fn rename_validation_preserves_redo_and_saved_state() {
+        let mut book = Workbook::new();
+        book.add_sheet("Résumé");
+        book.mark_clean();
+        book.clear_history();
+        book.rename_sheet(0, "売上 & <集計>").unwrap();
+        book.undo();
+        assert!(!book.is_dirty() && book.can_redo());
+        for name in [
+            "",
+            "   ",
+            "bad/name",
+            "bad:name",
+            "bad?name",
+            "bad*name",
+            "bad[name]",
+            "bad\\name",
+            "'bad",
+            "bad'",
+            "RÉSUMÉ",
+            "abcdefghijklmnopqrstuvwxyz123456",
+        ] {
+            assert!(book.rename_sheet(0, name).is_err(), "{name:?}");
+            assert_eq!(book.sheets[0].name, "Sheet1");
+            assert!(!book.is_dirty() && book.can_redo() && !book.can_undo());
+        }
+        assert!(!book.rename_sheet(0, "Sheet1").unwrap());
+        assert_eq!(book.rename_sheet(99, "Valid"), Err(SheetError::Missing));
+        assert!(book.redo());
+        assert_eq!(book.sheets[0].name, "売上 & <集計>");
+        book.rename_sheet(0, "日".repeat(31)).unwrap();
+        assert!(book.rename_sheet(0, "日".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn deletion_restores_position_contents_formulas_and_saved_revision() {
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(0, 0), "first");
+        book.add_sheet("売上");
+        book.set_cell(CellAddr::new(0, 80), "=1+2");
+        book.add_sheet("Last");
+        book.set_cell(CellAddr::new(0, 0), "last");
+        book.mark_clean();
+        book.clear_history();
+        book.set_active_sheet(1);
+        book.delete_sheet(1).unwrap();
+        assert_eq!(book.active_sheet().name, "Last");
+        assert!(book.is_dirty());
+        assert!(book.undo());
+        assert_eq!(book.active, 1);
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 80)), "=1+2");
+        assert_eq!(book.active_sheet().rows, 81);
+        assert!(!book.is_dirty());
+        assert!(book.redo());
+        assert_eq!(book.sheet_count(), 2);
+        book.mark_clean();
+        book.undo();
+        assert!(book.is_dirty());
+        book.redo();
+        assert!(!book.is_dirty());
+        book.delete_sheet(1).unwrap();
+        assert_eq!(book.active, 0);
+        assert_eq!(book.delete_sheet(0), Err(SheetError::LastSheet));
+        assert_eq!(book.delete_sheet(1), Err(SheetError::Missing));
+        book.undo();
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "last");
+    }
+
+    #[test]
+    fn deleting_inactive_sheets_tracks_active_indices_and_prior_edits() {
+        let mut book = Workbook::new();
+        book.add_sheet("Sheet2");
+        book.add_sheet("Sheet3");
+        book.set_cell(CellAddr::new(0, 0), "third");
+        book.delete_sheet(0).unwrap();
+        assert_eq!(book.active, 1);
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "third");
+        book.undo();
+        assert_eq!(book.active, 2);
+        book.undo();
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "");
+        book.redo();
+        book.redo();
+        book.set_active_sheet(0);
+        book.delete_sheet(1).unwrap();
+        assert_eq!(book.active, 0);
+        book.undo();
+        assert_eq!(book.active, 0);
+        assert_eq!(book.sheets[1].raw(CellAddr::new(0, 0)), "third");
+        assert_eq!(book.next_sheet_name(), "Sheet1");
+        book.add_sheet(book.next_sheet_name());
+        assert_eq!(book.next_sheet_name(), "Sheet4");
+    }
 
     #[test]
     fn paste_and_clear_are_single_undoable_operations_with_formulas() {
