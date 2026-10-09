@@ -98,6 +98,7 @@ pub(super) fn slide_parts(
     slide: &Slide,
     theme: &Theme,
     index: usize,
+    budget: &mut crate::pptx_limits::OutputBudget,
 ) -> Result<SlideParts, PptxError> {
     for t in [&slide.title, &slide.body] {
         if !textbox_bounds(t).is_valid() {
@@ -176,6 +177,7 @@ pub(super) fn slide_parts(
                 if bytes.len() as u64 > IMAGE_LIMIT {
                     return Err(error("Converted PNG exceeds the 8 MiB image limit"));
                 }
+                budget.add(bytes.len())?;
                 let name = format!("slide{index}-object{id}.{extension}");
                 let rid = format!("rId{}", media.len() + 2);
                 rels.push_str(&format!(r#"<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{name}"/>"#));
@@ -206,6 +208,7 @@ pub(super) fn slide_parts(
     let notes = format!(
         r#"<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld name="{PROFILE}"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{note_shape}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>"#
     );
+    let notes_size = notes.len();
     media.push(Media {
         path: format!("ppt/notesSlides/notesSlide{index}.xml"),
         data: notes.into_bytes(),
@@ -222,6 +225,17 @@ pub(super) fn slide_parts(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld name="{PROFILE}"><p:bg><p:bgPr><a:solidFill><a:srgbClr val="{}"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>{objects}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"#,
         rgb(theme.background)
     );
+    if xml.len() > 8 * 1024 * 1024 || notes_size > 8 * 1024 * 1024 || rels.len() > 8 * 1024 * 1024 {
+        return Err(error("PPTX XML output exceeds the 8 MiB part limit"));
+    }
+    budget.add(xml.len())?;
+    budget.add(rels.len())?;
+    for file in media
+        .iter()
+        .filter(|file| file.path.ends_with(".xml") || file.path.ends_with(".rels"))
+    {
+        budget.add(file.data.len())?;
+    }
     Ok(SlideParts { xml, rels, media })
 }
 
@@ -534,6 +548,7 @@ pub(super) fn read_slide<Rd: Read + Seek>(
     xml: &str,
     path: &str,
     archive: &mut ZipArchive<Rd>,
+    images: &mut HashMap<String, Arc<Vec<u8>>>,
 ) -> Result<Option<ImportedSlide>, PptxError> {
     let root = xml_tree(xml, "sld")?;
     let common = match root.find(P, "cSld") {
@@ -704,20 +719,25 @@ pub(super) fn read_slide<Rd: Read + Seek>(
                     return Err(error("Image must use an internal image relationship"));
                 }
                 let target = crate::pptx_read::part_path(&rel.target, parent.0)?;
-                let file = archive
-                    .by_name(&target)
-                    .map_err(|e| error(format!("cannot read {target}: {e}")))?;
-                if file.size() > IMAGE_LIMIT {
-                    return Err(error(format!("{target}: image exceeds 8 MiB limit")));
-                }
-                let mut bytes = Vec::new();
-                file.take(IMAGE_LIMIT + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| error(format!("cannot read {target}: {e}")))?;
-                crate::decode_image(&bytes).map_err(|e| error(format!("{target}: {e}")))?;
-                ObjectKind::Image {
-                    data: Arc::new(bytes),
-                }
+                let data = if let Some(data) = images.get(&target) {
+                    data.clone()
+                } else {
+                    let file = archive
+                        .by_name(&target)
+                        .map_err(|e| error(format!("cannot read {target}: {e}")))?;
+                    if file.size() > IMAGE_LIMIT {
+                        return Err(error(format!("{target}: image exceeds 8 MiB limit")));
+                    }
+                    let mut bytes = Vec::new();
+                    file.take(IMAGE_LIMIT + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| error(format!("cannot read {target}: {e}")))?;
+                    crate::decode_image(&bytes).map_err(|e| error(format!("{target}: {e}")))?;
+                    let data = Arc::new(bytes);
+                    images.insert(target, data.clone());
+                    data
+                };
+                ObjectKind::Image { data }
             }
             _ => {
                 return Err(error(format!(
@@ -1086,6 +1106,85 @@ mod tests {
             &load_pptx_bytes(&output.finish().unwrap().into_inner()).unwrap(),
         );
     }
+    #[test]
+    fn references_to_the_same_image_share_storage_across_slides() {
+        let bytes = write_pptx_bytes(&deck()).unwrap();
+        let path = "ppt/slides/_rels/slide3.xml.rels";
+        let rels = part(&bytes, path)
+            .replace("../media/slide3-object7.png", "../media/slide1-object7.png");
+        let loaded = load_pptx_bytes(&rewrite(&bytes, &[(path, Some(rels.as_bytes()))])).unwrap();
+        let ObjectKind::Image { data: first } = &loaded.slides[0].objects[3].kind else {
+            panic!()
+        };
+        let ObjectKind::Image { data: last } = &loaded.slides[2].objects[3].kind else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(first, last));
+    }
+    #[test]
+    fn excessive_slide_counts_and_declared_archive_expansion_fail_before_import() {
+        let bytes = write_pptx_bytes(&deck()).unwrap();
+        let path = "ppt/presentation.xml";
+        let list = (0..1001)
+            .map(|i| format!(r#"<p:sldId id="{}" r:id="rId{}"/>"#, 256 + i, i + 1))
+            .collect::<String>();
+        let manifest = format!(
+            r#"<p:presentation xmlns:p="{}" xmlns:r="{}"><p:sldIdLst>{list}</p:sldIdLst></p:presentation>"#,
+            PRESENTATION_NS[0], REL_NS[0]
+        );
+        assert!(
+            load_pptx_bytes(&rewrite(&bytes, &[(path, Some(manifest.as_bytes()))]))
+                .unwrap_err()
+                .to_string()
+                .contains("1000-slide limit")
+        );
+        let mut bomb = bytes;
+        let header = bomb
+            .windows(4)
+            .enumerate()
+            .find_map(|(i, w)| {
+                (w == b"PK\x01\x02"
+                    && bomb
+                        .get(i + 46..)
+                        .is_some_and(|tail| tail.starts_with(b"ppt/media/")))
+                .then_some(i)
+            })
+            .unwrap();
+        bomb[header + 24..header + 28].copy_from_slice(&(128u32 * 1024 * 1024 + 1).to_le_bytes());
+        assert!(load_pptx_bytes(&bomb)
+            .unwrap_err()
+            .to_string()
+            .contains("expanded parts"));
+    }
+    #[test]
+    fn oversized_files_and_export_models_do_not_replace_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.pptx");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(crate::pptx_limits::MAX_PACKAGE_BYTES + 1)
+            .unwrap();
+        assert!(crate::load_pptx_path(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("file limit"));
+        let mut p = Presentation::new();
+        p.slides = vec![Slide::blank(); 1001];
+        std::fs::write(&path, b"original").unwrap();
+        assert!(write_pptx_path(&p, &path)
+            .unwrap_err()
+            .to_string()
+            .contains("slide limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        p.slides = vec![Slide::blank()];
+        p.slides[0].objects = vec![SlideObject::shape(ShapeKind::Rectangle); 999];
+        assert!(write_pptx_path(&p, &path)
+            .unwrap_err()
+            .to_string()
+            .contains("object limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
     #[test]
     fn empty_deck_has_a_valid_blank_slide_and_repeated_exports_are_independent() {
         let mut p = Presentation::new();

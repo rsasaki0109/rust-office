@@ -32,17 +32,28 @@ const DC_NS: &[&str] = &["http://purl.org/dc/elements/1.1/"];
 
 /// Load a presentation from a `.pptx` path.
 pub fn load_pptx_path(path: &Path) -> Result<Presentation, PptxError> {
-    let bytes = std::fs::read(path)?;
+    let file = std::fs::File::open(path)?;
+    crate::pptx_limits::package_size(file.metadata()?.len())?;
+    let mut bytes = Vec::new();
+    file.take(crate::pptx_limits::MAX_PACKAGE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    crate::pptx_limits::package_size(bytes.len() as u64)?;
     load_pptx_bytes(&bytes)
 }
 
 /// Load a presentation from PPTX package bytes. Any listed slide failure rejects
 /// the entire import; ZIP directory order and relationship IDs never set slide order.
 pub fn load_pptx_bytes(bytes: &[u8]) -> Result<Presentation, PptxError> {
+    crate::pptx_limits::package_size(bytes.len() as u64)?;
+    crate::pptx_limits::directory(bytes)?;
     let mut archive = ZipArchive::new(Cursor::new(bytes))?;
+    crate::pptx_limits::archive(&mut archive)?;
+    let mut model_budget = crate::pptx_limits::ModelBudget::default();
+    let mut images = HashMap::new();
     let manifest_path = "ppt/presentation.xml";
     let manifest = read_zip_string(&mut archive, manifest_path)?;
     let ids = parse_slide_ids(&manifest).map_err(|e| part_error(manifest_path, e))?;
+    crate::pptx_limits::ModelBudget::slide_count(ids.len())?;
     let rels_path = "ppt/_rels/presentation.xml.rels";
     let rels = match read_optional_zip_string(&mut archive, rels_path)? {
         Some(xml) => parse_relationships(&xml).map_err(|e| part_error(rels_path, e))?,
@@ -62,8 +73,9 @@ pub fn load_pptx_bytes(bytes: &[u8]) -> Result<Presentation, PptxError> {
         }
         let path = slide_part_path(&rel.target).map_err(|e| part_error(rels_path, e))?;
         let xml = read_zip_string(&mut archive, &path)?;
-        if let Some(imported) = crate::pptx_objects::read_slide(&xml, &path, &mut archive)
-            .map_err(|e| part_error(&path, e))?
+        if let Some(imported) =
+            crate::pptx_objects::read_slide(&xml, &path, &mut archive, &mut images)
+                .map_err(|e| part_error(&path, e))?
         {
             let style = (imported.title, imported.body, imported.background);
             if basic_style.is_some_and(|previous| previous != style) {
@@ -72,9 +84,14 @@ pub fn load_pptx_bytes(bytes: &[u8]) -> Result<Presentation, PptxError> {
                 )));
             }
             basic_style = Some(style);
+            model_budget
+                .add(&imported.slide)
+                .map_err(|e| part_error(&path, e))?;
             slides.push(imported.slide);
         } else {
-            slides.push(parse_slide_xml(&xml).map_err(|e| part_error(&path, e))?);
+            let slide = parse_slide_xml(&xml).map_err(|e| part_error(&path, e))?;
+            model_budget.add(&slide).map_err(|e| part_error(&path, e))?;
+            slides.push(slide);
         }
     }
     if basic_style.is_some() {
