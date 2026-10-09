@@ -2459,10 +2459,12 @@ dependencies = [
 name = "office-impress"
 version = "0.1.0"
 dependencies = [
+ "image 0.25.10",
  "office-core",
  "quick-xml 0.37.5",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "zip 0.6.6",
 ]

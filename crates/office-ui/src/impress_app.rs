@@ -1,12 +1,12 @@
 //! Impress (presentation) application UI.
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use eframe::App;
 use egui::{self, Color32, RichText, Sense, Ui, Vec2};
 use office_impress::{
-    load_json_path, load_pptx_path, write_json_path, write_pptx_path, Presentation, Theme,
-    SLIDE_HEIGHT_PT, SLIDE_WIDTH_PT,
+    load_json_path, load_pptx_path, write_json_path, write_pptx_path, Bounds, ObjectKind,
+    Presentation, ShapeKind, SlideObject, Theme, SLIDE_HEIGHT_PT, SLIDE_WIDTH_PT,
 };
 
 use crate::theme::{CANVAS_BG, STATUS_BG, TOOLBAR_BG};
@@ -27,6 +27,10 @@ pub struct ImpressApp {
     pending_action: Option<DocumentAction>,
     pending_delete: Option<usize>,
     edit_session: Option<(usize, usize)>,
+    selected_object: usize,
+    selection_slide: usize,
+    drag_session: Option<(usize, usize, bool)>,
+    textures: HashMap<usize, (Arc<Vec<u8>>, egui::TextureHandle)>,
     pub pending_switch: Option<SwitchTo>,
 }
 
@@ -40,6 +44,10 @@ impl ImpressApp {
             pending_action: None,
             pending_delete: None,
             edit_session: None,
+            selected_object: 0,
+            selection_slide: 0,
+            drag_session: None,
+            textures: HashMap::new(),
             pending_switch: None,
         }
     }
@@ -80,6 +88,9 @@ impl ImpressApp {
 
     fn do_new_deck(&mut self) {
         self.edit_session = None;
+        self.textures.clear();
+        self.selected_object = 0;
+        self.drag_session = None;
         self.presentation = Presentation::new();
         self.file_path = None;
         self.set_status("New presentation");
@@ -114,6 +125,9 @@ impl ImpressApp {
         match result {
             Ok(p) => {
                 self.edit_session = None;
+                self.textures.clear();
+                self.selected_object = 0;
+                self.drag_session = None;
                 self.presentation = p;
                 self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Opened {}", path.display()));
@@ -222,6 +236,7 @@ impl ImpressApp {
 
     fn history(&mut self, redo: bool) {
         self.edit_session = None;
+        self.drag_session = None;
         let changed = if redo {
             self.presentation.redo()
         } else {
@@ -354,6 +369,28 @@ impl ImpressApp {
                     self.set_status("Slide inserted");
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Text box").clicked() {
+                    self.insert_object(SlideObject::text());
+                    ui.close();
+                }
+                if ui.button("Rectangle").clicked() {
+                    self.insert_object(SlideObject::shape(ShapeKind::Rectangle));
+                    ui.close();
+                }
+                if ui.button("Ellipse").clicked() {
+                    self.insert_object(SlideObject::shape(ShapeKind::Ellipse));
+                    ui.close();
+                }
+                if ui.button("Image…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Image", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+                        .pick_file()
+                    {
+                        self.insert_image_path(&path);
+                    }
+                    ui.close();
+                }
             });
             ui.menu_button("Theme", |ui| {
                 for theme in Theme::builtins() {
@@ -428,66 +465,292 @@ impl ImpressApp {
         });
     }
 
-    fn canvas(&self, ui: &mut Ui) {
-        let theme = &self.presentation.theme;
-        let Some(slide) = self.presentation.active_slide() else {
+    fn insert_object(&mut self, object: SlideObject) {
+        let Some(mut slide) = self.presentation.active_slide().cloned() else {
             return;
         };
+        self.edit_session = None;
+        self.drag_session = None;
+        self.selected_object = slide.objects.len() + 2;
+        slide.objects.push(object);
+        self.presentation.update_active_slide(slide, false);
+        self.set_status("Object inserted — drag to move; use the corner to resize");
+    }
 
+    fn insert_image_path(&mut self, path: &std::path::Path) {
+        match SlideObject::image_path(path) {
+            Ok(object) => self.insert_object(object),
+            Err(error) => self.set_error(format!("Image insertion failed: {error}")),
+        }
+    }
+
+    fn object_editor(&mut self, ui: &mut Ui) {
+        let Some(mut slide) = self.presentation.active_slide().cloned() else {
+            return;
+        };
+        if self.selection_slide != self.presentation.active {
+            self.selection_slide = self.presentation.active;
+            self.selected_object = 0;
+            self.drag_session = None;
+            self.edit_session = None;
+        }
+        self.selected_object = self.selected_object.min(slide.objects.len() + 1);
+        ui.label(RichText::new("Object").strong());
+        egui::ComboBox::from_id_salt("impress_object_selection")
+            .selected_text(object_label(&slide, self.selected_object))
+            .show_ui(ui, |ui| {
+                for index in 0..slide.objects.len() + 2 {
+                    if ui
+                        .selectable_value(
+                            &mut self.selected_object,
+                            index,
+                            object_label(&slide, index),
+                        )
+                        .changed()
+                    {
+                        self.edit_session = None;
+                        self.drag_session = None;
+                    }
+                }
+            });
+        let mut bounds = object_bounds(&slide, self.selected_object);
+        let mut changed = false;
+        egui::Grid::new("impress_geometry")
+            .num_columns(2)
+            .show(ui, |ui| {
+                for (label, value) in [
+                    ("X (%)", &mut bounds.x),
+                    ("Y (%)", &mut bounds.y),
+                    ("Width (%)", &mut bounds.w),
+                    ("Height (%)", &mut bounds.h),
+                ] {
+                    ui.label(label);
+                    let mut percent = *value * 100.0;
+                    let response = ui.add(
+                        egui::DragValue::new(&mut percent)
+                            .speed(0.5)
+                            .range(0.0..=100.0),
+                    );
+                    if response.changed() {
+                        *value = percent / 100.0;
+                        changed = true;
+                    }
+                    ui.end_row();
+                }
+            });
+        if self.selected_object >= 2 {
+            let object = &mut slide.objects[self.selected_object - 2];
+            match &mut object.kind {
+                ObjectKind::Text {
+                    text,
+                    font_pt,
+                    color,
+                } => {
+                    let response = ui.add(
+                        egui::TextEdit::multiline(text)
+                            .id_salt((
+                                "object_text",
+                                self.presentation.active,
+                                self.selected_object,
+                            ))
+                            .desired_rows(2),
+                    );
+                    if response.changed() {
+                        let session = (self.presentation.active, self.selected_object + 3);
+                        let coalesce = self.edit_session == Some(session);
+                        self.edit_session = Some(session);
+                        self.presentation.update_active_slide(slide, coalesce);
+                        return;
+                    }
+                    if !response.has_focus()
+                        && self.edit_session.is_some_and(|(_, field)| field >= 3)
+                    {
+                        self.edit_session = None;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Font size");
+                        changed |= ui
+                            .add(egui::DragValue::new(font_pt).range(1.0..=200.0))
+                            .changed();
+                    });
+                    if !font_pt.is_finite() {
+                        *font_pt = 24.0;
+                    }
+                    changed |= ui.color_edit_button_srgb(color).changed();
+                }
+                ObjectKind::Shape { fill, .. } => {
+                    changed |= ui.color_edit_button_srgb(fill).changed();
+                }
+                ObjectKind::Image { .. } => {
+                    ui.label("Image embedded in this document");
+                }
+            }
+            if ui.button("Remove object").clicked() {
+                slide.objects.remove(self.selected_object - 2);
+                self.selected_object = 0;
+                self.edit_session = None;
+                self.drag_session = None;
+                self.presentation.update_active_slide(slide, false);
+                return;
+            }
+        }
+        if changed {
+            bounds.constrain();
+            set_object_bounds(&mut slide, self.selected_object, bounds);
+            self.edit_session = None;
+            self.presentation.update_active_slide(slide, false);
+        }
+        ui.separator();
+    }
+
+    fn canvas(&mut self, ui: &mut Ui) {
+        let Some(mut slide) = self.presentation.active_slide().cloned() else {
+            return;
+        };
+        let theme = self.presentation.theme.clone();
         let avail = ui.available_size();
         let aspect = SLIDE_WIDTH_PT / SLIDE_HEIGHT_PT;
-        let mut w = (avail.x - 16.0).max(120.0);
-        let mut h = w / aspect;
-        if h > avail.y - 16.0 {
-            h = (avail.y - 16.0).max(80.0);
-            w = h * aspect;
-        }
+        let w = (avail.x - 16.0)
+            .max(120.0)
+            .min((avail.y - 16.0).max(80.0) * aspect);
+        let h = w / aspect;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
-        let bg = Color32::from_rgb(
-            theme.background[0],
-            theme.background[1],
-            theme.background[2],
-        );
-        ui.painter().rect_filled(rect, 4.0, bg);
-        ui.painter().rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(1.0, Color32::from_gray(160)),
-            egui::StrokeKind::Outside,
-        );
-
-        let title_color = Color32::from_rgb(
-            theme.title_color[0],
-            theme.title_color[1],
-            theme.title_color[2],
-        );
-        let body_color = Color32::from_rgb(
-            theme.body_color[0],
-            theme.body_color[1],
-            theme.body_color[2],
-        );
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, rgb(theme.background));
         let scale = h / SLIDE_HEIGHT_PT;
-
-        ui.painter().text(
-            rect.min + Vec2::new(slide.title.x * w, slide.title.y * h),
-            egui::Align2::LEFT_TOP,
-            &slide.title.text,
-            egui::FontId::proportional(theme.title_font_pt * scale),
-            title_color,
+        self.selected_object = self.selected_object.min(slide.objects.len() + 1);
+        let mut active_images = Vec::new();
+        for (index, object) in slide.objects.iter().enumerate() {
+            if let ObjectKind::Image { data } = &object.kind {
+                let key = Arc::as_ptr(data) as usize;
+                active_images.push(key);
+                if let std::collections::hash_map::Entry::Vacant(entry) = self.textures.entry(key) {
+                    if let Ok(image) = office_impress::decode_image(data) {
+                        let rgba = image.thumbnail(2048, 2048).to_rgba8();
+                        let color = egui::ColorImage::from_rgba_unmultiplied(
+                            [rgba.width() as usize, rgba.height() as usize],
+                            rgba.as_raw(),
+                        );
+                        entry.insert((
+                            data.clone(),
+                            ui.ctx().load_texture(
+                                format!("impress_image_{index}"),
+                                color,
+                                egui::TextureOptions::LINEAR,
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        self.textures.retain(|key, _| active_images.contains(key));
+        let mut drag = None;
+        // Register in paint order: the last (frontmost) interaction wins overlaps.
+        for index in 0..slide.objects.len() + 2 {
+            let bounds = object_bounds(&slide, index);
+            let object_rect = bounds_rect(rect, bounds);
+            let response = ui.interact(
+                object_rect,
+                egui::Id::new(("impress_move", self.presentation.active, index)),
+                Sense::click_and_drag(),
+            );
+            if response.clicked() || response.drag_started() {
+                self.selected_object = index;
+                self.edit_session = None;
+            }
+            if response.dragged() {
+                drag = Some((index, false));
+            }
+        }
+        let selected_rect = bounds_rect(rect, object_bounds(&slide, self.selected_object));
+        let handle_rect =
+            egui::Rect::from_center_size(selected_rect.right_bottom(), Vec2::splat(12.0));
+        let handle = ui.interact(
+            handle_rect,
+            egui::Id::new((
+                "impress_resize",
+                self.presentation.active,
+                self.selected_object,
+            )),
+            Sense::drag(),
         );
-        ui.painter().text(
-            rect.min + Vec2::new(slide.body.x * w, slide.body.y * h),
-            egui::Align2::LEFT_TOP,
-            &slide.body.text,
-            egui::FontId::proportional(theme.body_font_pt * scale),
-            body_color,
-        );
-
-        let accent = Color32::from_rgb(theme.accent[0], theme.accent[1], theme.accent[2]);
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(rect.min, Vec2::new(6.0, h)),
+        if handle.dragged() {
+            drag = Some((self.selected_object, true));
+        }
+        if let Some((index, resize)) = drag {
+            let delta = ui.input(|i| i.pointer.delta());
+            let mut bounds = object_bounds(&slide, index);
+            if resize {
+                bounds.w = (bounds.w + delta.x / w).clamp(0.01, 1.0 - bounds.x);
+                bounds.h = (bounds.h + delta.y / h).clamp(0.01, 1.0 - bounds.y);
+            } else {
+                bounds.x += delta.x / w;
+                bounds.y += delta.y / h;
+            }
+            bounds.constrain();
+            set_object_bounds(&mut slide, index, bounds);
+            let session = (self.presentation.active, index, resize);
+            self.presentation
+                .update_active_slide(slide.clone(), self.drag_session == Some(session));
+            self.drag_session = Some(session);
+            self.edit_session = None;
+        } else {
+            self.drag_session = None;
+        }
+        for index in 0..slide.objects.len() + 2 {
+            let object_rect = bounds_rect(rect, object_bounds(&slide, index));
+            let clipped = painter.with_clip_rect(object_rect.intersect(rect));
+            if index < 2 {
+                let (text, font, color) = if index == 0 {
+                    (&slide.title.text, theme.title_font_pt, theme.title_color)
+                } else {
+                    (&slide.body.text, theme.body_font_pt, theme.body_color)
+                };
+                paint_text(&clipped, object_rect, text, font * scale, rgb(color));
+            } else {
+                match &slide.objects[index - 2].kind {
+                    ObjectKind::Text {
+                        text,
+                        font_pt,
+                        color,
+                    } => paint_text(&clipped, object_rect, text, font_pt * scale, rgb(*color)),
+                    ObjectKind::Shape { shape, fill } => match shape {
+                        ShapeKind::Rectangle => {
+                            clipped.rect_filled(object_rect, 0.0, rgb(*fill));
+                        }
+                        ShapeKind::Ellipse => {
+                            clipped.add(egui::epaint::EllipseShape::filled(
+                                object_rect.center(),
+                                object_rect.size() / 2.0,
+                                rgb(*fill),
+                            ));
+                        }
+                    },
+                    ObjectKind::Image { data } => {
+                        if let Some((_, texture)) = self.textures.get(&(Arc::as_ptr(data) as usize))
+                        {
+                            clipped.image(
+                                texture.id(),
+                                object_rect,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let selected_rect = bounds_rect(rect, object_bounds(&slide, self.selected_object));
+        painter.rect_stroke(
+            selected_rect,
             0.0,
-            accent,
+            egui::Stroke::new(1.5, Color32::from_rgb(50, 120, 220)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(
+            egui::Rect::from_center_size(selected_rect.right_bottom(), Vec2::splat(8.0)),
+            0.0,
+            Color32::from_rgb(50, 120, 220),
         );
     }
 }
@@ -547,42 +810,46 @@ impl App for ImpressApp {
             .default_size(280.0)
             .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(8.0))
             .show(ui, |ui| {
-                ui.label(RichText::new("Edit").strong());
-                ui.separator();
-                if let Some(mut slide) = self.presentation.active_slide().cloned() {
-                    let mut changed_field = None;
-                    let mut focused = false;
-                    for (field, label, text, rows) in [
-                        (0, "Title", &mut slide.title.text, 2),
-                        (1, "Body", &mut slide.body.text, 10),
-                        (2, "Notes", &mut slide.notes, 3),
-                    ] {
-                        ui.label(label);
-                        let response = ui.add(
-                            egui::TextEdit::multiline(text)
-                                .id(egui::Id::new((
-                                    "impress_text",
-                                    self.presentation.active,
-                                    field,
-                                )))
-                                .desired_rows(rows)
-                                .desired_width(f32::INFINITY),
-                        );
-                        focused |= response.has_focus();
-                        if response.changed() {
-                            changed_field = Some(field);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.object_editor(ui);
+                    ui.label(RichText::new("Edit").strong());
+                    ui.separator();
+                    if let Some(mut slide) = self.presentation.active_slide().cloned() {
+                        let mut changed_field = None;
+                        let mut focused = false;
+                        for (field, label, text, rows) in [
+                            (0, "Title", &mut slide.title.text, 2),
+                            (1, "Body", &mut slide.body.text, 10),
+                            (2, "Notes", &mut slide.notes, 3),
+                        ] {
+                            ui.label(label);
+                            let response = ui.add(
+                                egui::TextEdit::multiline(text)
+                                    .id(egui::Id::new((
+                                        "impress_text",
+                                        self.presentation.active,
+                                        field,
+                                    )))
+                                    .desired_rows(rows)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            focused |= response.has_focus();
+                            if response.changed() {
+                                changed_field = Some(field);
+                            }
+                            ui.add_space(8.0);
                         }
-                        ui.add_space(8.0);
+                        if let Some(field) = changed_field {
+                            let session = (self.presentation.active, field);
+                            self.presentation
+                                .update_active_slide(slide, self.edit_session == Some(session));
+                            self.edit_session = Some(session);
+                        } else if !focused && self.edit_session.is_some_and(|(_, field)| field < 3)
+                        {
+                            self.edit_session = None;
+                        }
                     }
-                    if let Some(field) = changed_field {
-                        let session = (self.presentation.active, field);
-                        self.presentation
-                            .update_active_slide(slide, self.edit_session == Some(session));
-                        self.edit_session = Some(session);
-                    } else if !focused {
-                        self.edit_session = None;
-                    }
-                }
+                });
             });
 
         egui::CentralPanel::default()
@@ -784,5 +1051,175 @@ mod history_tests {
         let text = |p: &Presentation| p.slides.iter().map(|s| s.plain_text()).collect::<Vec<_>>();
         assert_eq!(text(&loaded), text(&app.presentation));
         assert!(app.is_dirty());
+    }
+}
+
+fn rgb(color: [u8; 3]) -> Color32 {
+    Color32::from_rgb(color[0], color[1], color[2])
+}
+fn object_label(slide: &office_impress::Slide, index: usize) -> String {
+    match index {
+        0 => "Title".into(),
+        1 => "Body".into(),
+        _ => format!(
+            "{}: {}",
+            index - 1,
+            match &slide.objects[index - 2].kind {
+                ObjectKind::Text { .. } => "Text box",
+                ObjectKind::Shape {
+                    shape: ShapeKind::Rectangle,
+                    ..
+                } => "Rectangle",
+                ObjectKind::Shape { .. } => "Ellipse",
+                ObjectKind::Image { .. } => "Image",
+            }
+        ),
+    }
+}
+fn object_bounds(slide: &office_impress::Slide, index: usize) -> Bounds {
+    if index >= 2 {
+        return slide.objects[index - 2].bounds;
+    }
+    let text = if index == 0 {
+        &slide.title
+    } else {
+        &slide.body
+    };
+    Bounds {
+        x: text.x,
+        y: text.y,
+        w: text.w,
+        h: text.h,
+    }
+}
+fn set_object_bounds(slide: &mut office_impress::Slide, index: usize, bounds: Bounds) {
+    if index >= 2 {
+        slide.objects[index - 2].bounds = bounds;
+        return;
+    }
+    let text = if index == 0 {
+        &mut slide.title
+    } else {
+        &mut slide.body
+    };
+    text.x = bounds.x;
+    text.y = bounds.y;
+    text.w = bounds.w;
+    text.h = bounds.h;
+}
+fn bounds_rect(rect: egui::Rect, bounds: Bounds) -> egui::Rect {
+    egui::Rect::from_min_size(
+        rect.min + egui::vec2(bounds.x * rect.width(), bounds.y * rect.height()),
+        egui::vec2(bounds.w * rect.width(), bounds.h * rect.height()),
+    )
+}
+fn paint_text(painter: &egui::Painter, rect: egui::Rect, text: &str, size: f32, color: Color32) {
+    let galley = painter.layout(
+        text.into(),
+        egui::FontId::proportional(size),
+        color,
+        rect.width(),
+    );
+    painter.galley(rect.min, galley, color);
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+
+    #[test]
+    fn object_insert_remove_save_and_failed_open_preserve_history() {
+        let mut app = ImpressApp::new();
+        app.insert_object(SlideObject::text());
+        app.insert_object(SlideObject::shape(ShapeKind::Ellipse));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("objects.json");
+        assert!(app.save_json_to(&path));
+        let original = app.presentation.slides.clone();
+        let bad = dir.path().join("bad.json");
+        let json = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&bad, json.replacen("\"w\": 0.3", "\"w\": -0.4", 1)).unwrap();
+        app.open_path(&bad);
+        assert_eq!(app.presentation.slides, original);
+        assert_eq!(app.file_path.as_ref(), Some(&path));
+        app.history(false);
+        assert!(app.is_dirty());
+        assert_eq!(app.presentation.slides[0].objects.len(), 1);
+        app.history(true);
+        assert!(!app.is_dirty());
+        app.open_path(&path);
+        assert_eq!(app.presentation.slides, original);
+        assert!(!app.presentation.can_undo());
+    }
+
+    #[test]
+    fn failed_image_insertion_does_not_replace_selection_or_document() {
+        let mut app = ImpressApp::new();
+        app.insert_object(SlideObject::shape(ShapeKind::Rectangle));
+        let slides = app.presentation.slides.clone();
+        let selected = app.selected_object;
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("bad.png");
+        std::fs::write(&corrupt, b"invalid image").unwrap();
+        app.insert_image_path(&corrupt);
+        assert!(app
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("Image insertion failed"));
+        assert_eq!(app.presentation.slides, slides);
+        assert_eq!(app.selected_object, selected);
+        app.history(false);
+        assert!(!app.is_dirty());
+        assert!(app.presentation.slides[0].objects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod canvas_tests {
+    use super::*;
+
+    #[test]
+    fn dragging_frontmost_shape_does_not_move_overlapping_title() {
+        let mut app = ImpressApp::new();
+        app.insert_object(SlideObject::shape(ShapeKind::Rectangle));
+        let title = app.presentation.slides[0].title.clone();
+        let bounds = app.presentation.slides[0].objects[0].bounds;
+        let ctx = egui::Context::default();
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.canvas(ui));
+            });
+            output.textures_delta.clear();
+        };
+        frame(vec![]);
+        let start = egui::pos2(300.0, 160.0);
+        frame(vec![egui::Event::PointerMoved(start)]);
+        frame(vec![egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let end = egui::pos2(360.0, 190.0);
+        frame(vec![egui::Event::PointerMoved(end)]);
+        frame(vec![egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(app.presentation.slides[0].title, title);
+        assert!(app.presentation.slides[0].objects[0].bounds.x > bounds.x);
+        app.history(false);
+        assert_eq!(app.presentation.slides[0].objects[0].bounds, bounds);
     }
 }

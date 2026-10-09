@@ -178,7 +178,7 @@ Not yet:
 * Calc copies raw values/formulas as tab-separated text. Formatting is not
   exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.
-* Impress: shapes beyond title+body / animations not started
+* Impress: added shape/image PPTX interchange, presentation mode and animations remain unsupported
 * Packaging: CI builds Linux binary; no signed macOS/Windows installers yet
 
 ## Suggested next PRs
@@ -262,3 +262,28 @@ slide order, text box geometry and notes, but never runtime history. PPTX remain
 the existing basic title/body import/export subset; this change does not add
 speaker-note or arbitrary shape fidelity. Direct model mutation followed by
 `mark_dirty` clears history to avoid replaying operations against unrelated data.
+
+
+Impress native objects include added text boxes, rectangles, ellipses and embedded
+images. Objects paint in insertion order; the frontmost bounding box wins clicks.
+Select on the canvas or in the Object selector, drag to move and use the lower-right
+handle to resize. X/Y/width/height fields use percentages of the slide, constrained
+to fit inside it. Text wraps and clips to its box. Added text has editable size and
+color; rectangles/ellipses have editable fill. Remove object and all geometry/text
+operations participate in history; one canvas drag is one Undo operation.
+
+Native JSON preserves the object list, geometry and embedded bytes. Old JSON with
+no object list still opens. Image bytes are shared across document/history clones;
+active-slide textures are cached and released on deck replacement or slide changes.
+Images accept PNG/JPEG/GIF/WebP/BMP, with an 8 MiB encoded limit and 4096-pixel edge
+limit. Animated images use the decoded first frame. Image insertion and native
+Open validate decoding and geometry before replacing the document. Saving invalid
+geometry or images fails before touching the destination. This does not add global
+archive/document input limits from the separate stability milestone.
+
+PPTX export currently refuses any added objects and leaves the output destination
+untouched. Save JSON to retain them. The existing PPTX reader remains the title/body
+subset; added native objects and speaker notes are not supported interchange yet.
+Rotation, grouping, object reordering, aspect-lock resize and animations are later
+work. Original title/body geometry is saved in JSON and emitted by the existing
+PPTX writer, but the PPTX reader does not promise geometry round-trip fidelity.

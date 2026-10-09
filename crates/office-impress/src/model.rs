@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::objects::SlideObject;
 use crate::theme::Theme;
 
 /// Standard 16:9 slide size in points (like PowerPoint widescreen).
@@ -47,6 +48,8 @@ pub struct Slide {
     /// Optional speaker notes.
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub objects: Vec<SlideObject>,
 }
 
 impl Slide {
@@ -55,6 +58,7 @@ impl Slide {
             title: TextBox::title(""),
             body: TextBox::body(""),
             notes: String::new(),
+            objects: Vec::new(),
         }
     }
 
@@ -63,6 +67,7 @@ impl Slide {
             title: TextBox::title(title),
             body: TextBox::body(body),
             notes: String::new(),
+            objects: Vec::new(),
         }
     }
 

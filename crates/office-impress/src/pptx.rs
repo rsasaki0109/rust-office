@@ -26,6 +26,9 @@ pub fn write_pptx_path(presentation: &Presentation, path: &Path) -> Result<(), P
 }
 
 pub fn write_pptx_bytes(presentation: &Presentation) -> Result<Vec<u8>, PptxError> {
+    if presentation.slides.iter().any(|s| !s.objects.is_empty()) {
+        return Err(PptxError::Parse("PPTX export does not yet support added text boxes, shapes or images. Save native JSON to preserve them.".into()));
+    }
     let mut cursor = Cursor::new(Vec::new());
     write_pptx(presentation, &mut cursor)?;
     Ok(cursor.into_inner())

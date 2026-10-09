@@ -4,12 +4,14 @@
 
 mod json;
 mod model;
+mod objects;
 mod pptx;
 mod pptx_read;
 mod theme;
 
 pub use json::{is_impress_json_path, load_json_path, write_json_path, JsonError};
 pub use model::{Presentation, Slide, TextBox, SLIDE_HEIGHT_PT, SLIDE_WIDTH_PT};
+pub use objects::{decode_image, Bounds, ObjectKind, ShapeKind, SlideObject};
 pub use pptx::{write_pptx_bytes, write_pptx_path, PptxError};
 pub use pptx_read::{load_pptx_bytes, load_pptx_path};
 pub use theme::Theme;

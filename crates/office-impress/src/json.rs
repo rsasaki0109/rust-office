@@ -13,11 +13,14 @@ pub enum JsonError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid presentation: {0}")]
+    Invalid(String),
 }
 
 pub fn load_json_path(path: &Path) -> Result<Presentation, JsonError> {
     let text = fs::read_to_string(path)?;
     let mut p: Presentation = serde_json::from_str(&text)?;
+    validate(&p)?;
     p.mark_clean();
     if p.slides.is_empty() {
         p.slides.push(crate::model::Slide::blank());
@@ -30,6 +33,7 @@ pub fn load_json_path(path: &Path) -> Result<Presentation, JsonError> {
 }
 
 pub fn write_json_path(presentation: &Presentation, path: &Path) -> Result<(), JsonError> {
+    validate(presentation)?;
     let text = serde_json::to_string_pretty(presentation)?;
     office_core::storage::atomic_write(path, text.as_bytes())?;
     Ok(())
@@ -43,4 +47,27 @@ pub fn is_impress_json_path(path: &Path) -> bool {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.contains("impress") || n.ends_with(".rimpress.json"))
+}
+
+fn validate(p: &Presentation) -> Result<(), JsonError> {
+    for slide in &p.slides {
+        for text in [&slide.title, &slide.body] {
+            if !(crate::Bounds {
+                x: text.x,
+                y: text.y,
+                w: text.w,
+                h: text.h,
+            })
+            .is_valid()
+            {
+                return Err(JsonError::Invalid(
+                    "Text box position or size is outside the slide".into(),
+                ));
+            }
+        }
+        for object in &slide.objects {
+            object.validate().map_err(JsonError::Invalid)?;
+        }
+    }
+    Ok(())
 }
