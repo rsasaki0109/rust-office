@@ -6,6 +6,7 @@ mod calc_recovery;
 mod calc_clipboard;
 mod fonts;
 mod impress_app;
+mod impress_recovery;
 mod office;
 mod print_sys;
 mod recovery;

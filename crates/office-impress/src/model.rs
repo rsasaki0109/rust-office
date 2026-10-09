@@ -192,6 +192,16 @@ impl Presentation {
         self.saved_revision = self.revision;
     }
 
+    /// Recovery starts a new unsaved history; Undo cannot reach a saved revision.
+    pub fn mark_recovered(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.revision = 0;
+        self.next_revision = 0;
+        self.saved_revision = u64::MAX;
+        self.dirty = true;
+    }
+
     /// Direct mutations cannot safely retain an earlier operation history.
     pub fn mark_dirty(&mut self) {
         self.undo.clear();

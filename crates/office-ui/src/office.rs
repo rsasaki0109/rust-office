@@ -48,15 +48,23 @@ impl OfficeApp {
         calc.enable_recovery(
             crate::recovery::default_directory().map(|root| root.with_file_name("calc")),
         );
+        let mut impress = ImpressApp::new();
+        impress.enable_recovery(
+            crate::recovery::default_directory().map(|root| root.with_file_name("impress")),
+        );
         Self {
-            mode: if calc.has_pending_recovery() && !writer.has_pending_recovery() {
+            mode: if writer.has_pending_recovery() {
+                Mode::Writer
+            } else if calc.has_pending_recovery() {
                 Mode::Calc
+            } else if impress.has_pending_recovery() {
+                Mode::Impress
             } else {
                 Mode::Writer
             },
             writer,
             calc,
-            impress: ImpressApp::new(),
+            impress,
             closing: None,
             close_authorized: false,
         }
@@ -82,6 +90,7 @@ impl OfficeApp {
         if self.dirty_modes().is_empty() {
             self.writer.clear_recovery();
             self.calc.clear_recovery();
+            self.impress.clear_recovery();
             self.close_authorized = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
@@ -103,6 +112,7 @@ impl OfficeApp {
             self.closing = None;
             self.writer.clear_recovery();
             self.calc.clear_recovery();
+            self.impress.clear_recovery();
             self.close_authorized = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -183,6 +193,7 @@ impl App for OfficeApp {
         if !self.close_authorized {
             self.writer.recovery_tick(&ctx);
             self.calc.recovery_tick(&ctx);
+            self.impress.recovery_tick(&ctx);
         }
     }
 }

@@ -85,6 +85,7 @@ compatibility. Unmerged work is tracked separately.
 
 * Slides, Light / Dark / Ocean themes
 * Native JSON open/save and separate PPTX import/export
+* Crash recovery of slides, object geometry, embedded images, themes and notes
 
 ### Platform
 
