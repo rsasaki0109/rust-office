@@ -7,6 +7,7 @@
 
 mod docx;
 mod odt;
+mod limits;
 mod pdf;
 
 use std::fs;
@@ -68,9 +69,8 @@ impl DocumentFormat for JsonFormat {
     }
 
     fn load_from_reader(&self, reader: &mut dyn Read) -> Result<Document, FormatError> {
-        let mut buf = String::new();
-        reader.read_to_string(&mut buf)?;
-        let doc: Document = serde_json::from_str(&buf)?;
+        let buf = limits::read(reader)?;
+        let doc: Document = serde_json::from_slice(&buf)?;
         if doc.format_version > Document::CURRENT_FORMAT_VERSION {
             return Err(FormatError::UnsupportedVersion {
                 found: doc.format_version,
@@ -87,6 +87,7 @@ impl DocumentFormat for JsonFormat {
                 "Invalid section paper size or margins".into(),
             ));
         }
+        limits::model(&doc)?;
         Ok(doc)
     }
 
@@ -102,7 +103,11 @@ impl DocumentFormat for JsonFormat {
                 "Invalid section paper size or margins".into(),
             ));
         }
+        limits::model(document)?;
         let json = serde_json::to_string_pretty(document)?;
+        if json.len() as u64 + 1 > limits::MAX_FILE {
+            return Err(FormatError::InvalidDocument("Writer JSON exceeds the 64 MiB file limit".into()));
+        }
         writer.write_all(json.as_bytes())?;
         writer.write_all(b"\n")?;
         Ok(())

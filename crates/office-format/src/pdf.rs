@@ -27,6 +27,7 @@ impl From<printpdf::Error> for PdfError {
 
 /// Write `document` as PDF bytes (section pages, body + header/footer).
 pub fn document_to_pdf_bytes(document: &Document) -> Result<Vec<u8>, PdfError> {
+    office_core::limits::validate_document(document).map_err(PdfError::Pdf)?;
     let mut cursor = std::io::Cursor::new(Vec::new());
     write_document_pdf(document, &mut cursor)?;
     Ok(cursor.into_inner())

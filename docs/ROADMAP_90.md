@@ -36,8 +36,10 @@ Writer のセクション設定を PR #28 でマージし、実画面・保存�
   部分的な読み込みによる内容欠落を防ぐ。ODT は [PR #10](https://github.com/rsasaki0109/rust-office/pull/10) で完了。
 - [ ] クラッシュ後の復旧用コピーと、読み込み・展開・描画の大きな入力に対する
   制限を備える。強制終了と復旧、制限超過後の編集継続を確認する。
-  PPTX / XLSX の全体容量・モデル件数制限と Writer / Calc / Impress の復旧コピーを進行中。
-  各変更のマージと他形式の制限が揃うまで加点しない。
+  PPTX / XLSX の制限と3アプリの復旧コピーはマージ済み。
+  DOCX / ODT / JSON・画像・ODS・BIFF8 XLS・CSVの制限も実装し、全356テストと
+  Linuxでの拒否後の編集・保存、3アプリの強制終了・復旧を確認した。
+  詳細は [INPUT_LIMITS.md](INPUT_LIMITS.md)。新しいPRのマージ後に85%へ加点する。
 
 ### Writer（25点）
 

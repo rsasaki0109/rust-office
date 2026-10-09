@@ -25,6 +25,7 @@ pub(super) fn apply_section_styles(
     let mut layout_name = None;
     let mut page = PageStyle::default();
     let mut masters: Vec<(String, Option<String>, Margins)> = Vec::new();
+    let mut copied_styles=0usize;
     let mut automatic = Writer::new(Vec::new());
     let mut master = None::<(String, Option<String>, BytesStart<'static>, Writer<Vec<u8>>)>;
     xml::read_xml(
@@ -92,6 +93,8 @@ pub(super) fn apply_section_styles(
                     let root = xml::office_wrapper(reader, "document-styles")?;
                     let mut writer = Writer::new(Vec::new());
                     writer.write_event(Event::Start(root.clone()))?;
+                    copied_styles=copied_styles.saturating_add(automatic.get_ref().len());
+                    if copied_styles>16*1024*1024 { return Err(xml::invalid("ODT replicated master-page styles exceed 16 MiB")); }
                     writer.get_mut().extend_from_slice(automatic.get_ref());
                     master = Some((name, layout, root, writer));
                 }
@@ -112,7 +115,11 @@ pub(super) fn apply_section_styles(
                 )))?;
                 let text = String::from_utf8(writer.into_inner())
                     .map_err(|e| xml::invalid(e.to_string()))?;
-                masters.push((name, layout, parse_master_header_footer(&text)?));
+                let margins=parse_master_header_footer(&text)?;
+                for p in margins.0.iter().chain(margins.1.iter()) {
+                    office_core::limits::validate_paragraph(p).map_err(xml::invalid)?;
+                }
+                masters.push((name, layout, margins));
             }
             Ok(())
         },

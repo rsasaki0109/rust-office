@@ -53,7 +53,7 @@ impl RecoveryData for Document {
         {
             Err("Invalid recovery document version or sections".into())
         } else {
-            Ok(())
+            office_core::limits::validate_document(self)
         }
     }
     fn decode(bytes: &[u8]) -> Result<Self, String> {

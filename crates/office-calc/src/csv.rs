@@ -1,6 +1,6 @@
 //! CSV import / export for the active sheet.
 
-use std::path::Path;
+use std::{path::Path, io::Read};
 
 use thiserror::Error;
 
@@ -22,24 +22,27 @@ pub enum CsvError {
 
 /// Load a workbook from a CSV file (one sheet).
 pub fn load_csv_path(path: &Path) -> Result<Workbook, CsvError> {
-    let text = std::fs::read_to_string(path)?;
+    let mut text = String::new();
+    std::fs::File::open(path)?.take(crate::xlsx_limits::MAX_TEXT_BYTES as u64 + 1).read_to_string(&mut text)?;
     load_csv_str(&text)
 }
 
 /// Read comma-separated records, including quoted multiline fields.
 /// Quotes must enclose the complete field; errors reject the entire import.
 pub fn load_csv_str(text: &str) -> Result<Workbook, CsvError> {
+    if text.len() > crate::xlsx_limits::MAX_TEXT_BYTES { return Err(CsvError::Parse("CSV exceeds 32 MiB text limit".into())); }
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let rows = delimited::parse_records(
         text,
         Format {
             delimiter: ',',
-            max_fields: u64::MAX,
+            max_fields: 2_000_000,
             allow_unquoted_quotes: false,
         },
     )
     .map_err(|error| CsvError::Parse(error.to_string()))?;
     let mut sheet = Sheet::new("Sheet1");
+    let mut cells = 0usize;
     for (r, fields) in rows.into_iter().enumerate() {
         if r >= MAX_SHEET_ROWS as usize || fields.len() > MAX_SHEET_COLS as usize {
             return Err(CsvError::OutOfBounds);
@@ -52,6 +55,10 @@ pub fn load_csv_str(text: &str) -> Result<Workbook, CsvError> {
                 } else {
                     field
                 };
+                cells += 1;
+                if cells > crate::xlsx_limits::MAX_CELLS {
+                    return Err(CsvError::Parse("CSV exceeds 100000 nonempty cells".into()));
+                }
                 sheet.set_raw(CellAddr::new(c as u32, r as u32), input);
             }
         }
@@ -64,6 +71,7 @@ pub fn load_csv_str(text: &str) -> Result<Workbook, CsvError> {
 }
 
 pub fn write_csv_path(workbook: &Workbook, path: &Path) -> Result<(), CsvError> {
+    crate::xlsx_limits::model(workbook).map_err(|e| CsvError::Parse(e.to_string()))?;
     let text = sheet_to_csv(workbook.active_sheet());
     office_core::storage::atomic_write(path, text.as_bytes())?;
     Ok(())
@@ -274,5 +282,25 @@ mod tests {
         );
         std::fs::write(&path, "Good,1\n\"unfinished").unwrap();
         assert!(matches!(load_csv_path(&path), Err(CsvError::Parse(_))));
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn excess_nonempty_csv_cells_are_rejected() {
+        let text="1\n".repeat(100_001);
+        assert!(load_csv_str(&text).unwrap_err().to_string().contains("100000"));
+    }
+    #[test]
+    fn sparse_csv_export_rejects_before_expansion_and_keeps_destination() {
+        let mut book=Workbook::new();
+        book.active_sheet_mut().set_raw(CellAddr::new(0,0),"1");
+        book.active_sheet_mut().set_raw(CellAddr::new(16383,1048575),"2");
+        let path=std::env::temp_dir().join(format!("bounded-csv-{}.csv",std::process::id()));
+        std::fs::write(&path,"original").unwrap();
+        assert!(write_csv_path(&book,&path).is_err());assert_eq!(std::fs::read_to_string(&path).unwrap(),"original");
+        std::fs::remove_file(path).unwrap();
     }
 }

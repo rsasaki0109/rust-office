@@ -100,6 +100,17 @@ pub(crate) fn package(bytes: &[u8]) -> Result<bool, XlsxError> {
         ));
     }
     if !is_xlsx {
+        let mut actual = 0u64;
+        for (index, _, _) in &xml_parts {
+            let mut file = zip.by_index(*index).map_err(|e| error(e.to_string()))?;
+            let mut xml = Vec::new();
+            file.by_ref().take(MAX_XML_BYTES + 1).read_to_end(&mut xml)?;
+            actual = actual.saturating_add(xml.len() as u64);
+            if xml.len() as u64 > MAX_XML_BYTES || actual > MAX_EXPANDED_BYTES {
+                return Err(error("ODS actual XML reads exceed admission byte limits"));
+            }
+            if file.name() == "content.xml" { crate::legacy_limits::ods(&xml)?; }
+        }
         return Ok(false);
     }
     let mut budget = XmlBudget::default();

@@ -15,6 +15,7 @@ rust_xlsxwriter = { workspace = true }
 zip2 = { package = "zip", version = "2.4", default-features = false, features = ["deflate"] }
 quick-xml = { workspace = true }
 zip = { workspace = true }
+cfb = "0.14"
 
 [dev-dependencies]
 serde_json = { workspace = true }
