@@ -6,15 +6,15 @@ use eframe::App;
 use egui::{self, Color32, Context, Key, RichText, Sense, Ui, Vec2};
 use office_calc::{
     col_to_letters, load_csv_path, load_xlsx_path, write_csv_path, write_xlsx_path, CellAddr,
-    CellRange, Workbook,
+    CellRange, DimensionAxis, FormatChange, Workbook,
 };
 
 use crate::calc_clipboard::CopiedCells;
+use crate::calc_geometry::GridAxis;
 use crate::theme::{ACCENT, CANVAS_BG, STATUS_BG, TOOLBAR_BG};
 use crate::unsaved::{self, Choice, DocumentAction};
 
-const COL_WIDTH: f32 = 88.0;
-const ROW_HEIGHT: f32 = 24.0;
+const HEADER_HEIGHT: f32 = 24.0;
 const HEADER_W: f32 = 40.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,11 +24,29 @@ pub enum SwitchTo {
     Quit,
 }
 
+enum SheetDialog {
+    Size {
+        axis: DimensionAxis,
+        value: f64,
+        error: Option<String>,
+    },
+    Rename {
+        index: usize,
+        name: String,
+        focus: bool,
+        error: Option<String>,
+    },
+    Delete {
+        index: usize,
+    },
+}
+
 pub struct CalcApp {
     recovery: Option<crate::recovery::Recovery<crate::calc_recovery::CalcSnapshot>>,
     recovery_open: bool,
     recovery_selected: usize,
     recovery_delete: Option<usize>,
+    sheet_dialog: Option<SheetDialog>,
     copied_cells: Option<CopiedCells>,
     clipboard: Option<arboard::Clipboard>,
     copy_pending: bool,
@@ -74,6 +92,7 @@ impl CalcApp {
             recovery_open: false,
             recovery_selected: 0,
             recovery_delete: None,
+            sheet_dialog: None,
             copied_cells: None,
             clipboard: None,
             copy_pending: false,
@@ -382,10 +401,192 @@ impl CalcApp {
 
     fn add_sheet(&mut self) {
         self.commit_edit();
-        let n = self.workbook.sheet_count() + 1;
-        self.workbook.add_sheet(format!("Sheet{n}"));
+        let name = self.workbook.next_sheet_name();
+        self.workbook.add_sheet(name);
         self.select_cell(CellAddr::new(0, 0), false);
         self.scroll_to_active = true;
+    }
+
+    fn open_sheet_dialog(&mut self, rename: bool) {
+        self.commit_edit();
+        self.sheet_dialog = Some(if rename {
+            SheetDialog::Rename {
+                index: self.workbook.active,
+                name: self.workbook.active_sheet().name.clone(),
+                focus: true,
+                error: None,
+            }
+        } else {
+            SheetDialog::Delete {
+                index: self.workbook.active,
+            }
+        });
+    }
+
+    fn confirm_sheet_rename(
+        &mut self,
+        index: usize,
+        name: &str,
+    ) -> Result<(), office_calc::SheetError> {
+        self.workbook.rename_sheet(index, name)?;
+        self.set_status("Worksheet renamed");
+        Ok(())
+    }
+
+    fn confirm_sheet_delete(&mut self, index: usize) {
+        match self.workbook.delete_sheet(index) {
+            Ok(()) => {
+                self.reset_copy();
+                self.select_cell(CellAddr::new(0, 0), false);
+                self.scroll_to_active = true;
+                self.set_status("Worksheet deleted — Undo restores its contents");
+            }
+            Err(error) => self.set_error(error.to_string()),
+        }
+    }
+
+    fn open_size_dialog(&mut self, axis: DimensionAxis) {
+        self.commit_edit();
+        let sheet = self.workbook.active_sheet();
+        let value = match axis {
+            DimensionAxis::Columns => sheet.column_width(self.active.col),
+            DimensionAxis::Rows => sheet.row_height(self.active.row),
+        };
+        self.sheet_dialog = Some(SheetDialog::Size {
+            axis,
+            value,
+            error: None,
+        });
+    }
+
+    fn resize_selection(
+        &mut self,
+        axis: DimensionAxis,
+        value: Option<f64>,
+    ) -> Result<(), office_calc::DimensionError> {
+        self.commit_edit();
+        let range = self.selection();
+        let (first, last) = match axis {
+            DimensionAxis::Columns => (range.start.col, range.end.col),
+            DimensionAxis::Rows => (range.start.row, range.end.row),
+        };
+        self.workbook.resize_range(axis, first, last, value)?;
+        self.scroll_to_active = true;
+        self.set_status("Row/column size updated");
+        Ok(())
+    }
+
+    fn show_sheet_dialog(&mut self, ctx: &Context) {
+        let Some(mut dialog) = self.sheet_dialog.take() else {
+            return;
+        };
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("calc_sheet_dialog")).show(ctx, |ui| {
+            match &mut dialog {
+                SheetDialog::Size { axis, value, error } => {
+                    let columns = *axis == DimensionAxis::Columns;
+                    ui.heading(if columns {
+                        "Column Width"
+                    } else {
+                        "Row Height"
+                    });
+                    ui.label(format!(
+                        "Apply to {} {}",
+                        self.selection_label(),
+                        if columns { "columns" } else { "rows" }
+                    ));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .range(if columns { 1.0..=1790.0 } else { 1.0..=409.5 })
+                                .speed(if columns { 1.0 } else { 0.25 })
+                                .max_decimals(if columns { 0 } else { 2 }),
+                        );
+                        ui.label(if columns { "pixels" } else { "points" });
+                    });
+                    if let Some(error) = error {
+                        ui.colored_label(Color32::RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        for (label, size) in [("Apply", Some(*value)), ("Reset to Default", None)] {
+                            if ui.button(label).clicked() {
+                                match self.resize_selection(*axis, size) {
+                                    Ok(()) => close = true,
+                                    Err(e) => *error = Some(e.to_string()),
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+
+                SheetDialog::Rename {
+                    index,
+                    name,
+                    focus,
+                    error,
+                } => {
+                    ui.heading("Rename Worksheet");
+                    ui.label("Use a unique name, up to 31 characters.");
+                    let input = ui
+                        .add(egui::TextEdit::singleline(name).id(egui::Id::new("calc_sheet_name")));
+                    if *focus {
+                        input.request_focus();
+                        *focus = false;
+                    }
+                    if let Some(error) = error {
+                        ui.colored_label(Color32::RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() {
+                            match self.confirm_sheet_rename(*index, name) {
+                                Ok(()) => close = true,
+                                Err(e) => *error = Some(e.to_string()),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                SheetDialog::Delete { index } => {
+                    ui.heading("Delete Worksheet?");
+                    ui.label(format!(
+                        "Delete \"{}\" and all its cells?",
+                        self.workbook.sheets[*index].name
+                    ));
+                    ui.label("You can restore this worksheet with Undo.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete Worksheet").clicked() {
+                            self.confirm_sheet_delete(*index);
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            }
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                close = true;
+            }
+        });
+        if close {
+            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("calc_sheet_name")));
+            ctx.request_repaint();
+        } else {
+            self.sheet_dialog = Some(dialog);
+        }
+    }
+
+    fn format_selection(&mut self, change: FormatChange) {
+        self.commit_edit();
+        match self.workbook.format_range(self.selection(), change) {
+            Ok(_) => self.set_status(format!("Formatted {}", self.selection_label())),
+            Err(error) => self.set_error(format!("Format failed: {error}")),
+        }
     }
 
     fn clear_selection(&mut self) {
@@ -653,6 +854,18 @@ impl CalcApp {
             return false;
         }
         // Include the formula-bar draft, but retain it unchanged if saving fails.
+        if ext == "csv"
+            && self
+                .workbook
+                .sheets
+                .iter()
+                .any(|sheet| sheet.has_formatting() || sheet.has_custom_dimensions())
+        {
+            self.set_error(
+                "Save failed: CSV does not store cell formatting or row/column sizes. Choose XLSX to preserve it.",
+            );
+            return false;
+        }
         let mut workbook = self.workbook.clone();
         if self.editing && self.edit_buf != workbook.active_sheet().raw(self.active) {
             workbook.set_cell(self.active, self.edit_buf.clone());
@@ -732,8 +945,68 @@ impl CalcApp {
                     }
                 }
                 ui.separator();
+                if ui.button("Rename Worksheet…").clicked() {
+                    self.open_sheet_dialog(true);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.workbook.sheet_count() > 1,
+                        egui::Button::new("Delete Worksheet…"),
+                    )
+                    .clicked()
+                {
+                    self.open_sheet_dialog(false);
+                    ui.close();
+                }
                 if ui.button("Add Sheet").clicked() {
                     self.add_sheet();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Format", |ui| {
+                let current = self.workbook.active_sheet().format(self.active);
+                for (label, code) in [
+                    ("General", "General"),
+                    ("Number (2 decimals)", "0.00"),
+                    ("Percentage (2 decimals)", "0.00%"),
+                    ("Date (yyyy-mm-dd)", "yyyy-mm-dd"),
+                ] {
+                    if ui
+                        .selectable_label(current.number_format == code, label)
+                        .clicked()
+                    {
+                        self.format_selection(FormatChange::Number(code.into()));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(current.bold, "Bold    Ctrl+B")
+                    .clicked()
+                {
+                    self.format_selection(FormatChange::Bold(!current.bold));
+                    ui.close();
+                }
+                if ui
+                    .selectable_label(current.italic, "Italic    Ctrl+I")
+                    .clicked()
+                {
+                    self.format_selection(FormatChange::Italic(!current.italic));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Column Width…").clicked() {
+                    self.open_size_dialog(DimensionAxis::Columns);
+                    ui.close();
+                }
+                if ui.button("Row Height…").clicked() {
+                    self.open_size_dialog(DimensionAxis::Rows);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Clear Formatting").clicked() {
+                    self.format_selection(FormatChange::Clear);
                     ui.close();
                 }
             });
@@ -818,19 +1091,21 @@ impl CalcApp {
     fn grid(&mut self, ui: &mut Ui) {
         let cols = self.workbook.active_sheet().cols;
         let rows = self.workbook.active_sheet().rows;
+        let columns = GridAxis::new(self.workbook.active_sheet(), DimensionAxis::Columns);
+        let row_sizes = GridAxis::new(self.workbook.active_sheet(), DimensionAxis::Rows);
         // Only paint the visible cells; imported/pasted sheets can exceed the
         // old 40-column/80-row display limit without creating millions of widgets.
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 let size = Vec2::new(
-                    HEADER_W + cols as f32 * COL_WIDTH,
-                    (rows + 1) as f32 * ROW_HEIGHT,
+                    HEADER_W + columns.total(),
+                    HEADER_HEIGHT + row_sizes.total(),
                 );
                 let (grid_rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 let origin = grid_rect.min;
                 let cells_rect = egui::Rect::from_min_max(
-                    origin + Vec2::new(HEADER_W, ROW_HEIGHT),
+                    origin + Vec2::new(HEADER_W, HEADER_HEIGHT),
                     grid_rect.max,
                 );
                 let response = ui.interact(
@@ -839,12 +1114,10 @@ impl CalcApp {
                     Sense::click_and_drag(),
                 );
                 let cell_at = |pos: egui::Pos2| {
-                    let offset = pos - origin - Vec2::new(HEADER_W, ROW_HEIGHT);
+                    let offset = pos - origin - Vec2::new(HEADER_W, HEADER_HEIGHT);
                     CellAddr::new(
-                        (offset.x / COL_WIDTH).floor().clamp(0.0, (cols - 1) as f32) as u32,
-                        (offset.y / ROW_HEIGHT)
-                            .floor()
-                            .clamp(0.0, (rows - 1) as f32) as u32,
+                        columns.index_at(f64::from(offset.x)),
+                        row_sizes.index_at(f64::from(offset.y)),
                     )
                 };
                 if ui.is_enabled() {
@@ -869,29 +1142,33 @@ impl CalcApp {
                 if self.scroll_to_active {
                     let min = origin
                         + Vec2::new(
-                            HEADER_W + self.active.col as f32 * COL_WIDTH,
-                            (self.active.row + 1) as f32 * ROW_HEIGHT,
+                            HEADER_W + columns.position(self.active.col) as f32,
+                            HEADER_HEIGHT + row_sizes.position(self.active.row) as f32,
                         );
                     ui.scroll_to_rect(
-                        egui::Rect::from_min_size(min, Vec2::new(COL_WIDTH, ROW_HEIGHT)),
+                        egui::Rect::from_min_size(
+                            min,
+                            Vec2::new(
+                                columns.size(self.active.col),
+                                row_sizes.size(self.active.row),
+                            ),
+                        ),
                         None,
                     );
                     self.scroll_to_active = false;
                 }
-                let first_col = ((viewport.min.x - HEADER_W) / COL_WIDTH).floor().max(0.0) as u32;
+                let first_col = columns.index_at(f64::from(viewport.min.x - HEADER_W));
                 let last_col =
-                    (((viewport.max.x - HEADER_W) / COL_WIDTH).ceil().max(0.0) as u32).min(cols);
-                let first_row = ((viewport.min.y - ROW_HEIGHT) / ROW_HEIGHT)
-                    .floor()
-                    .max(0.0) as u32;
+                    (columns.index_at(f64::from(viewport.max.x - HEADER_W)) + 1).min(cols);
+                let first_row = row_sizes.index_at(f64::from(viewport.min.y - HEADER_HEIGHT));
                 let last_row =
-                    (((viewport.max.y - ROW_HEIGHT) / ROW_HEIGHT).ceil().max(0.0) as u32).min(rows);
+                    (row_sizes.index_at(f64::from(viewport.max.y - HEADER_HEIGHT)) + 1).min(rows);
                 let painter = ui.painter();
                 let selection = self.selection();
                 for col in first_col..last_col {
                     let rect = egui::Rect::from_min_size(
-                        origin + Vec2::new(HEADER_W + col as f32 * COL_WIDTH, 0.0),
-                        Vec2::new(COL_WIDTH, ROW_HEIGHT),
+                        origin + Vec2::new(HEADER_W + columns.position(col) as f32, 0.0),
+                        Vec2::new(columns.size(col), HEADER_HEIGHT),
                     );
                     painter.rect_filled(rect, 0.0, Color32::from_gray(230));
                     painter.text(
@@ -903,10 +1180,10 @@ impl CalcApp {
                     );
                 }
                 for row in first_row..last_row {
-                    let top = origin.y + (row + 1) as f32 * ROW_HEIGHT;
+                    let top = origin.y + HEADER_HEIGHT + row_sizes.position(row) as f32;
                     let header = egui::Rect::from_min_size(
                         egui::pos2(origin.x, top),
-                        Vec2::new(HEADER_W, ROW_HEIGHT),
+                        Vec2::new(HEADER_W, row_sizes.size(row)),
                     );
                     painter.rect_filled(header, 0.0, Color32::from_gray(230));
                     painter.text(
@@ -919,8 +1196,8 @@ impl CalcApp {
                     for col in first_col..last_col {
                         let addr = CellAddr::new(col, row);
                         let rect = egui::Rect::from_min_size(
-                            egui::pos2(origin.x + HEADER_W + col as f32 * COL_WIDTH, top),
-                            Vec2::new(COL_WIDTH, ROW_HEIGHT),
+                            egui::pos2(origin.x + HEADER_W + columns.position(col) as f32, top),
+                            Vec2::new(columns.size(col), row_sizes.size(row)),
                         );
                         let bg = if selection.contains(addr) {
                             Color32::from_rgb(210, 230, 255)
@@ -934,15 +1211,25 @@ impl CalcApp {
                             egui::Stroke::new(1.0, Color32::from_gray(200)),
                             egui::StrokeKind::Inside,
                         );
-                        painter
-                            .with_clip_rect(rect.intersect(ui.clip_rect()).shrink(2.0))
-                            .text(
-                                rect.left_center() + Vec2::new(4.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                self.workbook.active_sheet().display(addr),
-                                egui::FontId::proportional(13.0),
-                                Color32::BLACK,
-                            );
+                        let style = self.workbook.active_sheet().format(addr);
+                        let job = egui::text::LayoutJob::single_section(
+                            self.workbook.active_sheet().display(addr),
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(13.0),
+                                color: Color32::BLACK,
+                                italics: style.italic,
+                                ..Default::default()
+                            },
+                        );
+                        let galley = painter.layout_job(job);
+                        let pos = rect.left_center() + Vec2::new(4.0, -galley.size().y / 2.0);
+                        let clipped =
+                            painter.with_clip_rect(rect.intersect(ui.clip_rect()).shrink(2.0));
+                        clipped.galley(pos, galley.clone(), Color32::BLACK);
+                        // Synthetic weight keeps CJK fallback glyphs visibly bold too.
+                        if style.bold {
+                            clipped.galley(pos + Vec2::new(0.45, 0.0), galley, Color32::BLACK);
+                        }
                         if addr == self.active {
                             painter.rect_stroke(
                                 rect,
@@ -957,6 +1244,9 @@ impl CalcApp {
     }
 
     fn handle_keys(&mut self, ctx: &Context) {
+        if self.sheet_dialog.is_some() || ctx.memory(|memory| memory.top_modal_layer().is_some()) {
+            return;
+        }
         let command = egui::Modifiers::COMMAND;
         if ctx.input_mut(|i| i.consume_key(command | egui::Modifiers::SHIFT, Key::S)) {
             self.save_file_as();
@@ -985,6 +1275,16 @@ impl CalcApp {
                 self.cancel_edit();
                 Self::leave_formula(ctx);
             }
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::B)) {
+            let bold = self.workbook.active_sheet().format(self.active).bold;
+            self.format_selection(FormatChange::Bold(!bold));
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::I)) {
+            let italic = self.workbook.active_sheet().format(self.active).italic;
+            self.format_selection(FormatChange::Italic(!italic));
             return;
         }
         let mut clipboard_events = Vec::new();
@@ -1093,7 +1393,10 @@ impl App for CalcApp {
             self.handle_keys(&ctx);
         }
         self.show_unsaved_dialog(&ctx);
-        if self.pending_action.is_some() || recovery_was_open {
+        if !recovery_was_open {
+            self.show_sheet_dialog(&ctx);
+        }
+        if self.pending_action.is_some() || recovery_was_open || self.sheet_dialog.is_some() {
             ui.disable();
         }
 
@@ -1145,6 +1448,306 @@ fn writable_extension(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resized_selection_round_trips_and_undo_restores_saved_state() {
+        let mut app = CalcApp::new();
+        draft(&mut app, "日本語");
+        app.selection_end = CellAddr::new(1, 1);
+        app.resize_selection(DimensionAxis::Columns, Some(160.0))
+            .unwrap();
+        app.resize_selection(DimensionAxis::Rows, Some(31.5))
+            .unwrap();
+        assert!(!app.editing);
+        assert_eq!(
+            app.workbook.active_sheet().raw(CellAddr::new(0, 0)),
+            "日本語"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sizes.xlsx");
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.active_sheet().column_width(1), 160.0);
+        assert_eq!(loaded.active_sheet().row_height(1), 31.5);
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+        app.resize_selection(DimensionAxis::Columns, None).unwrap();
+        assert_eq!(
+            app.workbook.active_sheet().column_width(0),
+            office_calc::DEFAULT_COLUMN_WIDTH
+        );
+        app.history(false);
+        assert_eq!(app.workbook.active_sheet().column_width(0), 160.0);
+    }
+
+    #[test]
+    fn csv_save_cannot_drop_dimensions_or_pending_draft() {
+        let mut app = CalcApp::new();
+        app.resize_selection(DimensionAxis::Rows, Some(40.0))
+            .unwrap();
+        assert!(!app.workbook.active_sheet().has_formatting());
+        draft(&mut app, "keep this draft");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.csv");
+        std::fs::write(&path, "original bytes").unwrap();
+        assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original bytes");
+        assert!(app.editing && app.is_dirty());
+        assert_eq!(app.edit_buf, "keep this draft");
+        assert!(app.file_path.is_none());
+        assert!(app
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("row/column sizes"));
+    }
+
+    #[test]
+    fn cancelling_size_dialog_does_not_resize_or_edit_cells() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        for axis in [DimensionAxis::Columns, DimensionAxis::Rows] {
+            app.open_size_dialog(axis);
+            for events in [
+                vec![],
+                vec![egui::Event::Text("123".into())],
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![],
+                vec![],
+            ] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.handle_keys(ui.ctx());
+                        app.show_sheet_dialog(ui.ctx());
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert!(app.sheet_dialog.is_none());
+            assert!(!app.workbook.active_sheet().has_custom_dimensions());
+            assert_eq!(app.workbook.active_sheet().raw(app.active), "Item");
+            assert!(!app.is_dirty() && !app.workbook.can_undo());
+        }
+    }
+
+    #[test]
+    fn resized_grid_pointer_selects_the_cell_at_its_new_position() {
+        let mut app = CalcApp::new();
+        app.resize_selection(DimensionAxis::Columns, Some(160.0))
+            .unwrap();
+        app.resize_selection(DimensionAxis::Rows, Some(36.0))
+            .unwrap();
+        app.scroll_to_active = false;
+        let ctx = Context::default();
+        let mut origin = egui::Pos2::ZERO;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    origin = ui.cursor().min;
+                    app.grid(ui);
+                });
+            },
+        );
+        output.textures_delta.clear();
+        let pos = origin + egui::vec2(HEADER_W + 160.0 + 20.0, HEADER_HEIGHT + 48.0 + 10.0);
+        for pressed in [true, false] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.grid(ui));
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert_eq!(app.active, CellAddr::new(1, 1));
+        assert_eq!(app.edit_buf, "3");
+    }
+
+    #[test]
+    fn formatting_commits_draft_preserves_formulas_and_reloads_from_xlsx() {
+        let mut app = CalcApp::new();
+        app.select_cell(CellAddr::new(2, 3), false);
+        draft(&mut app, "=B2*C2+B3*C3");
+        app.format_selection(FormatChange::Number("0.00".into()));
+        app.format_selection(FormatChange::Bold(true));
+        app.format_selection(FormatChange::Italic(true));
+        assert!(!app.editing);
+        assert_eq!(app.workbook.active_sheet().display(app.active), "5.20");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("formatted.xlsx");
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(
+            loaded.active_sheet().format(app.active),
+            app.workbook.active_sheet().format(app.active)
+        );
+        assert_eq!(loaded.active_sheet().raw(app.active), "=B2*C2+B3*C3");
+        assert_eq!(loaded.active_sheet().display(app.active), "5.20");
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn csv_save_cannot_drop_styling_or_commit_a_pending_draft() {
+        let mut app = CalcApp::new();
+        app.format_selection(FormatChange::Bold(true));
+        draft(&mut app, "keep this draft");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.csv");
+        std::fs::write(&path, "original bytes").unwrap();
+        assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original bytes");
+        assert!(app.editing && app.is_dirty());
+        assert_eq!(app.edit_buf, "keep this draft");
+        assert!(app.file_path.is_none());
+        assert!(app.last_error.as_deref().unwrap().contains("formatting"));
+        assert!(app.workbook.can_undo());
+    }
+
+    #[test]
+    fn formatting_shortcuts_apply_to_grid_and_stay_out_of_rename_modals() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        let bold = egui::Event::Key {
+            key: Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![bold.clone()],
+                ..Default::default()
+            },
+            |ui| app.handle_keys(ui.ctx()),
+        );
+        output.textures_delta.clear();
+        assert!(app.workbook.active_sheet().format(app.active).bold);
+        app.workbook.mark_clean();
+        app.open_sheet_dialog(true);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![bold],
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_keys(ui.ctx());
+                app.show_sheet_dialog(ui.ctx());
+            },
+        );
+        output.textures_delta.clear();
+        assert!(app.workbook.active_sheet().format(app.active).bold);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn sheet_management_round_trip_and_undo_preserve_drafts_and_formulas() {
+        let mut app = CalcApp::new();
+        draft(&mut app, "日本語");
+        app.add_sheet();
+        assert_eq!(app.workbook.sheets[0].raw(CellAddr::new(0, 0)), "日本語");
+        draft(&mut app, "=1+2");
+        app.open_sheet_dialog(true);
+        app.confirm_sheet_rename(1, "売上 & <集計>").unwrap();
+        app.sheet_dialog = None;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed.xlsx");
+        assert!(app.save_to(&path));
+        app.confirm_sheet_delete(1);
+        assert_eq!(app.workbook.sheet_count(), 1);
+        app.history(false);
+        assert!(!app.is_dirty());
+        assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(0, 0)), "=1+2");
+        app.history(true);
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.sheet_count(), 1);
+        assert_eq!(loaded.active_sheet().raw(CellAddr::new(0, 0)), "日本語");
+        app.history(false);
+        assert!(app.is_dirty());
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.sheets[1].name, "売上 & <集計>");
+        assert_eq!(loaded.sheets[1].raw(CellAddr::new(0, 0)), "=1+2");
+        assert_eq!(loaded.sheets[1].display(CellAddr::new(0, 0)), "3");
+        assert!(!loaded.can_undo() && !loaded.is_dirty());
+    }
+
+    #[test]
+    fn cancelling_sheet_modals_and_typing_do_not_edit_cells() {
+        let mut app = CalcApp::new();
+        app.add_sheet();
+        app.workbook.mark_clean();
+        app.workbook.clear_history();
+        let ctx = Context::default();
+        for rename in [true, false] {
+            app.open_sheet_dialog(rename);
+            for events in [
+                vec![],
+                vec![egui::Event::Text("draft name".into())],
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![],
+                vec![],
+            ] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let ctx = ui.ctx().clone();
+                        app.handle_keys(&ctx);
+                        app.show_sheet_dialog(&ctx);
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert!(app.sheet_dialog.is_none());
+            assert_eq!(app.workbook.sheet_count(), 2);
+            assert_eq!(app.workbook.active_sheet().name, "Sheet2");
+            assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(0, 0)), "");
+            assert!(!app.is_dirty() && !app.workbook.can_undo());
+        }
+    }
 
     fn draft(app: &mut CalcApp, value: &str) {
         app.begin_edit();

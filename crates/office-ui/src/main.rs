@@ -4,6 +4,7 @@ mod app;
 mod calc_app;
 mod calc_recovery;
 mod calc_clipboard;
+mod calc_geometry;
 mod fonts;
 mod impress_app;
 mod office;
