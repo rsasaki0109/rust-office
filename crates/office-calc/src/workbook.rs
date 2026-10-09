@@ -48,6 +48,13 @@ pub enum SheetError {
 
 #[derive(Debug, Clone)]
 enum Change {
+    Dimensions {
+        sheet: usize,
+        axis: crate::DimensionAxis,
+        sizes: Vec<(u32, f64, f64)>,
+        before_bounds: (u32, u32),
+        after_bounds: (u32, u32),
+    },
     Formats {
         sheet: usize,
         cells: Vec<(CellAddr, crate::CellFormat, crate::CellFormat)>,
@@ -192,6 +199,49 @@ impl Workbook {
         Ok(true)
     }
 
+    /// Resize a row/column range as one undoable edit; None restores its sheet default.
+    pub fn resize_range(
+        &mut self,
+        axis: crate::DimensionAxis,
+        first: u32,
+        last: u32,
+        size: Option<f64>,
+    ) -> Result<bool, crate::DimensionError> {
+        let limit = match axis {
+            crate::DimensionAxis::Columns => crate::MAX_SHEET_COLS,
+            crate::DimensionAxis::Rows => crate::MAX_SHEET_ROWS,
+        };
+        if first > last || last >= limit {
+            return Err(crate::DimensionError::OutOfBounds);
+        }
+        let sheet = self.active_sheet();
+        let size = size.unwrap_or(sheet.default_dimension(axis));
+        axis.validate(size)?;
+        let before_bounds = (sheet.rows, sheet.cols);
+        let sizes: Vec<_> = (first..=last)
+            .filter_map(|index| {
+                let before = sheet.dimensions.get(axis, index);
+                (before != size).then_some((index, before, size))
+            })
+            .collect();
+        if sizes.is_empty() {
+            return Ok(false);
+        }
+        for &(index, _, after) in &sizes {
+            self.active_sheet_mut().set_dimension(axis, index, after);
+        }
+        let sheet = self.active_sheet();
+        let after_bounds = (sheet.rows, sheet.cols);
+        self.record(Change::Dimensions {
+            sheet: self.active,
+            axis,
+            sizes,
+            before_bounds,
+            after_bounds,
+        });
+        Ok(true)
+    }
+
     pub fn copy_tsv(&self, range: CellRange) -> Result<String, ClipboardError> {
         let range = clipboard::validate_range(range)?;
         let sheet = self.active_sheet();
@@ -327,6 +377,29 @@ impl Workbook {
 
     fn apply(&mut self, change: &Change, forward: bool) {
         match change {
+            Change::Dimensions {
+                sheet,
+                axis,
+                sizes,
+                before_bounds,
+                after_bounds,
+            } => {
+                self.active = *sheet;
+                for &(index, before, after) in sizes {
+                    self.active_sheet_mut().set_dimension(
+                        *axis,
+                        index,
+                        if forward { after } else { before },
+                    );
+                }
+                let (rows, cols) = if forward {
+                    *after_bounds
+                } else {
+                    *before_bounds
+                };
+                self.active_sheet_mut().rows = rows;
+                self.active_sheet_mut().cols = cols;
+            }
             Change::Formats {
                 sheet,
                 cells,
@@ -518,6 +591,77 @@ impl Workbook {
 mod tests {
     use super::*;
     use crate::{MAX_SHEET_COLS, MAX_SHEET_ROWS};
+
+    #[test]
+    fn resizing_ranges_tracks_saved_revisions_without_changing_cell_data() {
+        use crate::DimensionAxis::*;
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(0, 0), "=1+2");
+        book.mark_clean();
+        book.clear_history();
+        book.resize_range(Columns, 0, 2, Some(160.0)).unwrap();
+        assert_eq!(book.active_sheet().column_width(2), 160.0);
+        assert_eq!(book.active_sheet().raw(CellAddr::new(0, 0)), "=1+2");
+        book.undo();
+        assert!(!book.is_dirty() && !book.can_undo());
+        book.redo();
+        book.mark_clean();
+        book.resize_range(Rows, 0, 1, Some(31.5)).unwrap();
+        assert_eq!(book.active_sheet().row_height(1), 31.5);
+        book.undo();
+        assert!(!book.is_dirty());
+        book.redo();
+        book.resize_range(Rows, 0, 1, None).unwrap();
+        assert_eq!(book.active_sheet().row_height(0), crate::DEFAULT_ROW_HEIGHT);
+        book.undo();
+        assert_eq!(book.active_sheet().row_height(0), 31.5);
+    }
+
+    #[test]
+    fn invalid_or_unchanged_sizes_preserve_redo_and_clean_state() {
+        use crate::DimensionAxis::*;
+        let mut book = Workbook::new();
+        book.resize_range(Columns, 0, 0, Some(100.0)).unwrap();
+        book.undo();
+        for (axis, value) in [
+            (Columns, f64::NAN),
+            (Columns, f64::INFINITY),
+            (Columns, 0.0),
+            (Columns, 1791.0),
+            (Columns, 1.5),
+            (Rows, 0.0),
+            (Rows, 410.0),
+            (Rows, f64::NEG_INFINITY),
+        ] {
+            assert!(book.resize_range(axis, 0, 0, Some(value)).is_err());
+        }
+        assert!(book.resize_range(Columns, 1, 0, Some(100.0)).is_err());
+        assert!(book
+            .resize_range(Columns, 0, MAX_SHEET_COLS, Some(100.0))
+            .is_err());
+        assert!(book
+            .resize_range(Rows, 0, MAX_SHEET_ROWS, Some(25.0))
+            .is_err());
+        assert!(!book.resize_range(Columns, 0, 0, None).unwrap());
+        assert!(!book.is_dirty() && book.can_redo() && !book.can_undo());
+    }
+
+    #[test]
+    fn resized_empty_rows_restore_bounds_and_survive_sheet_deletion_undo() {
+        use crate::DimensionAxis::*;
+        let mut book = Workbook::new();
+        let before = (book.active_sheet().rows, book.active_sheet().cols);
+        book.resize_range(Rows, 100, 100, Some(36.0)).unwrap();
+        assert_eq!(book.active_sheet().rows, 101);
+        book.undo();
+        assert_eq!((book.active_sheet().rows, book.active_sheet().cols), before);
+        book.redo();
+        book.add_sheet("Other");
+        book.delete_sheet(0).unwrap();
+        book.undo();
+        assert_eq!(book.sheets[0].row_height(100), 36.0);
+        assert_eq!(book.sheets[0].rows, 101);
+    }
 
     #[test]
     fn formatting_is_one_edit_and_never_changes_values_or_formula_results() {

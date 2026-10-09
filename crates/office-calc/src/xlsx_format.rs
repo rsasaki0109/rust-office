@@ -292,6 +292,42 @@ pub(crate) fn load(path: &Path, workbook: &mut Workbook) -> Result<(), String> {
             MAIN,
             "worksheet",
             |name, parent, attrs| {
+                use crate::DimensionAxis;
+                let size = |key: &str| -> Result<f64, String> {
+                    attrs.get(key).ok_or_else(|| format!("Missing {key}"))?.parse::<f64>().map_err(|_| format!("Invalid {key}"))
+                };
+                let hidden = |key: &str| attrs.get(key).is_some_and(|v| v == "1" || v == "true");
+                if (name == "row" || name == "col") && hidden("hidden") || name == "sheetFormatPr" && hidden("zeroHeight") {
+                    return Err("Hidden rows/columns are not supported; import cancelled to preserve worksheet layout".into());
+                }
+                if name == "sheetFormatPr" && parent == "worksheet" {
+                    if attrs.contains_key("defaultRowHeight") {
+                        let height = size("defaultRowHeight")?;
+                        DimensionAxis::Rows.validate(height).map_err(|e| e.to_string())?;
+                        sheet.dimensions.default_row = height;
+                    }
+                    if attrs.contains_key("defaultColWidth") {
+                        let width = (size("defaultColWidth")? * 7.0).round();
+                        DimensionAxis::Columns.validate(width).map_err(|e| e.to_string())?;
+                        sheet.dimensions.default_column = width;
+                    }
+                }
+                if name == "col" && parent == "cols" && attrs.contains_key("width") {
+                    let first = integer(attrs, "min", 0)?;
+                    let last = integer(attrs, "max", 0)?;
+                    if first == 0 || first > last || last > MAX_SHEET_COLS as usize { return Err("Invalid column-size range".into()); }
+                    // XLSX column widths use a Calibri-11 digit width of seven pixels.
+                    let width = (size("width")? * 7.0).round();
+                    DimensionAxis::Columns.validate(width).map_err(|e| e.to_string())?;
+                    for col in first - 1..last { sheet.set_dimension(DimensionAxis::Columns, col as u32, width); }
+                }
+                if name == "row" && parent == "sheetData" && attrs.contains_key("ht") {
+                    let row = integer(attrs, "r", 0)?;
+                    if row == 0 || row > MAX_SHEET_ROWS as usize { return Err("Invalid row-size index".into()); }
+                    let height = size("ht")?;
+                    DimensionAxis::Rows.validate(height).map_err(|e| e.to_string())?;
+                    sheet.set_dimension(DimensionAxis::Rows, row as u32 - 1, height);
+                }
                 if name == "c" && parent == "row" {
                     let style = integer(attrs, "s", 0)?;
                     let format = formats
@@ -371,6 +407,110 @@ mod tests {
             output.write_all(xml.as_bytes()).unwrap();
         }
         output.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn xlsx_round_trips_pixel_widths_point_heights_blank_dimensions_and_defaults() {
+        use crate::DimensionAxis::*;
+        let mut book = fixture();
+        book.set_active_sheet(0);
+        for (col, width) in [1.0, 7.0, 12.0, 88.0, 1790.0].into_iter().enumerate() {
+            book.resize_range(Columns, col as u32, col as u32, Some(width))
+                .unwrap();
+        }
+        book.resize_range(Rows, 0, 1, Some(31.5)).unwrap();
+        book.resize_range(Rows, 100, 100, Some(409.5)).unwrap();
+        book.set_active_sheet(1);
+        book.resize_range(Columns, 1, 1, Some(120.0)).unwrap();
+        let restored = reload(&write_xlsx_bytes(&book).unwrap()).unwrap();
+        for index in 0..2 {
+            for col in 0..6 {
+                assert_eq!(
+                    restored.sheets[index].column_width(col),
+                    book.sheets[index].column_width(col)
+                );
+            }
+            for row in [0, 1, 100] {
+                assert_eq!(
+                    restored.sheets[index].row_height(row),
+                    book.sheets[index].row_height(row)
+                );
+            }
+        }
+        assert_eq!(restored.sheets[0].rows, 101);
+        assert_eq!(restored.sheets[0].raw(crate::CellAddr::new(1, 0)), "=A1*2");
+        assert!(restored.sheets[0].format(crate::CellAddr::new(0, 0)).bold);
+        assert!(!restored.is_dirty() && !restored.can_undo());
+        let again = reload(&write_xlsx_bytes(&restored).unwrap()).unwrap();
+        assert_eq!(again.sheets[0].column_width(4), 1790.0);
+        assert_eq!(again.sheets[0].row_height(100), 409.5);
+    }
+
+    #[test]
+    fn imported_sheet_defaults_remain_defaults_after_export() {
+        let bytes = rewrite(&write_xlsx_bytes(&Workbook::new()).unwrap(), |name, xml| {
+            let xml = if name == "xl/worksheets/sheet1.xml" {
+                xml.replace("defaultRowHeight=\"18\"", "defaultRowHeight=\"25.5\"")
+                    .replace(
+                        "defaultColWidth=\"12.571428571428571\"",
+                        "defaultColWidth=\"20\"",
+                    )
+            } else {
+                xml
+            };
+            (name.into(), xml)
+        });
+        let mut loaded = reload(&bytes).unwrap();
+        assert_eq!(
+            loaded
+                .active_sheet()
+                .default_dimension(crate::DimensionAxis::Rows),
+            25.5
+        );
+        assert_eq!(
+            loaded
+                .active_sheet()
+                .default_dimension(crate::DimensionAxis::Columns),
+            140.0
+        );
+        loaded
+            .resize_range(crate::DimensionAxis::Columns, 0, 0, Some(200.0))
+            .unwrap();
+        loaded
+            .resize_range(crate::DimensionAxis::Columns, 0, 0, None)
+            .unwrap();
+        let again = reload(&write_xlsx_bytes(&loaded).unwrap()).unwrap();
+        assert_eq!(
+            again
+                .active_sheet()
+                .default_dimension(crate::DimensionAxis::Columns),
+            140.0
+        );
+        assert_eq!(again.active_sheet().column_width(0), 140.0);
+        assert_eq!(again.active_sheet().row_height(2), 25.5);
+    }
+
+    #[test]
+    fn invalid_size_ranges_non_finite_sizes_and_hidden_rows_fail_the_whole_import() {
+        let mut book = Workbook::new();
+        book.resize_range(crate::DimensionAxis::Rows, 0, 0, Some(30.0))
+            .unwrap();
+        let bytes = write_xlsx_bytes(&book).unwrap();
+        for case in 0..5 {
+            let broken = rewrite(&bytes, |name, mut xml| {
+                if name == "xl/worksheets/sheet1.xml" {
+                    xml = match case {
+                        0 => xml.replace("min=\"1\"", "min=\"0\""),
+                        1 => xml.replace("ht=\"30\"", "ht=\"NaN\""),
+                        2 => xml.replace("ht=\"30\"", "ht=\"410\""),
+                        3 => xml.replace("ht=\"30\"", "ht=\"30\" hidden=\"1\""),
+                        _ => xml.replace("width=\"12.5703125\"", "width=\"inf\""),
+                    };
+                }
+                (name.into(), xml)
+            });
+            assert!(reload(&broken).is_err(), "case {case}");
+        }
     }
 
     #[test]

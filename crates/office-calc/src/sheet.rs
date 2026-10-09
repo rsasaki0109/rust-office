@@ -16,6 +16,8 @@ pub const DEFAULT_COLS: u32 = 26;
 pub struct Sheet {
     pub name: String,
     #[serde(default)]
+    pub(crate) dimensions: crate::dimensions::Dimensions,
+    #[serde(default)]
     formats: HashMap<(u32, u32), crate::CellFormat>,
     #[serde(default)]
     cells: HashMap<(u32, u32), Cell>,
@@ -36,6 +38,7 @@ impl Sheet {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            dimensions: Default::default(),
             formats: HashMap::new(),
             cells: HashMap::new(),
             rows: DEFAULT_ROWS,
@@ -93,6 +96,34 @@ impl Sheet {
         } else {
             self.ensure_bounds(addr);
             self.formats.insert((addr.col, addr.row), format);
+        }
+    }
+
+    pub fn column_width(&self, index: u32) -> f64 {
+        self.dimensions.get(crate::DimensionAxis::Columns, index)
+    }
+    pub fn row_height(&self, index: u32) -> f64 {
+        self.dimensions.get(crate::DimensionAxis::Rows, index)
+    }
+    pub fn default_dimension(&self, axis: crate::DimensionAxis) -> f64 {
+        self.dimensions.default_size(axis)
+    }
+    pub fn dimension_overrides(
+        &self,
+        axis: crate::DimensionAxis,
+    ) -> impl Iterator<Item = (u32, f64)> + '_ {
+        self.dimensions.iter(axis)
+    }
+    pub fn has_custom_dimensions(&self) -> bool {
+        self.dimensions.is_custom()
+    }
+    pub(crate) fn set_dimension(&mut self, axis: crate::DimensionAxis, index: u32, size: f64) {
+        self.dimensions.set(axis, index, size);
+        if size != self.dimensions.default_size(axis) {
+            match axis {
+                crate::DimensionAxis::Columns => self.cols = self.cols.max(index + 1),
+                crate::DimensionAxis::Rows => self.rows = self.rows.max(index + 1),
+            }
         }
     }
 

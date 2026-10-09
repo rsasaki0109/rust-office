@@ -203,7 +203,7 @@ Cancel/Escape leaves the sheet name and sheet list unchanged.
 
 XLSX preserves the resulting sheet names and contents; CSV still stores only one
 sheet. Cross-sheet formulas are not supported yet; rename does not rewrite their
-raw text. Custom row/column sizes remain unimplemented.
+raw text. Row heights and column widths are editable and preserved in XLSX.
 
 The Format menu applies General, two-decimal number, percentage, ISO date,
 bold/italic and Clear Formatting to the selected range as one undoable edit.
@@ -223,6 +223,22 @@ CSV cannot store formatting: Save/Save As refuses a styled workbook and asks for
 XLSX instead, preserving the existing file, destination, draft and dirty state.
 Clipboard copy/paste still exchanges raw text/formulas and retains destination
 presentation; it does not transfer source formatting.
+
+Format → Column Width / Row Height applies a size to all columns/rows intersecting
+the selection, as one Undo/Redo edit. Widths use integer pixels (1–1790), heights
+use points (1–409.5; 1 point is 4/3 screen pixels). Reset to Default restores the
+current sheet default; Cancel/Escape changes no sizes. Opening the dialog commits
+a pending formula-bar draft to its original cell. Clearing cell formatting does
+not reset row/column sizes.
+
+Sizing is sparse. Drawing, hit testing and scrolling share prefix offsets for
+custom sizes and only visit visible cells; there is no offset array per empty row.
+XLSX retains individual/range sizes, blank rows/columns and sheet defaults. Column
+conversion assumes the standard Calibri-11 seven-pixel digit metric and rounds to
+physical pixels. Hidden rows/columns and sizes outside the supported limits reject
+an XLSX import to preserve layout; hiding, merged cells and font-dependent autofit
+remain unsupported. CSV Save/Save As also refuses custom sizes rather than silently
+losing them, preserving the current file, destination and pending edits.
 
 Aggregate functions (`SUM`, `AVERAGE`/`AVG`, `MIN`, `MAX`, `COUNT`) visit only
 stored cells in ranges, in row/column order. Referenced empty cells and text

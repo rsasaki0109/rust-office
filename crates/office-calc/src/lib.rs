@@ -9,6 +9,7 @@ mod cell;
 mod clipboard;
 mod csv;
 mod delimited;
+mod dimensions;
 mod format;
 mod formula;
 mod reference;
@@ -21,6 +22,7 @@ pub use addr::{col_to_letters, parse_a1, parse_a1_range, AddrError, CellAddr, Ce
 pub use cell::{CalcError, Cell, Value};
 pub use clipboard::{ClipboardError, MAX_SHEET_COLS, MAX_SHEET_ROWS};
 pub use csv::{load_csv_path, load_csv_str, sheet_to_csv, write_csv_path, CsvError};
+pub use dimensions::{DimensionAxis, DimensionError, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT};
 pub use format::{CellFormat, FormatChange};
 pub use formula::evaluate_formula;
 pub use reference::translate_formula;

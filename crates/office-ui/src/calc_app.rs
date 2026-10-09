@@ -6,15 +6,15 @@ use eframe::App;
 use egui::{self, Color32, Context, Key, RichText, Sense, Ui, Vec2};
 use office_calc::{
     col_to_letters, load_csv_path, load_xlsx_path, write_csv_path, write_xlsx_path, CellAddr,
-    CellRange, FormatChange, Workbook,
+    CellRange, DimensionAxis, FormatChange, Workbook,
 };
 
 use crate::calc_clipboard::CopiedCells;
+use crate::calc_geometry::GridAxis;
 use crate::theme::{ACCENT, CANVAS_BG, STATUS_BG, TOOLBAR_BG};
 use crate::unsaved::{self, Choice, DocumentAction};
 
-const COL_WIDTH: f32 = 88.0;
-const ROW_HEIGHT: f32 = 24.0;
+const HEADER_HEIGHT: f32 = 24.0;
 const HEADER_W: f32 = 40.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,11 @@ pub enum SwitchTo {
 }
 
 enum SheetDialog {
+    Size {
+        axis: DimensionAxis,
+        value: f64,
+        error: Option<String>,
+    },
     Rename {
         index: usize,
         name: String,
@@ -240,6 +245,37 @@ impl CalcApp {
         }
     }
 
+    fn open_size_dialog(&mut self, axis: DimensionAxis) {
+        self.commit_edit();
+        let sheet = self.workbook.active_sheet();
+        let value = match axis {
+            DimensionAxis::Columns => sheet.column_width(self.active.col),
+            DimensionAxis::Rows => sheet.row_height(self.active.row),
+        };
+        self.sheet_dialog = Some(SheetDialog::Size {
+            axis,
+            value,
+            error: None,
+        });
+    }
+
+    fn resize_selection(
+        &mut self,
+        axis: DimensionAxis,
+        value: Option<f64>,
+    ) -> Result<(), office_calc::DimensionError> {
+        self.commit_edit();
+        let range = self.selection();
+        let (first, last) = match axis {
+            DimensionAxis::Columns => (range.start.col, range.end.col),
+            DimensionAxis::Rows => (range.start.row, range.end.row),
+        };
+        self.workbook.resize_range(axis, first, last, value)?;
+        self.scroll_to_active = true;
+        self.set_status("Row/column size updated");
+        Ok(())
+    }
+
     fn show_sheet_dialog(&mut self, ctx: &Context) {
         let Some(mut dialog) = self.sheet_dialog.take() else {
             return;
@@ -247,6 +283,45 @@ impl CalcApp {
         let mut close = false;
         egui::Modal::new(egui::Id::new("calc_sheet_dialog")).show(ctx, |ui| {
             match &mut dialog {
+                SheetDialog::Size { axis, value, error } => {
+                    let columns = *axis == DimensionAxis::Columns;
+                    ui.heading(if columns {
+                        "Column Width"
+                    } else {
+                        "Row Height"
+                    });
+                    ui.label(format!(
+                        "Apply to {} {}",
+                        self.selection_label(),
+                        if columns { "columns" } else { "rows" }
+                    ));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .range(if columns { 1.0..=1790.0 } else { 1.0..=409.5 })
+                                .speed(if columns { 1.0 } else { 0.25 })
+                                .max_decimals(if columns { 0 } else { 2 }),
+                        );
+                        ui.label(if columns { "pixels" } else { "points" });
+                    });
+                    if let Some(error) = error {
+                        ui.colored_label(Color32::RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        for (label, size) in [("Apply", Some(*value)), ("Reset to Default", None)] {
+                            if ui.button(label).clicked() {
+                                match self.resize_selection(*axis, size) {
+                                    Ok(()) => close = true,
+                                    Err(e) => *error = Some(e.to_string()),
+                                }
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+
                 SheetDialog::Rename {
                     index,
                     name,
@@ -582,10 +657,10 @@ impl CalcApp {
                 .workbook
                 .sheets
                 .iter()
-                .any(|sheet| sheet.has_formatting())
+                .any(|sheet| sheet.has_formatting() || sheet.has_custom_dimensions())
         {
             self.set_error(
-                "Save failed: CSV does not store cell formatting. Choose XLSX to preserve it.",
+                "Save failed: CSV does not store cell formatting or row/column sizes. Choose XLSX to preserve it.",
             );
             return false;
         }
@@ -714,6 +789,15 @@ impl CalcApp {
                     ui.close();
                 }
                 ui.separator();
+                if ui.button("Column Width…").clicked() {
+                    self.open_size_dialog(DimensionAxis::Columns);
+                    ui.close();
+                }
+                if ui.button("Row Height…").clicked() {
+                    self.open_size_dialog(DimensionAxis::Rows);
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("Clear Formatting").clicked() {
                     self.format_selection(FormatChange::Clear);
                     ui.close();
@@ -800,19 +884,21 @@ impl CalcApp {
     fn grid(&mut self, ui: &mut Ui) {
         let cols = self.workbook.active_sheet().cols;
         let rows = self.workbook.active_sheet().rows;
+        let columns = GridAxis::new(self.workbook.active_sheet(), DimensionAxis::Columns);
+        let row_sizes = GridAxis::new(self.workbook.active_sheet(), DimensionAxis::Rows);
         // Only paint the visible cells; imported/pasted sheets can exceed the
         // old 40-column/80-row display limit without creating millions of widgets.
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 let size = Vec2::new(
-                    HEADER_W + cols as f32 * COL_WIDTH,
-                    (rows + 1) as f32 * ROW_HEIGHT,
+                    HEADER_W + columns.total(),
+                    HEADER_HEIGHT + row_sizes.total(),
                 );
                 let (grid_rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 let origin = grid_rect.min;
                 let cells_rect = egui::Rect::from_min_max(
-                    origin + Vec2::new(HEADER_W, ROW_HEIGHT),
+                    origin + Vec2::new(HEADER_W, HEADER_HEIGHT),
                     grid_rect.max,
                 );
                 let response = ui.interact(
@@ -821,12 +907,10 @@ impl CalcApp {
                     Sense::click_and_drag(),
                 );
                 let cell_at = |pos: egui::Pos2| {
-                    let offset = pos - origin - Vec2::new(HEADER_W, ROW_HEIGHT);
+                    let offset = pos - origin - Vec2::new(HEADER_W, HEADER_HEIGHT);
                     CellAddr::new(
-                        (offset.x / COL_WIDTH).floor().clamp(0.0, (cols - 1) as f32) as u32,
-                        (offset.y / ROW_HEIGHT)
-                            .floor()
-                            .clamp(0.0, (rows - 1) as f32) as u32,
+                        columns.index_at(f64::from(offset.x)),
+                        row_sizes.index_at(f64::from(offset.y)),
                     )
                 };
                 if ui.is_enabled() {
@@ -851,29 +935,33 @@ impl CalcApp {
                 if self.scroll_to_active {
                     let min = origin
                         + Vec2::new(
-                            HEADER_W + self.active.col as f32 * COL_WIDTH,
-                            (self.active.row + 1) as f32 * ROW_HEIGHT,
+                            HEADER_W + columns.position(self.active.col) as f32,
+                            HEADER_HEIGHT + row_sizes.position(self.active.row) as f32,
                         );
                     ui.scroll_to_rect(
-                        egui::Rect::from_min_size(min, Vec2::new(COL_WIDTH, ROW_HEIGHT)),
+                        egui::Rect::from_min_size(
+                            min,
+                            Vec2::new(
+                                columns.size(self.active.col),
+                                row_sizes.size(self.active.row),
+                            ),
+                        ),
                         None,
                     );
                     self.scroll_to_active = false;
                 }
-                let first_col = ((viewport.min.x - HEADER_W) / COL_WIDTH).floor().max(0.0) as u32;
+                let first_col = columns.index_at(f64::from(viewport.min.x - HEADER_W));
                 let last_col =
-                    (((viewport.max.x - HEADER_W) / COL_WIDTH).ceil().max(0.0) as u32).min(cols);
-                let first_row = ((viewport.min.y - ROW_HEIGHT) / ROW_HEIGHT)
-                    .floor()
-                    .max(0.0) as u32;
+                    (columns.index_at(f64::from(viewport.max.x - HEADER_W)) + 1).min(cols);
+                let first_row = row_sizes.index_at(f64::from(viewport.min.y - HEADER_HEIGHT));
                 let last_row =
-                    (((viewport.max.y - ROW_HEIGHT) / ROW_HEIGHT).ceil().max(0.0) as u32).min(rows);
+                    (row_sizes.index_at(f64::from(viewport.max.y - HEADER_HEIGHT)) + 1).min(rows);
                 let painter = ui.painter();
                 let selection = self.selection();
                 for col in first_col..last_col {
                     let rect = egui::Rect::from_min_size(
-                        origin + Vec2::new(HEADER_W + col as f32 * COL_WIDTH, 0.0),
-                        Vec2::new(COL_WIDTH, ROW_HEIGHT),
+                        origin + Vec2::new(HEADER_W + columns.position(col) as f32, 0.0),
+                        Vec2::new(columns.size(col), HEADER_HEIGHT),
                     );
                     painter.rect_filled(rect, 0.0, Color32::from_gray(230));
                     painter.text(
@@ -885,10 +973,10 @@ impl CalcApp {
                     );
                 }
                 for row in first_row..last_row {
-                    let top = origin.y + (row + 1) as f32 * ROW_HEIGHT;
+                    let top = origin.y + HEADER_HEIGHT + row_sizes.position(row) as f32;
                     let header = egui::Rect::from_min_size(
                         egui::pos2(origin.x, top),
-                        Vec2::new(HEADER_W, ROW_HEIGHT),
+                        Vec2::new(HEADER_W, row_sizes.size(row)),
                     );
                     painter.rect_filled(header, 0.0, Color32::from_gray(230));
                     painter.text(
@@ -901,8 +989,8 @@ impl CalcApp {
                     for col in first_col..last_col {
                         let addr = CellAddr::new(col, row);
                         let rect = egui::Rect::from_min_size(
-                            egui::pos2(origin.x + HEADER_W + col as f32 * COL_WIDTH, top),
-                            Vec2::new(COL_WIDTH, ROW_HEIGHT),
+                            egui::pos2(origin.x + HEADER_W + columns.position(col) as f32, top),
+                            Vec2::new(columns.size(col), row_sizes.size(row)),
                         );
                         let bg = if selection.contains(addr) {
                             Color32::from_rgb(210, 230, 255)
@@ -1149,6 +1237,150 @@ fn writable_extension(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resized_selection_round_trips_and_undo_restores_saved_state() {
+        let mut app = CalcApp::new();
+        draft(&mut app, "日本語");
+        app.selection_end = CellAddr::new(1, 1);
+        app.resize_selection(DimensionAxis::Columns, Some(160.0))
+            .unwrap();
+        app.resize_selection(DimensionAxis::Rows, Some(31.5))
+            .unwrap();
+        assert!(!app.editing);
+        assert_eq!(
+            app.workbook.active_sheet().raw(CellAddr::new(0, 0)),
+            "日本語"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sizes.xlsx");
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.active_sheet().column_width(1), 160.0);
+        assert_eq!(loaded.active_sheet().row_height(1), 31.5);
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+        app.resize_selection(DimensionAxis::Columns, None).unwrap();
+        assert_eq!(
+            app.workbook.active_sheet().column_width(0),
+            office_calc::DEFAULT_COLUMN_WIDTH
+        );
+        app.history(false);
+        assert_eq!(app.workbook.active_sheet().column_width(0), 160.0);
+    }
+
+    #[test]
+    fn csv_save_cannot_drop_dimensions_or_pending_draft() {
+        let mut app = CalcApp::new();
+        app.resize_selection(DimensionAxis::Rows, Some(40.0))
+            .unwrap();
+        assert!(!app.workbook.active_sheet().has_formatting());
+        draft(&mut app, "keep this draft");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.csv");
+        std::fs::write(&path, "original bytes").unwrap();
+        assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original bytes");
+        assert!(app.editing && app.is_dirty());
+        assert_eq!(app.edit_buf, "keep this draft");
+        assert!(app.file_path.is_none());
+        assert!(app
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("row/column sizes"));
+    }
+
+    #[test]
+    fn cancelling_size_dialog_does_not_resize_or_edit_cells() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        for axis in [DimensionAxis::Columns, DimensionAxis::Rows] {
+            app.open_size_dialog(axis);
+            for events in [
+                vec![],
+                vec![egui::Event::Text("123".into())],
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![],
+                vec![],
+            ] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.handle_keys(ui.ctx());
+                        app.show_sheet_dialog(ui.ctx());
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert!(app.sheet_dialog.is_none());
+            assert!(!app.workbook.active_sheet().has_custom_dimensions());
+            assert_eq!(app.workbook.active_sheet().raw(app.active), "Item");
+            assert!(!app.is_dirty() && !app.workbook.can_undo());
+        }
+    }
+
+    #[test]
+    fn resized_grid_pointer_selects_the_cell_at_its_new_position() {
+        let mut app = CalcApp::new();
+        app.resize_selection(DimensionAxis::Columns, Some(160.0))
+            .unwrap();
+        app.resize_selection(DimensionAxis::Rows, Some(36.0))
+            .unwrap();
+        app.scroll_to_active = false;
+        let ctx = Context::default();
+        let mut origin = egui::Pos2::ZERO;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    origin = ui.cursor().min;
+                    app.grid(ui);
+                });
+            },
+        );
+        output.textures_delta.clear();
+        let pos = origin + egui::vec2(HEADER_W + 160.0 + 20.0, HEADER_HEIGHT + 48.0 + 10.0);
+        for pressed in [true, false] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.grid(ui));
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert_eq!(app.active, CellAddr::new(1, 1));
+        assert_eq!(app.edit_buf, "3");
+    }
 
     #[test]
     fn formatting_commits_draft_preserves_formulas_and_reloads_from_xlsx() {

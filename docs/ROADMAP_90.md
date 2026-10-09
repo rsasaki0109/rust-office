@@ -52,6 +52,9 @@
 - [x] 範囲編集、相対／絶対参照コピー、Undo/Redo、CSV / XLSX の基本入出力が機能する。
 - [ ] セルの数値／日付書式、基本装飾、列幅・行高、シート名変更・削除を扱い、
   XLSX の再読込で維持する。削除確認と Undo/Redo も確認する。
+  シート管理 [PR #13](https://github.com/rsasaki0109/rust-office/pull/13)、
+  セル書式 [PR #14](https://github.com/rsasaki0109/rust-office/pull/14)、
+  行高・列幅 [PR #15](https://github.com/rsasaki0109/rust-office/pull/15) が進行中。
 - [ ] シートをまたぐ参照・集計と、棒／折れ線グラフの作成・更新・保存を備える。
 
 ### Impress（20点）
