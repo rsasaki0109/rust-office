@@ -60,6 +60,11 @@ pub fn write_odt_package<W: Write + Seek>(
 pub fn build_content_and_pictures(
     document: &Document,
 ) -> Result<(String, Vec<PackageImage>), FormatError> {
+    if document.sections.is_empty() || document.sections.iter().any(|s| !s.page_style.is_valid()) {
+        return Err(FormatError::InvalidDocument(
+            "Invalid section paper size or margins".into(),
+        ));
+    }
     let mut pictures = Vec::new();
     let mut image_hrefs: Vec<Option<String>> = Vec::new();
 
@@ -107,24 +112,16 @@ pub fn build_content_xml(document: &Document) -> String {
     build_content_xml_with_images(document, &hrefs)
 }
 
-fn flatten_sections_for_export(document: &Document) -> Vec<Block> {
-    let mut out = Vec::new();
-    for (i, section) in document.sections.iter().enumerate() {
-        if i > 0 {
-            out.push(Block::PageBreak);
-        }
-        out.extend(section.blocks.iter().cloned());
-    }
-    out
-}
-
 fn build_content_xml_with_images(document: &Document, image_hrefs: &[Option<String>]) -> String {
     let mut text_styles: HashMap<TextStyleKey, String> = HashMap::new();
     let mut para_styles: HashMap<ParaStyleKey, String> = HashMap::new();
     let mut auto = String::new();
 
-    // Flatten sections with page breaks between them for ODT export (lossy vs true sections).
-    let blocks = flatten_sections_for_export(document);
+    let blocks: Vec<_> = document
+        .sections
+        .iter()
+        .flat_map(|s| s.blocks.iter())
+        .collect();
 
     for block in &blocks {
         match block {
@@ -156,46 +153,91 @@ fn build_content_xml_with_images(document: &Document, image_hrefs: &[Option<Stri
 
     let mut body = String::new();
     let mut image_i = 0usize;
-    let mut i = 0usize;
-    while i < blocks.len() {
-        match &blocks[i] {
-            Block::Paragraph(para) if para.style.list.is_some() => {
-                let kind = para.style.list.unwrap().kind;
-                let level = para.style.list.unwrap().level;
-                i = append_nested_list(
-                    &mut body,
-                    &blocks,
-                    i,
-                    level,
-                    kind,
-                    &para_styles,
-                    &text_styles,
-                );
-            }
-            Block::Paragraph(para) => {
-                append_paragraph(&mut body, para, &para_styles, &text_styles);
-                i += 1;
-            }
-            Block::Table(table) => {
-                append_table(&mut body, table, &para_styles, &text_styles);
-                i += 1;
-            }
-            Block::Image(image) => {
-                let href = image_hrefs.get(image_i).and_then(|h| h.as_ref());
-                image_i += 1;
-                if let Some(href) = href {
-                    append_image_frame(&mut body, image, href);
-                } else {
-                    let label = format!("[Image: {}]", image.display_name());
-                    let placeholder = Paragraph::from_text(label);
-                    append_paragraph(&mut body, &placeholder, &para_styles, &text_styles);
+    for (section_index, section) in document.sections.iter().enumerate() {
+        let blocks = &section.blocks;
+        let start = body.len();
+        let mut i = 0usize;
+        while i < blocks.len() {
+            match &blocks[i] {
+                Block::Paragraph(para) if para.style.list.is_some() => {
+                    let kind = para.style.list.unwrap().kind;
+                    let level = para.style.list.unwrap().level;
+                    i = append_nested_list(
+                        &mut body,
+                        blocks,
+                        i,
+                        level,
+                        kind,
+                        &para_styles,
+                        &text_styles,
+                    );
                 }
-                i += 1;
+                Block::Paragraph(para) => {
+                    append_paragraph(&mut body, para, &para_styles, &text_styles);
+                    i += 1;
+                }
+                Block::Table(table) => {
+                    append_table(&mut body, table, &para_styles, &text_styles);
+                    i += 1;
+                }
+                Block::Image(image) => {
+                    let href = image_hrefs.get(image_i).and_then(|h| h.as_ref());
+                    image_i += 1;
+                    if let Some(href) = href {
+                        append_image_frame(&mut body, image, href);
+                    } else {
+                        let label = format!("[Image: {}]", image.display_name());
+                        let placeholder = Paragraph::from_text(label);
+                        append_paragraph(&mut body, &placeholder, &para_styles, &text_styles);
+                    }
+                    i += 1;
+                }
+                Block::PageBreak => {
+                    body.push_str("<text:p text:style-name=\"P_pagebreak\"/>");
+                    i += 1;
+                }
             }
-            Block::PageBreak => {
-                body.push_str("<text:p text:style-name=\"P_pagebreak\"/>");
-                i += 1;
-            }
+        }
+
+        let marker = !matches!(blocks.first(), Some(Block::Paragraph(_)));
+        let alias = format!(
+            "RustOfficeSection{}{}",
+            if marker { "Marker" } else { "Start" },
+            section_index + 1
+        );
+        let parent = if let Some(Block::Paragraph(p)) = blocks.first() {
+            odt_paragraph_style_name(p, &para_styles)
+        } else {
+            "Standard".into()
+        };
+        let alignment = if let Some(Block::Paragraph(p)) = blocks.first() {
+            p.style.alignment
+        } else {
+            Alignment::Left
+        };
+        let alignment = match alignment {
+            Alignment::Center => "center",
+            Alignment::Right => "end",
+            Alignment::Justify => "justify",
+            Alignment::Left => "start",
+        };
+        let break_before = if section_index > 0 {
+            " fo:break-before=\"page\""
+        } else {
+            ""
+        };
+        auto.push_str(&format!("<style:style style:name=\"{alias}\" style:family=\"paragraph\" style:parent-style-name=\"{parent}\" style:master-page-name=\"{}\"><style:paragraph-properties fo:text-align=\"{alignment}\"{break_before}/></style:style>", master_name(section_index)));
+        if marker {
+            body.insert_str(start, &format!("<text:p text:style-name=\"{alias}\"/>"));
+        } else {
+            let paragraph_start = start + body[start..].find("<text:p ").expect("paragraph");
+            let at = paragraph_start
+                + body[paragraph_start..]
+                    .find("text:style-name=\"")
+                    .expect("paragraph style")
+                + "text:style-name=\"".len();
+            let end = at + body[at..].find('"').unwrap();
+            body.replace_range(at..end, &alias);
         }
     }
 
@@ -571,41 +613,62 @@ fn manifest_xml(pictures: &[PackageImage]) -> String {
     entries
 }
 
+fn master_name(index: usize) -> String {
+    if index == 0 {
+        "Standard".into()
+    } else {
+        format!("RustOfficeMaster{}", index + 1)
+    }
+}
+
 fn styles_xml(document: &Document) -> String {
-    let header_xml = document
-        .header()
-        .map(|p| format!("<style:header>{}</style:header>", paragraph_plain_xml(p)))
-        .unwrap_or_default();
-    let footer_xml = document
-        .footer()
-        .map(|p| format!("<style:footer>{}</style:footer>", paragraph_plain_xml(p)))
-        .unwrap_or_default();
+    let mut automatic = String::new();
+    let mut masters = String::new();
+    let mut text_styles = HashMap::new();
+    let mut para_styles = HashMap::new();
+    for (index, section) in document.sections.iter().enumerate() {
+        let page = &section.page_style;
+        let layout = format!("Mpm{}", index + 1);
+        let orientation = if page.width > page.height {
+            "landscape"
+        } else {
+            "portrait"
+        };
+        automatic.push_str(&format!("<style:page-layout style:name=\"{layout}\"><style:page-layout-properties fo:page-width=\"{}pt\" fo:page-height=\"{}pt\" fo:margin-top=\"{}pt\" fo:margin-bottom=\"{}pt\" fo:margin-left=\"{}pt\" fo:margin-right=\"{}pt\" style:print-orientation=\"{orientation}\"/></style:page-layout>", page.width, page.height, page.margin_top, page.margin_bottom, page.margin_left, page.margin_right));
+        masters.push_str(&format!(
+            "<style:master-page style:name=\"{}\" style:page-layout-name=\"{layout}\">",
+            master_name(index)
+        ));
+        for (tag, paragraph) in [
+            ("header", document.section_header(index)),
+            ("footer", document.section_footer(index)),
+        ] {
+            if let Some(paragraph) = paragraph {
+                ensure_para_style(&mut para_styles, &mut automatic, paragraph.style.alignment);
+                for run in &paragraph.runs {
+                    ensure_text_style(&mut text_styles, &mut automatic, &run.style);
+                }
+                masters.push_str(&format!("<style:{tag}>"));
+                append_paragraph(&mut masters, paragraph, &para_styles, &text_styles);
+                masters.push_str(&format!("</style:{tag}>"));
+            }
+        }
+        masters.push_str("</style:master-page>");
+    }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">
  <office:styles>
   <style:style style:name="Standard" style:family="paragraph" style:class="text"/>
   <style:style style:name="Heading1" style:family="paragraph" style:parent-style-name="Standard" style:class="text" style:default-outline-level="1"><style:paragraph-properties fo:margin-bottom="0.35cm"/><style:text-properties fo:font-size="20pt" fo:font-weight="bold"/></style:style>
   <style:style style:name="Heading2" style:family="paragraph" style:parent-style-name="Standard" style:class="text" style:default-outline-level="2"><style:paragraph-properties fo:margin-bottom="0.25cm"/><style:text-properties fo:font-size="16pt" fo:font-weight="bold"/></style:style>
   <style:style style:name="Heading3" style:family="paragraph" style:parent-style-name="Standard" style:class="text" style:default-outline-level="3"><style:paragraph-properties fo:margin-bottom="0.2cm"/><style:text-properties fo:font-size="14pt" fo:font-weight="bold"/></style:style>
  </office:styles>
- <office:master-styles>
-  <style:master-page style:name="Standard" style:page-layout-name="Mpm1">
-   {header_xml}{footer_xml}
-  </style:master-page>
- </office:master-styles>
+ <office:automatic-styles>{automatic}</office:automatic-styles>
+ <office:master-styles>{masters}</office:master-styles>
 </office:document-styles>
 "#
     )
-}
-
-fn paragraph_plain_xml(para: &Paragraph) -> String {
-    let mut out = String::from("<text:p>");
-    for run in &para.runs {
-        out.push_str(&escape_xml(&run.text));
-    }
-    out.push_str("</text:p>");
-    out
 }
 
 fn meta_xml(document: &Document) -> String {

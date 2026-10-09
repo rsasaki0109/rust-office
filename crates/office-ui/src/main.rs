@@ -9,6 +9,7 @@ mod fonts;
 mod impress_app;
 mod impress_recovery;
 mod office;
+mod page_setup;
 mod print_sys;
 mod recovery;
 mod slideshow;

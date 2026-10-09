@@ -105,22 +105,54 @@ impl DocumentEditor {
         Ok(())
     }
 
-    /// Edit the document header (creates an empty header if missing).
-    pub fn focus_header(&mut self, offset: usize) {
-        let len = self.document.ensure_header_mut().char_len();
-        self.edit_focus = EditFocus::Header;
-        self.selection = Selection::caret(DocPosition::new(0, offset.min(len)));
-        self.dirty = true;
-        self.sync_typing_style_from_caret();
+    pub fn current_section(&self) -> usize {
+        match self.edit_focus {
+            EditFocus::Body => self
+                .document
+                .locate_paragraph(self.selection.focus.paragraph)
+                .map(|(section, _)| section)
+                .unwrap_or(0),
+            EditFocus::Cell(address) => address.section,
+            EditFocus::Header(section) | EditFocus::Footer(section) => section,
+        }
     }
 
-    /// Edit the document footer (creates an empty footer if missing).
+    pub fn focus_header(&mut self, offset: usize) {
+        let _ = self.focus_section_header(0, offset);
+    }
+
     pub fn focus_footer(&mut self, offset: usize) {
-        let len = self.document.ensure_footer_mut().char_len();
-        self.edit_focus = EditFocus::Footer;
+        let _ = self.focus_section_footer(0, offset);
+    }
+
+    pub fn focus_section_header(&mut self, section: usize, offset: usize) -> Result<(), EditError> {
+        if section >= self.document.sections.len() {
+            return Err(EditError::InvalidSection);
+        }
+        let len = self
+            .document
+            .section_header(section)
+            .map(|p| p.char_len())
+            .unwrap_or(0);
+        self.edit_focus = EditFocus::Header(section);
         self.selection = Selection::caret(DocPosition::new(0, offset.min(len)));
-        self.dirty = true;
         self.sync_typing_style_from_caret();
+        Ok(())
+    }
+
+    pub fn focus_section_footer(&mut self, section: usize, offset: usize) -> Result<(), EditError> {
+        if section >= self.document.sections.len() {
+            return Err(EditError::InvalidSection);
+        }
+        let len = self
+            .document
+            .section_footer(section)
+            .map(|p| p.char_len())
+            .unwrap_or(0);
+        self.edit_focus = EditFocus::Footer(section);
+        self.selection = Selection::caret(DocPosition::new(0, offset.min(len)));
+        self.sync_typing_style_from_caret();
+        Ok(())
     }
 
     pub fn set_selection(&mut self, selection: Selection) {
@@ -212,8 +244,8 @@ impl DocumentEditor {
         match self.edit_focus {
             EditFocus::Body => self.document.paragraph(pos.paragraph),
             EditFocus::Cell(addr) => self.document.cell_paragraph(addr),
-            EditFocus::Header => self.document.header(),
-            EditFocus::Footer => self.document.footer(),
+            EditFocus::Header(section) => self.document.section_header(section),
+            EditFocus::Footer(section) => self.document.section_footer(section),
         }
     }
 
@@ -221,8 +253,8 @@ impl DocumentEditor {
         match self.edit_focus {
             EditFocus::Body => self.document.paragraph_mut(pos.paragraph),
             EditFocus::Cell(addr) => self.document.cell_paragraph_mut(addr),
-            EditFocus::Header => Some(self.document.ensure_header_mut()),
-            EditFocus::Footer => Some(self.document.ensure_footer_mut()),
+            EditFocus::Header(section) => self.document.ensure_section_header_mut(section),
+            EditFocus::Footer(section) => self.document.ensure_section_footer_mut(section),
         }
     }
 
@@ -247,12 +279,20 @@ impl DocumentEditor {
                     .unwrap_or(0);
                 DocPosition::new(0, pos.offset.min(len))
             }
-            EditFocus::Header => {
-                let len = self.document.header().map(|p| p.char_len()).unwrap_or(0);
+            EditFocus::Header(section) => {
+                let len = self
+                    .document
+                    .section_header(section)
+                    .map(|p| p.char_len())
+                    .unwrap_or(0);
                 DocPosition::new(0, pos.offset.min(len))
             }
-            EditFocus::Footer => {
-                let len = self.document.footer().map(|p| p.char_len()).unwrap_or(0);
+            EditFocus::Footer(section) => {
+                let len = self
+                    .document
+                    .section_footer(section)
+                    .map(|p| p.char_len())
+                    .unwrap_or(0);
                 DocPosition::new(0, pos.offset.min(len))
             }
         }
@@ -1480,6 +1520,46 @@ mod tests {
     use crate::style::Alignment;
 
     #[test]
+    fn editing_inherited_margin_is_local_and_undo_restores_inheritance() {
+        let mut document = Document::with_text("Body");
+        document.sections[0].header = Some(Paragraph::from_text("Inherited"));
+        document.sections.push(document.sections[0].clone());
+        document.sections[1].header = None;
+        let before = document.clone();
+        let mut editor = DocumentEditor::new(document);
+        editor.focus_section_header(1, 9).unwrap();
+        assert!(!editor.is_dirty() && !editor.can_undo());
+        assert_eq!(editor.current_section(), 1);
+        editor.insert_text(" local").unwrap();
+        assert_eq!(
+            editor.document().section_header(1).unwrap().plain_text(),
+            "Inherited local"
+        );
+        assert_eq!(
+            editor.document().header().unwrap().plain_text(),
+            "Inherited"
+        );
+        assert!(editor.undo());
+        assert_eq!(editor.document(), &before);
+        assert_eq!(editor.edit_focus(), EditFocus::Header(1));
+        assert!(editor.redo());
+        assert_eq!(
+            editor.focus_section_footer(100, 0),
+            Err(EditError::InvalidSection)
+        );
+        assert_eq!(editor.edit_focus(), EditFocus::Header(1));
+        editor
+            .set_section_settings(
+                1,
+                PageStyle::default(),
+                Some(Paragraph::from_text("X")),
+                None,
+            )
+            .unwrap();
+        assert_eq!(editor.selection().focus.offset, 1);
+    }
+
+    #[test]
     fn section_settings_are_atomic_and_preserve_other_sections() {
         let mut ed = DocumentEditor::default();
         ed.set_header_text("Inherited").unwrap();
@@ -1748,7 +1828,7 @@ mod tests {
     fn header_footer_in_place_edit() {
         let mut ed = DocumentEditor::default();
         ed.focus_header(0);
-        assert_eq!(ed.edit_focus(), EditFocus::Header);
+        assert_eq!(ed.edit_focus(), EditFocus::Header(0));
         ed.insert_text("Title").unwrap();
         assert_eq!(ed.document().header().unwrap().plain_text(), "Title");
         ed.focus_footer(0);

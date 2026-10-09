@@ -4,7 +4,7 @@ use std::io::{Seek, Write};
 
 use office_core::{
     extension_for_mime, mime_from_path, Alignment, Block, Document, Image, ImageSource, ListKind,
-    NamedParagraphStyle, Paragraph, Table, TextStyle,
+    NamedParagraphStyle, PageStyle, Paragraph, Table, TextStyle,
 };
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -23,8 +23,8 @@ struct MediaFile {
 enum RelKind {
     Hyperlink(String),
     Image { target: String },
-    Header,
-    Footer,
+    Header(usize),
+    Footer(usize),
 }
 
 pub fn write_docx_package<W: Write + Seek>(
@@ -54,12 +54,12 @@ pub fn write_docx_package<W: Write + Seek>(
     zip.start_file("word/_rels/document.xml.rels", deflated)?;
     zip.write_all(package.document_rels.as_bytes())?;
 
-    if let Some(ref header) = package.header_xml {
-        zip.start_file("word/header1.xml", deflated)?;
+    for (index, header) in package.header_xml.iter().enumerate() {
+        zip.start_file(format!("word/header{}.xml", index + 1), deflated)?;
         zip.write_all(header.as_bytes())?;
     }
-    if let Some(ref footer) = package.footer_xml {
-        zip.start_file("word/footer1.xml", deflated)?;
+    for (index, footer) in package.footer_xml.iter().enumerate() {
+        zip.start_file(format!("word/footer{}.xml", index + 1), deflated)?;
         zip.write_all(footer.as_bytes())?;
     }
 
@@ -87,8 +87,8 @@ struct Package {
     document_rels: String,
     content_types: String,
     media: Vec<Option<MediaFile>>,
-    header_xml: Option<String>,
-    footer_xml: Option<String>,
+    header_xml: Vec<String>,
+    footer_xml: Vec<String>,
 }
 
 fn build_package(document: &Document) -> Result<Package, FormatError> {
@@ -96,11 +96,15 @@ fn build_package(document: &Document) -> Result<Package, FormatError> {
     let mut rels: Vec<RelKind> = Vec::new();
     let mut body = String::new();
     let mut image_i = 0usize;
+    let mut header_xml = Vec::new();
+    let mut footer_xml = Vec::new();
+    if document.sections.is_empty() || document.sections.iter().any(|s| !s.page_style.is_valid()) {
+        return Err(FormatError::InvalidDocument(
+            "Invalid section page geometry".into(),
+        ));
+    }
 
     for (sec_i, section) in document.sections.iter().enumerate() {
-        if sec_i > 0 {
-            body.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
-        }
         for block in &section.blocks {
             match block {
                 Block::Paragraph(para) => append_paragraph(&mut body, para, &mut rels),
@@ -123,43 +127,33 @@ fn build_package(document: &Document) -> Result<Package, FormatError> {
                 }
             }
         }
-    }
-
-    if body.is_empty() {
-        body.push_str("<w:p/>");
-    }
-
-    let header_xml = document.header().and_then(|p| {
-        let t = p.plain_text();
-        if t.is_empty() {
-            None
+        let blank = Paragraph::empty();
+        let header = document
+            .section_header(sec_i)
+            .or_else(|| (sec_i > 0).then_some(&blank));
+        let footer = document
+            .section_footer(sec_i)
+            .or_else(|| (sec_i > 0).then_some(&blank));
+        let header_rid = header.map(|paragraph| {
+            header_xml.push(hf_part_xml("hdr", paragraph));
+            rels.push(RelKind::Header(header_xml.len()));
+            rels.len()
+        });
+        let footer_rid = footer.map(|paragraph| {
+            footer_xml.push(hf_part_xml("ftr", paragraph));
+            rels.push(RelKind::Footer(footer_xml.len()));
+            rels.len()
+        });
+        let properties = sect_pr(&section.page_style, header_rid, footer_rid);
+        if sec_i + 1 == document.sections.len() {
+            body.push_str(&properties);
+        } else if matches!(section.blocks.last(), Some(Block::Paragraph(_))) {
+            let at = body.rfind("</w:pPr>").expect("paragraph properties");
+            body.insert_str(at, &properties);
         } else {
-            Some(hf_part_xml("hdr", p))
+            body.push_str(&format!("<w:p><w:pPr><w:pStyle w:val=\"RustOfficeSectionBreak\"/>{properties}</w:pPr></w:p>"));
         }
-    });
-    let footer_xml = document.footer().and_then(|p| {
-        let t = p.plain_text();
-        if t.is_empty() {
-            None
-        } else {
-            Some(hf_part_xml("ftr", p))
-        }
-    });
-
-    let header_rid = if header_xml.is_some() {
-        rels.push(RelKind::Header);
-        Some(rels.len())
-    } else {
-        None
-    };
-    let footer_rid = if footer_xml.is_some() {
-        rels.push(RelKind::Footer);
-        Some(rels.len())
-    } else {
-        None
-    };
-
-    body.push_str(&sect_pr(document, header_rid, footer_rid));
+    }
 
     let document_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -171,7 +165,7 @@ fn build_package(document: &Document) -> Result<Package, FormatError> {
     );
 
     let document_rels = build_rels_xml(&rels);
-    let content_types = build_content_types(&media, header_xml.is_some(), footer_xml.is_some());
+    let content_types = build_content_types(&media, header_xml.len(), footer_xml.len());
 
     Ok(Package {
         document_xml,
@@ -244,15 +238,15 @@ fn build_rels_xml(rels: &[RelKind]) -> String {
                     escape_xml(target)
                 ));
             }
-            RelKind::Header => {
+            RelKind::Header(index) => {
                 out.push_str(&format!(
-                    r#"<Relationship Id="rId{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+                    r#"<Relationship Id="rId{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header{index}.xml"/>
 "#
                 ));
             }
-            RelKind::Footer => {
+            RelKind::Footer(index) => {
                 out.push_str(&format!(
-                    r#"<Relationship Id="rId{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
+                    r#"<Relationship Id="rId{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer{index}.xml"/>
 "#
                 ));
             }
@@ -262,7 +256,7 @@ fn build_rels_xml(rels: &[RelKind]) -> String {
     out
 }
 
-fn build_content_types(media: &[Option<MediaFile>], has_header: bool, has_footer: bool) -> String {
+fn build_content_types(media: &[Option<MediaFile>], headers: usize, footers: usize) -> String {
     let mut defaults = String::from(
         r#"  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
@@ -292,17 +286,13 @@ fn build_content_types(media: &[Option<MediaFile>], has_header: bool, has_footer
   <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
 "#,
     );
-    if has_header {
-        overrides.push_str(
-            r#"  <Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
-"#,
-        );
+    for index in 1..=headers {
+        overrides.push_str(&format!(r#"  <Override PartName="/word/header{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>
+"#));
     }
-    if has_footer {
-        overrides.push_str(
-            r#"  <Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>
-"#,
-        );
+    for index in 1..=footers {
+        overrides.push_str(&format!(r#"  <Override PartName="/word/footer{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>
+"#));
     }
 
     format!(
@@ -313,8 +303,7 @@ fn build_content_types(media: &[Option<MediaFile>], has_header: bool, has_footer
     )
 }
 
-fn sect_pr(document: &Document, header_rid: Option<usize>, footer_rid: Option<usize>) -> String {
-    let page = document.page_style();
+fn sect_pr(page: &PageStyle, header_rid: Option<usize>, footer_rid: Option<usize>) -> String {
     // OOXML uses twentieths of a point (dxa): 1 pt = 20 dxa.
     let w = (page.width * 20.0).round() as i32;
     let h = (page.height * 20.0).round() as i32;
@@ -333,8 +322,13 @@ fn sect_pr(document: &Document, header_rid: Option<usize>, footer_rid: Option<us
             r#"<w:footerReference w:type="default" r:id="rId{id}"/>"#
         ));
     }
+    let orientation = if page.width > page.height {
+        "landscape"
+    } else {
+        "portrait"
+    };
     format!(
-        r#"<w:sectPr>{refs}<w:pgSz w:w="{w}" w:h="{h}"/><w:pgMar w:top="{top}" w:right="{right}" w:bottom="{bottom}" w:left="{left}" w:header="720" w:footer="720"/></w:sectPr>"#
+        r#"<w:sectPr>{refs}<w:type w:val="nextPage"/><w:pgSz w:w="{w}" w:h="{h}" w:orient="{orientation}"/><w:pgMar w:top="{top}" w:right="{right}" w:bottom="{bottom}" w:left="{left}" w:header="720" w:footer="720"/></w:sectPr>"#
     )
 }
 

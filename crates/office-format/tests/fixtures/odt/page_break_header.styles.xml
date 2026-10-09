@@ -1,14 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">
  <office:styles>
   <style:style style:name="Standard" style:family="paragraph" style:class="text"/>
   <style:style style:name="Heading1" style:family="paragraph" style:parent-style-name="Standard" style:class="text" style:default-outline-level="1"><style:paragraph-properties fo:margin-bottom="0.35cm"/><style:text-properties fo:font-size="20pt" fo:font-weight="bold"/></style:style>
   <style:style style:name="Heading2" style:family="paragraph" style:parent-style-name="Standard" style:class="text" style:default-outline-level="2"><style:paragraph-properties fo:margin-bottom="0.25cm"/><style:text-properties fo:font-size="16pt" fo:font-weight="bold"/></style:style>
   <style:style style:name="Heading3" style:family="paragraph" style:parent-style-name="Standard" style:class="text" style:default-outline-level="3"><style:paragraph-properties fo:margin-bottom="0.2cm"/><style:text-properties fo:font-size="14pt" fo:font-weight="bold"/></style:style>
  </office:styles>
- <office:master-styles>
-  <style:master-page style:name="Standard" style:page-layout-name="Mpm1">
-   <style:header><text:p>Hdr</text:p></style:header><style:footer><text:p>Page {page} of {pages}</text:p></style:footer>
-  </style:master-page>
- </office:master-styles>
+ <office:automatic-styles><style:page-layout style:name="Mpm1"><style:page-layout-properties fo:page-width="595.28pt" fo:page-height="841.89pt" fo:margin-top="72pt" fo:margin-bottom="72pt" fo:margin-left="72pt" fo:margin-right="72pt" style:print-orientation="portrait"/></style:page-layout><style:style style:name="P1" style:family="paragraph"><style:paragraph-properties fo:text-align="start"/></style:style>
+<style:style style:name="T1" style:family="text"><style:text-properties/></style:style>
+</office:automatic-styles>
+ <office:master-styles><style:master-page style:name="Standard" style:page-layout-name="Mpm1"><style:header><text:p text:style-name="P1">Hdr</text:p></style:header><style:footer><text:p text:style-name="P1">Page {page} of {pages}</text:p></style:footer></style:master-page></office:master-styles>
 </office:document-styles>

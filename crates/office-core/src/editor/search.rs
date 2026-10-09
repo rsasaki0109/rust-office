@@ -308,7 +308,7 @@ mod tests {
         editor.mark_clean();
         let selection = editor.selection();
         assert!(editor.find_body("missing", true).is_none());
-        assert_eq!(editor.edit_focus(), EditFocus::Header);
+        assert_eq!(editor.edit_focus(), EditFocus::Header(0));
         assert_eq!(editor.selection(), selection);
         assert!(!editor.is_dirty());
         assert!(!editor.replace_body_match("header", "changed").unwrap());
@@ -323,6 +323,6 @@ mod tests {
         assert_eq!(editor.document().plain_text(), "🙂 ".repeat(10_000));
         assert!(editor.undo());
         assert_eq!(editor.document(), &original);
-        assert_eq!(editor.edit_focus(), EditFocus::Header);
+        assert_eq!(editor.edit_focus(), EditFocus::Header(0));
     }
 }

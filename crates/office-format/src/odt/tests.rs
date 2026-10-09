@@ -127,8 +127,15 @@ fn invalid_content_roots_attributes_entities_and_utf8_name_the_part() {
 
 #[test]
 fn absent_styles_are_optional_but_present_invalid_styles_fail() {
-    let doc = OdtFormat
+    assert!(OdtFormat
         .load_from_bytes(&package(&[("styles.xml", None)]))
+        .is_err());
+    let unreferenced = part("content.xml").replace(" style:master-page-name=\"Standard\"", "");
+    let doc = OdtFormat
+        .load_from_bytes(&package(&[
+            ("styles.xml", None),
+            ("content.xml", Some(unreferenced.as_bytes())),
+        ]))
         .unwrap();
     assert!(doc.header().is_none());
     assert!(doc.plain_text().contains("Before & 日本語"));

@@ -74,10 +74,11 @@ Run these checks before submitting changes:
   callers may still omit package resources; the file loader resolves references
   before assigning a document. Body/header/footer text supports CDATA and escaped
   XML. UTF-8 Transitional/Strict main namespaces are accepted.
-  DOCX remains an MVP reader, not a full OOXML schema/fidelity validator: one global
-  plain-text header/footer is retained (first default reference, otherwise first
-  reference). Rich header/footer contents, per-section variants, arbitrary main-part
-  locations and richer image placement remain outside the current model.
+  DOCX remains an MVP reader, not a full OOXML schema/fidelity validator. Next-page
+  sections retain page geometry and per-section default headers/footers with basic
+  run styling. Continuous/even/odd section breaks are rejected. Header/footer
+  images, links, first/even-page variants, arbitrary main-part locations and richer
+  image placement remain outside the supported interchange subset.
 * ODT file imports require complete UTF-8 `content.xml` with an
   `office:document-content` root and `office:body/office:text`. Referenced
   `draw:image` package parts are loaded by namespace-qualified `xlink:href`;
@@ -85,7 +86,7 @@ Run these checks before submitting changes:
   name. Relative/absolute package paths, dot segments and percent-encoded names
   are resolved within the ZIP. Unreferenced images are ignored. External image
   links and inline binary image data are unsupported and fail explicitly.
-* ODT `styles.xml` is optional when absent, but a present empty, unreadable,
+* ODT `styles.xml` is optional only without master-page references; a present empty, unreadable,
   invalid UTF-8 or malformed part fails the import. Body/header/footer CDATA,
   escaped links, spaces, tabs and line breaks are retained. Compact `text:s`
   expansion is limited to 1,000,000 spaces per XML part; invalid counts fail
@@ -94,8 +95,9 @@ Run these checks before submitting changes:
   XML-only parsing helpers may still omit image bytes, and failed
   `apply_styles_xml` calls leave their document unchanged. This is MVP structure
   validation, not full ODF schema/manifest validation: rich header/footer
-  resources, master-page selection, per-section variants, floating images and
-  images within table cells remain outside the current model.
+  resources, first/even-page variants, floating images and images within table
+  cells remain outside the current model. Paragraph master-page changes retain
+  per-section geometry and styled text headers/footers.
 * New/Open ask before replacing edited documents in all three apps. Quit/window close
   checks every edited document, including inactive apps. Cancelling retains edits,
   even after choosing Don't Save for another document in the same close attempt.
@@ -144,7 +146,7 @@ Run these checks before submitting changes:
 * Named paragraph styles — Normal / Heading 1–3 (toolbar + Format menu; JSON round-trip; bakes run metrics)
 * DOCX `w:pStyle` + ODT `Heading1`–`3` named-style round-trip (LO `Heading_20_N` on read)
 * Layout PDF embeds real images (PNG/JPEG via printpdf; placeholder fallback on decode failure)
-* Section breaks — Insert → Section Break; multi-section JSON; layout/PDF across sections (DOCX/ODT flatten to page breaks)
+* Section breaks — Insert → Section Break; multi-section JSON; per-section canvas/PDF geometry and DOCX/ODT round-trip
 
 ## ODT / DOCX coverage (MVP)
 
@@ -157,21 +159,20 @@ Supported (ODT + DOCX unless noted):
 * Tables
 * Explicit page breaks
 * Embedded images — ODT `Pictures/`; DOCX `word/media/` + inline DrawingML
-* Header / footer — ODT `styles.xml`; DOCX `word/header1.xml` / `footer1.xml` (plain text)
+* Header / footer — per-section ODT master pages and DOCX parts; basic run styling
 * ZIP packages with required package parts
 
 Not yet:
 
 * Named styles / numbering.xml fidelity
 * Floating/anchored images, wrap, alt-text fidelity beyond basics
-* Styled runs inside header/footer on write (plain paragraph only)
+* Header/footer images and DOCX header/footer hyperlinks
 
 ## Known limitations
 
-* Section breaks work in the native model/layout; DOCX/ODT still flatten per-section page styles
+* DOCX supports next-page sections; continuous and even/odd breaks are rejected
 * Header / footer are single-paragraph (Enter inserts a line break, not a new para)
 * Bold rendering is still approximated in egui
-* Per-section page geometry in DOCX/ODT (export flattens section breaks to page breaks)
 * Named styles beyond Normal/Heading 1–3; custom user style registry
 * Layout PDF glyph metrics still approximate (egui ≠ embedded PDF fonts)
 * Calc: charting / pivot not started; formula set still limited vs Excel
@@ -189,7 +190,7 @@ Not yet:
 
 ## Suggested next PRs
 
-1. True DOCX `sectPr` / ODT master-page section styles
+1. Native acceptance of Writer section settings, then aggregate DOCX/ODT input limits
 2. Win/macOS packaging artifacts + accessibility tree stubs
 3. Calc charting MVP / Impress richer shapes
 
@@ -671,3 +672,16 @@ Calc の書式・シート管理・行高／列幅、および Impress の発表
 ある 65% は、それぞれの実装時点の記録である。Writer のセクション別の画面配置と
 DOCX/ODT/PDF の設定保持が80%に向けた残りの項目。復旧と XLSX/PPTX の制限は
 統合済みだが、DOCX/ODT と従来の表計算形式の制限が未完了のため、安定性の残りは加点しない。
+
+### Writer セクション設定の統合
+
+Insert → Page / Section Setup で、現在のセクションの用紙サイズ・向き・余白と
+ヘッダー／フッターをまとめて変更できる。一度の Undo で戻せる。後続セクションは
+最初のヘッダー／フッターを継承するか、独自の内容・明示的な空欄を指定できる。
+画面と PDF はセクションごとの寸法を使い、DOCX の sectPr と ODT の master-page
+で保存・再読込時にも保持する。異常な寸法や参照先の欠落は読込全体を失敗させる。
+
+ローカル検証は全341テスト、Clippy、UI ビルド成功。混在用紙、余白、基本書式、
+継承と空欄、二度の形式往復、名前空間別名、不正な参照、PDF の MediaBox を確認した。
+新しい設定ダイアログの実画面テストは実行要求が中断され、未実施。ロードマップは
+受け入れ確認が終わるまで75%のままとする。

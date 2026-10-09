@@ -62,8 +62,8 @@ pub enum EditFocus {
     #[default]
     Body,
     Cell(CellAddress),
-    Header,
-    Footer,
+    Header(usize),
+    Footer(usize),
 }
 
 impl EditFocus {
@@ -72,12 +72,12 @@ impl EditFocus {
     }
 
     pub fn is_margin(self) -> bool {
-        matches!(self, Self::Header | Self::Footer)
+        matches!(self, Self::Header(_) | Self::Footer(_))
     }
 
     /// Single-paragraph target (cell or margin) — Enter does not split paragraphs.
     pub fn is_single_paragraph(self) -> bool {
-        matches!(self, Self::Cell(_) | Self::Header | Self::Footer)
+        matches!(self, Self::Cell(_) | Self::Header(_) | Self::Footer(_))
     }
 
     pub fn cell(self) -> Option<CellAddress> {

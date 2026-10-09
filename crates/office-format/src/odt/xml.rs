@@ -248,3 +248,53 @@ pub(super) fn content_images(text: &str) -> Result<Vec<String>, FormatError> {
     }
     Ok(images)
 }
+
+/// Keep inherited namespace bindings when a subtree is parsed independently.
+pub(super) fn with_namespaces(
+    element: &BytesStart<'_>,
+    reader: &NsReader<&[u8]>,
+) -> Result<BytesStart<'static>, FormatError> {
+    use quick_xml::name::PrefixDeclaration;
+    let mut element = element.clone().into_owned();
+    for (prefix, namespace) in reader.prefixes() {
+        let key = match prefix {
+            PrefixDeclaration::Default => "xmlns".to_owned(),
+            PrefixDeclaration::Named(name) => format!(
+                "xmlns:{}",
+                std::str::from_utf8(name).map_err(|e| invalid(e.to_string()))?
+            ),
+        };
+        if element
+            .try_get_attribute(key.as_str())
+            .map_err(|e| invalid(e.to_string()))?
+            .is_none()
+        {
+            element.push_attribute((
+                key.as_str(),
+                std::str::from_utf8(namespace.as_ref()).map_err(|e| invalid(e.to_string()))?,
+            ));
+        }
+    }
+    Ok(element)
+}
+
+pub(super) fn office_wrapper(
+    reader: &NsReader<&[u8]>,
+    local: &str,
+) -> Result<BytesStart<'static>, FormatError> {
+    let mut index = 0;
+    loop {
+        let prefix = format!("rooffice{index}");
+        let key = format!("xmlns:{prefix}");
+        let mut element = with_namespaces(&BytesStart::new(format!("{prefix}:{local}")), reader)?;
+        if element
+            .try_get_attribute(key.as_str())
+            .map_err(|e| invalid(e.to_string()))?
+            .is_none()
+        {
+            element.push_attribute((key.as_str(), OFFICE_NS[0]));
+            return Ok(element);
+        }
+        index += 1;
+    }
+}
