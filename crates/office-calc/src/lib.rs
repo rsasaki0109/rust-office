@@ -22,5 +22,5 @@ pub use csv::{load_csv_path, load_csv_str, sheet_to_csv, write_csv_path, CsvErro
 pub use formula::evaluate_formula;
 pub use reference::translate_formula;
 pub use sheet::{Sheet, DEFAULT_COLS, DEFAULT_ROWS};
-pub use workbook::Workbook;
+pub use workbook::{SheetError, Workbook};
 pub use xlsx::{load_xlsx_path, write_xlsx_bytes, write_xlsx_path, XlsxError};

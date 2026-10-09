@@ -24,7 +24,20 @@ pub enum SwitchTo {
     Quit,
 }
 
+enum SheetDialog {
+    Rename {
+        index: usize,
+        name: String,
+        focus: bool,
+        error: Option<String>,
+    },
+    Delete {
+        index: usize,
+    },
+}
+
 pub struct CalcApp {
+    sheet_dialog: Option<SheetDialog>,
     copied_cells: Option<CopiedCells>,
     clipboard: Option<arboard::Clipboard>,
     copy_pending: bool,
@@ -66,6 +79,7 @@ impl CalcApp {
         let edit_buf = workbook.active_sheet().raw(CellAddr::new(0, 0)).to_owned();
 
         Self {
+            sheet_dialog: None,
             copied_cells: None,
             clipboard: None,
             copy_pending: false,
@@ -182,10 +196,114 @@ impl CalcApp {
 
     fn add_sheet(&mut self) {
         self.commit_edit();
-        let n = self.workbook.sheet_count() + 1;
-        self.workbook.add_sheet(format!("Sheet{n}"));
+        let name = self.workbook.next_sheet_name();
+        self.workbook.add_sheet(name);
         self.select_cell(CellAddr::new(0, 0), false);
         self.scroll_to_active = true;
+    }
+
+    fn open_sheet_dialog(&mut self, rename: bool) {
+        self.commit_edit();
+        self.sheet_dialog = Some(if rename {
+            SheetDialog::Rename {
+                index: self.workbook.active,
+                name: self.workbook.active_sheet().name.clone(),
+                focus: true,
+                error: None,
+            }
+        } else {
+            SheetDialog::Delete {
+                index: self.workbook.active,
+            }
+        });
+    }
+
+    fn confirm_sheet_rename(
+        &mut self,
+        index: usize,
+        name: &str,
+    ) -> Result<(), office_calc::SheetError> {
+        self.workbook.rename_sheet(index, name)?;
+        self.set_status("Worksheet renamed");
+        Ok(())
+    }
+
+    fn confirm_sheet_delete(&mut self, index: usize) {
+        match self.workbook.delete_sheet(index) {
+            Ok(()) => {
+                self.reset_copy();
+                self.select_cell(CellAddr::new(0, 0), false);
+                self.scroll_to_active = true;
+                self.set_status("Worksheet deleted — Undo restores its contents");
+            }
+            Err(error) => self.set_error(error.to_string()),
+        }
+    }
+
+    fn show_sheet_dialog(&mut self, ctx: &Context) {
+        let Some(mut dialog) = self.sheet_dialog.take() else {
+            return;
+        };
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("calc_sheet_dialog")).show(ctx, |ui| {
+            match &mut dialog {
+                SheetDialog::Rename {
+                    index,
+                    name,
+                    focus,
+                    error,
+                } => {
+                    ui.heading("Rename Worksheet");
+                    ui.label("Use a unique name, up to 31 characters.");
+                    let input = ui
+                        .add(egui::TextEdit::singleline(name).id(egui::Id::new("calc_sheet_name")));
+                    if *focus {
+                        input.request_focus();
+                        *focus = false;
+                    }
+                    if let Some(error) = error {
+                        ui.colored_label(Color32::RED, error);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() {
+                            match self.confirm_sheet_rename(*index, name) {
+                                Ok(()) => close = true,
+                                Err(e) => *error = Some(e.to_string()),
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                SheetDialog::Delete { index } => {
+                    ui.heading("Delete Worksheet?");
+                    ui.label(format!(
+                        "Delete \"{}\" and all its cells?",
+                        self.workbook.sheets[*index].name
+                    ));
+                    ui.label("You can restore this worksheet with Undo.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete Worksheet").clicked() {
+                            self.confirm_sheet_delete(*index);
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            }
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                close = true;
+            }
+        });
+        if close {
+            ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("calc_sheet_name")));
+            ctx.request_repaint();
+        } else {
+            self.sheet_dialog = Some(dialog);
+        }
     }
 
     fn clear_selection(&mut self) {
@@ -525,6 +643,20 @@ impl CalcApp {
                     }
                 }
                 ui.separator();
+                if ui.button("Rename Worksheet…").clicked() {
+                    self.open_sheet_dialog(true);
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.workbook.sheet_count() > 1,
+                        egui::Button::new("Delete Worksheet…"),
+                    )
+                    .clicked()
+                {
+                    self.open_sheet_dialog(false);
+                    ui.close();
+                }
                 if ui.button("Add Sheet").clicked() {
                     self.add_sheet();
                     ui.close();
@@ -750,6 +882,9 @@ impl CalcApp {
     }
 
     fn handle_keys(&mut self, ctx: &Context) {
+        if self.sheet_dialog.is_some() || ctx.memory(|memory| memory.top_modal_layer().is_some()) {
+            return;
+        }
         let command = egui::Modifiers::COMMAND;
         if ctx.input_mut(|i| i.consume_key(command | egui::Modifiers::SHIFT, Key::S)) {
             self.save_file_as();
@@ -884,7 +1019,8 @@ impl App for CalcApp {
             self.handle_keys(&ctx);
         }
         self.show_unsaved_dialog(&ctx);
-        if self.pending_action.is_some() {
+        self.show_sheet_dialog(&ctx);
+        if self.pending_action.is_some() || self.sheet_dialog.is_some() {
             ui.disable();
         }
 
@@ -936,6 +1072,82 @@ fn writable_extension(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sheet_management_round_trip_and_undo_preserve_drafts_and_formulas() {
+        let mut app = CalcApp::new();
+        draft(&mut app, "日本語");
+        app.add_sheet();
+        assert_eq!(app.workbook.sheets[0].raw(CellAddr::new(0, 0)), "日本語");
+        draft(&mut app, "=1+2");
+        app.open_sheet_dialog(true);
+        app.confirm_sheet_rename(1, "売上 & <集計>").unwrap();
+        app.sheet_dialog = None;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed.xlsx");
+        assert!(app.save_to(&path));
+        app.confirm_sheet_delete(1);
+        assert_eq!(app.workbook.sheet_count(), 1);
+        app.history(false);
+        assert!(!app.is_dirty());
+        assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(0, 0)), "=1+2");
+        app.history(true);
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.sheet_count(), 1);
+        assert_eq!(loaded.active_sheet().raw(CellAddr::new(0, 0)), "日本語");
+        app.history(false);
+        assert!(app.is_dirty());
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(loaded.sheets[1].name, "売上 & <集計>");
+        assert_eq!(loaded.sheets[1].raw(CellAddr::new(0, 0)), "=1+2");
+        assert_eq!(loaded.sheets[1].display(CellAddr::new(0, 0)), "3");
+        assert!(!loaded.can_undo() && !loaded.is_dirty());
+    }
+
+    #[test]
+    fn cancelling_sheet_modals_and_typing_do_not_edit_cells() {
+        let mut app = CalcApp::new();
+        app.add_sheet();
+        app.workbook.mark_clean();
+        app.workbook.clear_history();
+        let ctx = Context::default();
+        for rename in [true, false] {
+            app.open_sheet_dialog(rename);
+            for events in [
+                vec![],
+                vec![egui::Event::Text("draft name".into())],
+                vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                vec![],
+                vec![],
+            ] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let ctx = ui.ctx().clone();
+                        app.handle_keys(&ctx);
+                        app.show_sheet_dialog(&ctx);
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert!(app.sheet_dialog.is_none());
+            assert_eq!(app.workbook.sheet_count(), 2);
+            assert_eq!(app.workbook.active_sheet().name, "Sheet2");
+            assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(0, 0)), "");
+            assert!(!app.is_dirty() && !app.workbook.can_undo());
+        }
+    }
 
     fn draft(app: &mut CalcApp, value: &str) {
         app.begin_edit();

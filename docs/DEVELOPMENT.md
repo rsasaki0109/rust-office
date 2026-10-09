@@ -189,6 +189,18 @@ Not yet:
 
 ## Calc editing
 
+The Sheet menu can rename and delete worksheets. Names must be unique (case
+insensitive) and satisfy XLSX naming rules; Add Sheet chooses an unused default
+name even after deletions or renames. Deletion requires confirmation and the last
+worksheet cannot be deleted. Rename/delete are undoable, including deleted cell
+contents, formulas, sheet position and the saved revision's dirty state. Opening
+these actions commits a pending formula-bar edit to its original worksheet.
+Cancel/Escape leaves the sheet name and sheet list unchanged.
+
+XLSX preserves the resulting sheet names and contents; CSV still stores only one
+sheet. Cross-sheet formulas are not supported yet; rename does not rewrite their
+raw text. Cell formatting and custom row/column sizes remain unimplemented.
+
 Aggregate functions (`SUM`, `AVERAGE`/`AVG`, `MIN`, `MAX`, `COUNT`) visit only
 stored cells in ranges, in row/column order. Referenced empty cells and text
 (including numeric-looking literal text and formula text results) are ignored.
