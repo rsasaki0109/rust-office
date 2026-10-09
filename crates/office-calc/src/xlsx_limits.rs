@@ -450,15 +450,42 @@ pub(crate) fn model(workbook: &crate::Workbook) -> Result<(), XlsxError> {
     let mut count = 0usize;
     let mut text = 0usize;
     let mut dense = 0u64;
+    let mut dimensions = 0usize;
     for sheet in &workbook.sheets {
         let mut span = Span::default();
+        let mut seen = std::collections::HashSet::new();
         for (addr, cell) in sheet.occupied() {
             count += 1;
+            seen.insert(addr);
             text = text.saturating_add(cell.raw.len());
             if count > MAX_CELLS || text > MAX_TEXT_BYTES {
                 return Err(error("XLSX model exceeds cell or 32 MiB raw-text limits"));
             }
             span.add((addr.row, addr.col))?;
+        }
+        for (addr, format) in sheet.formatted() {
+            if seen.insert(addr) {
+                count += 1;
+            }
+            text = text.saturating_add(format.number_format.len());
+            if count > MAX_CELLS || text > MAX_TEXT_BYTES {
+                return Err(error("XLSX model exceeds cell or presentation-text limits"));
+            }
+            span.add((addr.row, addr.col))?;
+        }
+        for (axis, limit) in [
+            (crate::DimensionAxis::Columns, crate::MAX_SHEET_COLS),
+            (crate::DimensionAxis::Rows, crate::MAX_SHEET_ROWS),
+        ] {
+            axis.validate(sheet.default_dimension(axis))
+                .map_err(|e| error(e.to_string()))?;
+            for (index, size) in sheet.dimension_overrides(axis) {
+                dimensions += 1;
+                if index >= limit || dimensions > MAX_CELLS {
+                    return Err(error("XLSX dimension exceeds grid or entry limits"));
+                }
+                axis.validate(size).map_err(|e| error(e.to_string()))?;
+            }
         }
         dense = dense.saturating_add(span.size()?);
         if dense > MAX_DENSE_CELLS {
@@ -490,6 +517,37 @@ mod tests {
     fn scan(xml: &str) -> Result<(), XlsxError> {
         XmlBudget::default().scan(xml.as_bytes(), false, false)
     }
+    #[test]
+    fn styled_blank_cells_and_dimensions_are_validated_before_export() {
+        let mut book = crate::Workbook::new();
+        book.active_sheet_mut().set_format(
+            crate::CellAddr::new(16384, 0),
+            crate::CellFormat {
+                bold: true,
+                ..Default::default()
+            },
+        );
+        assert!(crate::write_xlsx_bytes(&book).is_err());
+        let mut book = crate::Workbook::new();
+        book.active_sheet_mut()
+            .set_dimension(crate::DimensionAxis::Columns, 16384, 120.0);
+        assert!(crate::write_xlsx_bytes(&book).is_err());
+        let mut book = crate::Workbook::new();
+        book.active_sheet_mut()
+            .set_dimension(crate::DimensionAxis::Rows, 0, f64::NAN);
+        assert!(crate::write_xlsx_bytes(&book).is_err());
+        let mut book = crate::Workbook::new();
+        book.set_cell(crate::CellAddr::new(0, 0), "value");
+        book.active_sheet_mut().set_format(
+            crate::CellAddr::new(16383, 1048575),
+            crate::CellFormat {
+                bold: true,
+                ..Default::default()
+            },
+        );
+        assert!(crate::write_xlsx_bytes(&book).is_err());
+    }
+
     #[test]
     fn ranges_accept_boundary_and_reject_reversed_overflow_or_sparse_explosion() {
         assert_eq!(range(b"A1:J100000").unwrap().size().unwrap(), 1_000_000);
@@ -592,11 +650,7 @@ mod tests {
             .contains("expanded shared-string"));
         let mut budget = XmlBudget::default();
         budget
-            .scan(
-                "<sst><si><t>日本語</t></si></sst>".as_bytes(),
-                true,
-                false,
-            )
+            .scan("<sst><si><t>日本語</t></si></sst>".as_bytes(), true, false)
             .unwrap();
         budget
             .scan(
