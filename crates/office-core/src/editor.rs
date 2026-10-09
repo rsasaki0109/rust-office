@@ -23,6 +23,10 @@ pub enum EditError {
     InvalidCell,
     #[error("replacement text must not contain paragraph breaks")]
     InvalidReplacement,
+    #[error("section index out of range")]
+    InvalidSection,
+    #[error("invalid page size or margins")]
+    InvalidPageStyle,
 }
 
 #[derive(Debug, Clone)]
@@ -490,12 +494,15 @@ impl DocumentEditor {
         &mut self,
         page_style: Option<PageStyle>,
     ) -> Result<(), EditError> {
+        if page_style.as_ref().is_some_and(|style| !style.is_valid()) {
+            return Err(EditError::InvalidPageStyle);
+        }
         self.focus_body();
-        self.push_undo();
         let para_idx = self.selection.focus.paragraph;
         let (sec, block_idx) = self
             .block_loc_of_paragraph(para_idx)
             .ok_or(EditError::InvalidParagraph)?;
+        self.push_undo();
         let split_at = block_idx + 1;
         let section = &mut self.document.sections[sec];
         let mut right_blocks = if split_at < section.blocks.len() {
@@ -522,6 +529,34 @@ impl DocumentEditor {
         self.edit_focus = EditFocus::Body;
         self.dirty = true;
         self.sync_typing_style_from_caret();
+        Ok(())
+    }
+
+    /// Apply page geometry and local margin content as one undoable operation.
+    /// `None` inherits the first section; an empty paragraph explicitly clears it.
+    pub fn set_section_settings(
+        &mut self,
+        section: usize,
+        page_style: PageStyle,
+        header: Option<Paragraph>,
+        footer: Option<Paragraph>,
+    ) -> Result<(), EditError> {
+        let current = self.document.sections.get(section)
+            .ok_or(EditError::InvalidSection)?;
+        if !page_style.is_valid() {
+            return Err(EditError::InvalidPageStyle);
+        }
+        if current.page_style == page_style && current.header == header && current.footer == footer {
+            return Ok(());
+        }
+        self.push_undo();
+        let current = &mut self.document.sections[section];
+        current.page_style = page_style;
+        current.header = header;
+        current.footer = footer;
+        self.selection = self.clamp_selection(self.selection);
+        self.sync_typing_style_from_caret();
+        self.dirty = true;
         Ok(())
     }
 
@@ -1443,6 +1478,50 @@ fn for_each_style_in_range(
 mod tests {
     use super::*;
     use crate::style::Alignment;
+
+    #[test]
+    fn section_settings_are_atomic_and_preserve_other_sections() {
+        let mut ed = DocumentEditor::default();
+        ed.set_header_text("Inherited").unwrap();
+        ed.insert_section_break().unwrap();
+        let before = ed.document().clone();
+        let mut style = PageStyle::default();
+        std::mem::swap(&mut style.width, &mut style.height);
+        ed.set_section_settings(
+            1,
+            style.clone(),
+            Some(Paragraph::empty()),
+            Some(Paragraph::from_text("  Page {page}  ")),
+        ).unwrap();
+        assert_eq!(ed.document().sections[0], before.sections[0]);
+        assert_eq!(ed.document().section_header(1).unwrap().plain_text(), "");
+        assert_eq!(ed.document().section_footer(1).unwrap().plain_text(), "  Page {page}  ");
+        assert!(ed.undo());
+        assert_eq!(ed.document(), &before);
+        assert!(ed.redo());
+        assert_eq!(ed.document().sections[1].page_style, style);
+    }
+
+    #[test]
+    fn invalid_or_unchanged_section_settings_preserve_history() {
+        let mut ed = DocumentEditor::default();
+        ed.insert_text("draft").unwrap();
+        ed.undo();
+        ed.mark_clean();
+        let before = ed.document().clone();
+        ed.set_section_settings(0, PageStyle::default(), None, None).unwrap();
+        let bad = PageStyle {
+            margin_left: f32::NAN,
+            ..PageStyle::default()
+        };
+        assert_eq!(ed.set_section_settings(0, bad.clone(), None, None), Err(EditError::InvalidPageStyle));
+        assert_eq!(ed.insert_section_break_with_style(Some(bad)), Err(EditError::InvalidPageStyle));
+        assert_eq!(ed.set_section_settings(99, PageStyle::default(), None, None), Err(EditError::InvalidSection));
+        assert_eq!(ed.document(), &before);
+        assert!(!ed.is_dirty());
+        assert!(!ed.can_undo());
+        assert!(ed.can_redo());
+    }
 
     #[test]
     fn named_heading_bakes_metrics_and_runs() {
