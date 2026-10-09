@@ -41,7 +41,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 * Interchange-friendly formats (JSON / ODT / DOCX / XLSX / PPTX / PDF)
 * Incremental delivery: ship real apps early, deepen fidelity continuously
 
-## Current status (60% of the daily-use roadmap)
+## Current status (65% of the daily-use roadmap)
 
 The [daily-use roadmap (80% intermediate target)](docs/ROADMAP_90.md) tracks 20 acceptance milestones for daily
 use across Writer, Calc, Impress, data protection, and distribution. This is a
@@ -78,6 +78,7 @@ compatibility. Unmerged work is tracked separately.
 * Select, drag and resize title/body text, added text boxes, rectangles, ellipses and embedded images
 * Native JSON preserves object geometry and image bytes; object operations support Undo/Redo
 * PPTX export rejects added objects until their interchange is supported
+* PPTX import rejects images, shapes without text bodies, groups, connectors and charts instead of silently dropping them
 
 * Slides, Light / Dark / Ocean themes
 * JSON + PPTX open/export (title + body MVP)

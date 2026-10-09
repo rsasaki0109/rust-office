@@ -339,3 +339,12 @@ the destination; failure leaves a prior file intact. The UI requires a .pdf
 extension, protecting a selected native JSON destination from accidental export.
 This does not complete the combined presentation/PDF/PPTX roadmap milestone until
 basic-object PPTX output is implemented and the corresponding PRs are merged.
+
+
+PPTX import currently supports title/body text only. Listed slides containing
+images, shapes without text bodies, grouped objects, connectors, charts/tables or content
+parts are rejected with the slide part path rather than silently losing those
+objects. This applies to both transitional and strict OOXML namespaces, including
+renamed prefixes. Unlisted slide parts remain ignored. Text formatting and
+geometry remain subject to the existing title/body MVP limitations. Native JSON
+is the preservation format for presentations with added objects.
