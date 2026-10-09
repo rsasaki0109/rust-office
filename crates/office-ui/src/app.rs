@@ -35,6 +35,10 @@ pub enum SwitchTo {
 
 pub struct WriterApp {
     editor: DocumentEditor,
+    recovery: Option<crate::recovery::Recovery>,
+    recovery_open: bool,
+    recovery_selected: usize,
+    recovery_delete: Option<usize>,
     file_path: Option<PathBuf>,
     zoom: f32,
     status_message: String,
@@ -94,6 +98,10 @@ impl WriterApp {
 
         Self {
             editor,
+            recovery: None,
+            recovery_open: false,
+            recovery_selected: 0,
+            recovery_delete: None,
             file_path: None,
             zoom: 1.0,
             status_message: "Ready".into(),
@@ -119,6 +127,191 @@ impl WriterApp {
             find_scroll_pending: false,
             find_restore_focus: false,
             pending_switch: None,
+        }
+    }
+
+    pub(super) fn enable_recovery(&mut self, root: Result<PathBuf, String>) {
+        match root.and_then(|root| crate::recovery::Recovery::new(&root)) {
+            Ok(store) => {
+                self.recovery_open = !store.entries.is_empty();
+                self.recovery = Some(store);
+            }
+            Err(e) => self.set_error(format!("Writer recovery unavailable: {e}")),
+        }
+    }
+    pub(super) fn recovery_tick(&mut self, ctx: &Context) {
+        let label = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled Writer document".into());
+        if let Some(store) = &mut self.recovery {
+            let result = store.tick(
+                self.editor.document(),
+                self.editor.is_dirty(),
+                &label,
+                Instant::now(),
+            );
+            ctx.request_repaint_after(crate::recovery::INTERVAL);
+            if let Err(e) = result {
+                self.set_error(format!("Writer recovery copy failed: {e}"));
+            }
+        }
+    }
+    pub(super) fn clear_recovery(&mut self) {
+        if let Some(store) = &mut self.recovery {
+            if let Err(e) = store.clear() {
+                self.set_error(format!("Writer recovery cleanup failed: {e}"));
+            }
+        }
+    }
+    fn open_recovery(&mut self) {
+        let Some(store) = &mut self.recovery else {
+            self.set_error("Writer recovery is unavailable");
+            return;
+        };
+        match store.refresh() {
+            Ok(()) => {
+                self.recovery_selected = 0;
+                self.recovery_open = true;
+            }
+            Err(e) => self.set_error(format!("Could not list recovery copies: {e}")),
+        }
+    }
+    fn restore_recovery(&mut self, index: usize) -> bool {
+        if self.editor.is_dirty() {
+            self.set_error("Save the current document before recovering another copy");
+            return false;
+        }
+        let Some(store) = &mut self.recovery else {
+            return false;
+        };
+        match store.restore(index) {
+            Ok(doc) => {
+                let warning = store.cleanup_warning.take();
+                self.editor.restore_unsaved_document(doc);
+                self.file_path = None;
+                self.image_textures.clear();
+                self.last_layout = None;
+                self.preferred_caret_x = None;
+                self.ime_preedit.clear();
+                self.ime_active_range = None;
+                self.focus_document = true;
+                self.find_open = false;
+                self.recovery_open = false;
+                self.recovery_delete = None;
+                self.recovery.as_mut().unwrap().postpone();
+                self.set_status("Recovered unsaved Writer document — use Save As to keep it");
+                if let Some(e) = warning {
+                    self.set_error(format!(
+                        "Recovered document; older copy cleanup failed: {e}"
+                    ));
+                }
+                true
+            }
+            Err(e) => {
+                self.set_error(format!("Recovery failed: {e}"));
+                false
+            }
+        }
+    }
+    fn show_recovery_dialog(&mut self, ctx: &Context) {
+        if !self.recovery_open {
+            return;
+        }
+        let mut restore = None;
+        let mut delete = None;
+        let mut later = false;
+        let response = egui::Modal::new(egui::Id::new("writer_recovery")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            if let Some(index) = self.recovery_delete {
+                ui.heading("Delete recovery copy?");
+                ui.label("Permanently delete this recovery copy?");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        delete = Some(index);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.recovery_delete = None;
+                    }
+                });
+            } else {
+                ui.heading("Unsaved Writer documents found");
+                ui.label("Select a copy to recover. Recovered documents use Save As.");
+                let entries = self.recovery.as_ref().map(|s| &s.entries);
+                let count = entries.map_or(0, Vec::len);
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        if let Some(entries) = entries {
+                            for (index, entry) in entries.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.recovery_selected,
+                                    index,
+                                    &entry.label,
+                                );
+                            }
+                        }
+                    });
+                if count == 0 {
+                    ui.label("No available recovery copies.");
+                }
+                if self.editor.is_dirty() {
+                    ui.label("Save your current document before recovering another copy.");
+                }
+                if let Some(error) = &self.last_error {
+                    ui.colored_label(Color32::RED, error);
+                }
+                let can_restore = count > 0 && !self.editor.is_dirty();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_restore, egui::Button::new("Recover (Enter)"))
+                        .clicked()
+                    {
+                        restore = Some(self.recovery_selected);
+                    }
+                    if ui.button("Keep for later").clicked() {
+                        later = true;
+                    }
+                    if ui
+                        .add_enabled(count > 0, egui::Button::new("Delete copy…"))
+                        .clicked()
+                    {
+                        self.recovery_delete = Some(self.recovery_selected);
+                    }
+                });
+                if can_restore && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                    restore = Some(self.recovery_selected);
+                }
+            }
+        });
+        if response.should_close() {
+            if self.recovery_delete.is_some() {
+                self.recovery_delete = None;
+            } else {
+                later = true;
+            }
+        }
+        if let Some(index) = delete {
+            let result = self.recovery.as_mut().unwrap().delete(index);
+            match result {
+                Ok(()) => {
+                    self.recovery_selected = 0;
+                    self.recovery_delete = None;
+                }
+                Err(e) => self.set_error(format!("Recovery copy deletion failed: {e}")),
+            }
+        }
+        if let Some(index) = restore {
+            self.restore_recovery(index);
+        }
+        if later {
+            self.recovery_open = false;
+            self.recovery_delete = None;
+            if let Some(store) = &mut self.recovery {
+                store.postpone();
+            }
         }
     }
 
@@ -157,6 +350,7 @@ impl WriterApp {
 
     fn do_new_file(&mut self) {
         self.editor.new_document();
+        self.clear_recovery();
         self.file_path = None;
         self.preferred_caret_x = None;
         self.set_status("New document");
@@ -186,6 +380,7 @@ impl WriterApp {
         match load_document(path) {
             Ok(doc) => {
                 self.editor.replace_document(doc);
+                self.clear_recovery();
                 self.file_path = Some(path.to_path_buf());
                 self.preferred_caret_x = None;
                 self.set_status("Opened");
@@ -415,6 +610,7 @@ impl WriterApp {
         match save_document(self.editor.document(), &path) {
             Ok(()) => {
                 self.editor.mark_clean();
+                self.clear_recovery();
                 self.set_status(format!("Saved {}", path.display()));
                 true
             }
@@ -438,6 +634,7 @@ impl WriterApp {
         match save_document(self.editor.document(), &path) {
             Ok(()) => {
                 self.editor.mark_clean();
+                self.clear_recovery();
                 self.file_path = Some(path.clone());
                 self.set_status(format!("Saved {}", path.display()));
                 true
@@ -857,6 +1054,10 @@ impl WriterApp {
                 }
                 if ui.button("Save As…").clicked() {
                     self.save_file_as();
+                    ui.close();
+                }
+                if ui.button("Recovery copies…").clicked() {
+                    self.open_recovery();
                     ui.close();
                 }
                 if ui.button("Export PDF…").clicked() {
@@ -1798,6 +1999,11 @@ impl App for WriterApp {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
 
+        let recovery_was_open = self.recovery_open;
+        self.show_recovery_dialog(&ctx);
+        if recovery_was_open {
+            ui.disable();
+        }
         self.restore_find_focus(&ctx);
 
         // Focus the document canvas on first frame so typing works immediately.
@@ -2103,5 +2309,80 @@ mod tests {
         assert!(!app.save_file());
         assert_eq!(std::fs::read(&path).unwrap(), b"original file");
         assert!(app.is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use office_core::Document;
+    fn crashed_copy(root: &std::path::Path, doc: &Document) {
+        let mut store = crate::recovery::Recovery::new(root).unwrap();
+        store
+            .tick(doc, true, "original.docx", Instant::now())
+            .unwrap();
+    }
+    #[test]
+    fn restored_document_is_unsaved_has_no_original_destination_and_cleans_up_after_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("recovery");
+        let doc = Document::with_text("日本語 recovered");
+        crashed_copy(&root, &doc);
+        let mut app = WriterApp::new();
+        app.enable_recovery(Ok(root.clone()));
+        assert!(app.recovery_open);
+        assert!(app.restore_recovery(0));
+        assert!(app.is_dirty());
+        assert!(app.file_path.is_none());
+        assert!(!app.editor.can_undo());
+        assert_eq!(app.editor.document(), &doc);
+        app.editor.insert_text("edit ").unwrap();
+        app.editor.undo();
+        assert_eq!(app.editor.document(), &doc);
+        assert!(app.is_dirty());
+        let restored = dir.path().join("restored.roffice.json");
+        app.file_path = Some(restored.clone());
+        assert!(app.save_file());
+        assert_eq!(load_document(&restored).unwrap(), doc);
+        drop(app);
+        assert!(crate::recovery::Recovery::new(&root)
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+    #[test]
+    fn recovery_cannot_overwrite_current_unsaved_edits_and_postponing_keeps_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = Document::with_text("other document");
+        crashed_copy(dir.path(), &doc);
+        let mut app = WriterApp::new();
+        app.enable_recovery(Ok(dir.path().into()));
+        app.editor.insert_text("keep this edit").unwrap();
+        let before = app.editor.document().clone();
+        assert!(!app.restore_recovery(0));
+        assert_eq!(app.editor.document(), &before);
+        assert!(app.is_dirty());
+        app.recovery.as_mut().unwrap().postpone();
+        drop(app);
+        assert_eq!(
+            crate::recovery::Recovery::new(dir.path())
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn unavailable_recovery_storage_does_not_block_editing_or_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"keep").unwrap();
+        let mut app = WriterApp::new();
+        app.enable_recovery(Ok(blocked.clone()));
+        assert!(app.recovery.is_none());
+        app.editor.insert_text("still editable").unwrap();
+        app.file_path = Some(dir.path().join("normal.roffice.json"));
+        assert!(app.save_file());
+        assert_eq!(std::fs::read(blocked).unwrap(), b"keep");
     }
 }

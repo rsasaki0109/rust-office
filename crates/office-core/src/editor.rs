@@ -1234,6 +1234,12 @@ impl DocumentEditor {
         self.typing_style = TextStyle::default();
     }
 
+    /// Restore an unsaved snapshot, without restoring its runtime undo history.
+    pub fn restore_unsaved_document(&mut self, document: Document) {
+        self.replace_document(document);
+        self.dirty = true;
+    }
+
     pub fn new_document(&mut self) {
         self.replace_document(Document::new());
     }
@@ -1735,5 +1741,25 @@ mod tests {
         ed.set_hyperlink(Some("https://example.com".into())).unwrap();
         let run = &ed.document().paragraph(0).unwrap().runs[0];
         assert_eq!(run.link.as_deref(), Some("https://example.com"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn restored_document_is_unsaved_and_new_edits_undo_to_recovered_content() {
+        let doc = Document::with_text("recovered 日本語");
+        let mut editor = DocumentEditor::default();
+        editor.insert_text("unrelated history").unwrap();
+        editor.restore_unsaved_document(doc.clone());
+        assert!(editor.is_dirty());
+        assert!(!editor.can_undo());
+        assert!(!editor.can_redo());
+        editor.insert_text("added ").unwrap();
+        editor.undo();
+        assert_eq!(editor.document(), &doc);
+        assert!(editor.is_dirty());
     }
 }
