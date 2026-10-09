@@ -60,6 +60,13 @@ pub struct WriterApp {
     header_footer_dialog: Option<(String, String)>,
     /// When set, show the print dialog.
     print_dialog: Option<PrintDialog>,
+    find_open: bool,
+    find_query: String,
+    find_replacement: String,
+    find_focus_requested: bool,
+    find_message: String,
+    find_scroll_pending: bool,
+    find_restore_focus: bool,
     /// Suite mode switch request.
     pub pending_switch: Option<SwitchTo>,
 }
@@ -104,6 +111,13 @@ impl WriterApp {
             link_dialog: None,
             header_footer_dialog: None,
             print_dialog: None,
+            find_open: false,
+            find_query: String::new(),
+            find_replacement: String::new(),
+            find_focus_requested: false,
+            find_message: String::new(),
+            find_scroll_pending: false,
+            find_restore_focus: false,
             pending_switch: None,
         }
     }
@@ -578,6 +592,8 @@ impl WriterApp {
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let macros = [
+            (KeyboardShortcut::new(Modifiers::COMMAND, Key::F), "find"),
+            (KeyboardShortcut::new(Modifiers::COMMAND, Key::H), "find"),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::N), "new"),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::O), "open"),
             (KeyboardShortcut::new(Modifiers::COMMAND, Key::S), "save"),
@@ -622,6 +638,7 @@ impl WriterApp {
         for (shortcut, action) in macros {
             if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
                 match action {
+                    "find" => self.open_find(),
                     "new" => self.new_file(),
                     "open" => self.open_file(),
                     "save" => {
@@ -664,6 +681,161 @@ impl WriterApp {
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    fn open_find(&mut self) {
+        self.find_open = true;
+        self.find_focus_requested = true;
+        self.find_message.clear();
+        self.ime_preedit.clear();
+        self.ime_active_range = None;
+        self.dragging = false;
+    }
+
+    fn find_body(&mut self, forward: bool) {
+        if let Some(selected) = self.editor.find_body(&self.find_query, forward) {
+            let matches = self.editor.body_matches(&self.find_query);
+            let index = matches
+                .iter()
+                .position(|found| *found == selected)
+                .unwrap_or(0);
+            self.find_message = format!("Match {} of {}", index + 1, matches.len());
+            self.preferred_caret_x = None;
+            self.find_scroll_pending = true;
+        } else {
+            self.find_message = if self.find_query.is_empty() {
+                "Enter text to find".into()
+            } else {
+                "No matches in body paragraphs".into()
+            };
+        }
+    }
+
+    fn replace_found(&mut self) {
+        match self
+            .editor
+            .replace_body_match(&self.find_query, &self.find_replacement)
+        {
+            Ok(true) => {
+                self.find_body(true);
+                self.find_message = format!("Replaced 1. {}", self.find_message);
+                self.find_scroll_pending = true;
+            }
+            Ok(false) => {
+                if self.find_query == self.find_replacement && !self.find_query.is_empty() {
+                    self.find_message = "No changes: replacement is identical".into();
+                } else {
+                    self.find_body(true);
+                }
+            }
+            Err(error) => self.find_message = error.to_string(),
+        }
+    }
+
+    fn replace_all_found(&mut self) {
+        match self
+            .editor
+            .replace_all_body(&self.find_query, &self.find_replacement)
+        {
+            Ok(count) => {
+                self.find_message = format!("Replaced {count} matches in body paragraphs");
+                if count > 0 {
+                    self.preferred_caret_x = None;
+                    self.find_scroll_pending = true;
+                }
+            }
+            Err(error) => self.find_message = error.to_string(),
+        }
+    }
+
+    fn show_find_dialog(&mut self, ctx: &Context) {
+        if !self.find_open {
+            return;
+        }
+        let mut close = false;
+        let mut next = false;
+        let mut previous = false;
+        let mut replace = false;
+        let mut replace_all = false;
+        egui::Modal::new(egui::Id::new("find_replace_dialog")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.heading("Find and Replace");
+            ui.label("Body paragraphs in all sections · Exact case · Literal text");
+            ui.label("Tables, headers and footers are excluded. No paragraph breaks.");
+            ui.horizontal(|ui| {
+                ui.label("Find");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.find_query)
+                        .id(egui::Id::new("writer_find_query"))
+                        .desired_width(335.0),
+                );
+                if self.find_focus_requested {
+                    response.request_focus();
+                    self.find_focus_requested = false;
+                }
+                if response.changed() {
+                    self.find_message.clear();
+                }
+                if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                    next = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Replace");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.find_replacement)
+                        .id(egui::Id::new("writer_find_replacement"))
+                        .desired_width(315.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                let ready = !self.find_query.is_empty();
+                previous = ui
+                    .add_enabled(ready, egui::Button::new("Previous"))
+                    .clicked();
+                next |= ui.add_enabled(ready, egui::Button::new("Next")).clicked();
+                replace = ui
+                    .add_enabled(ready, egui::Button::new("Replace"))
+                    .clicked();
+                replace_all = ui
+                    .add_enabled(ready, egui::Button::new("Replace All"))
+                    .clicked();
+                close = ui.button("Close").clicked();
+            });
+            ui.label(&self.find_message);
+            close |= ui.input(|input| input.key_pressed(Key::Escape));
+        });
+        if previous {
+            self.find_body(false);
+        }
+        if next {
+            self.find_body(true);
+        }
+        if replace {
+            self.replace_found();
+        }
+        if replace_all {
+            self.replace_all_found();
+        }
+        if close {
+            self.find_open = false;
+            // The modal still owns this frame's focus layer. Restore body focus
+            // next frame, after that layer has gone away.
+            self.find_restore_focus = true;
+            ctx.request_repaint();
+        }
+    }
+
+    fn restore_find_focus(&mut self, ctx: &Context) {
+        if self.find_restore_focus && !self.find_open {
+            if ctx.memory(|memory| memory.top_modal_layer().is_none()) {
+                self.find_restore_focus = false;
+                self.focus_document = true;
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("writer_document")));
+            } else {
+                ctx.request_repaint();
             }
         }
     }
@@ -746,6 +918,11 @@ impl WriterApp {
                 ui.separator();
                 if ui.button("Select All\tCtrl+A").clicked() {
                     self.editor.select_all();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Find and Replace…\tCtrl+F / Ctrl+H").clicked() {
+                    self.open_find();
                     ui.close();
                 }
             });
@@ -1075,6 +1252,12 @@ impl WriterApp {
                 );
 
                 let layout = layout_document(ui, self.editor.document(), origin, zoom);
+                if self.find_scroll_pending {
+                    if let Some(rect) = layout.caret_rect(self.editor.selection().focus) {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                    self.find_scroll_pending = false;
+                }
                 ensure_image_textures(ui.ctx(), self.editor.document(), &mut self.image_textures);
                 self.prune_image_textures();
                 let texture_ids: HashMap<String, egui::TextureId> = self
@@ -1398,6 +1581,7 @@ impl WriterApp {
             || self.pending_action.is_some()
             || self.link_dialog.is_some()
             || self.header_footer_dialog.is_some()
+            || self.find_open
         {
             return;
         }
@@ -1614,6 +1798,8 @@ impl App for WriterApp {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
 
+        self.restore_find_focus(&ctx);
+
         // Focus the document canvas on first frame so typing works immediately.
         if self.focus_document && ctx.memory(|m| m.focused().is_none()) {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("writer_document")));
@@ -1624,6 +1810,7 @@ impl App for WriterApp {
             && self.link_dialog.is_none()
             && self.header_footer_dialog.is_none()
             && self.print_dialog.is_none()
+            && !self.find_open
         {
             self.handle_shortcuts(&ctx);
             self.handle_text_input(&ctx);
@@ -1635,6 +1822,7 @@ impl App for WriterApp {
         self.show_link_dialog(&ctx);
         self.show_header_footer_dialog(&ctx);
         self.show_print_dialog(&ctx);
+        self.show_find_dialog(&ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
         egui::Panel::top("menu_panel")
@@ -1682,6 +1870,134 @@ impl App for WriterApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_from_find_returns_keyboard_input_to_body_after_modal_layer_expires() {
+        let mut app = WriterApp::new();
+        app.editor
+            .replace_document(office_core::Document::with_text("original"));
+        app.open_find();
+        let ctx = Context::default();
+        let escape = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for events in [
+            vec![],
+            vec![escape],
+            vec![],
+            vec![],
+            vec![egui::Event::Text("typed ".into())],
+        ] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.restore_find_focus(&ctx);
+                    app.handle_text_input(&ctx);
+                    app.show_find_dialog(&ctx);
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        ui.interact(
+                            ui.available_rect_before_wrap(),
+                            egui::Id::new("writer_document"),
+                            Sense::click_and_drag(),
+                        );
+                        app.focus_document =
+                            ui.memory(|memory| memory.has_focus(egui::Id::new("writer_document")));
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert!(!app.find_open);
+        assert!(app.focus_document);
+        assert_eq!(app.editor.document().plain_text(), "typed original");
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.document().plain_text(), "original");
+    }
+
+    #[test]
+    fn find_navigation_and_changed_query_do_not_replace_stale_selection() {
+        let mut app = WriterApp::new();
+        app.editor
+            .replace_document(office_core::Document::with_text("日本語 old 日本語"));
+        app.find_query = "日本語".into();
+        app.open_find();
+        app.find_body(true);
+        assert_eq!(app.find_message, "Match 1 of 2");
+        app.find_body(true);
+        assert_eq!(app.find_message, "Match 2 of 2");
+        app.find_body(false);
+        assert_eq!(app.find_message, "Match 1 of 2");
+        app.find_query = "old".into();
+        app.find_replacement = "new".into();
+        app.replace_found();
+        assert_eq!(app.editor.document().plain_text(), "日本語 old 日本語");
+        assert_eq!(app.editor.selected_text(), "old");
+        assert!(!app.is_dirty());
+        app.replace_found();
+        assert_eq!(app.editor.document().plain_text(), "日本語 new 日本語");
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.document().plain_text(), "日本語 old 日本語");
+    }
+
+    #[test]
+    fn replace_all_saves_and_reloads_in_each_writer_format_and_undo_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        for extension in ["roffice.json", "docx", "odt"] {
+            let mut app = WriterApp::new();
+            app.editor
+                .replace_document(office_core::Document::with_text("日本語 日本語\n日本語"));
+            app.find_query = "日本語".into();
+            app.find_replacement = "置換🙂".into();
+            app.replace_all_found();
+            assert_eq!(app.find_message, "Replaced 3 matches in body paragraphs");
+            assert!(app.is_dirty());
+            app.file_path = Some(dir.path().join(format!("replaced.{extension}")));
+            assert!(app.save_file());
+            assert_eq!(
+                load_document(app.file_path.as_ref().unwrap())
+                    .unwrap()
+                    .plain_text(),
+                "置換🙂 置換🙂\n置換🙂"
+            );
+            assert!(app.editor.undo());
+            assert_eq!(app.editor.document().plain_text(), "日本語 日本語\n日本語");
+            assert!(!app.editor.can_undo());
+            assert!(app.editor.redo());
+            assert_eq!(app.editor.document().plain_text(), "置換🙂 置換🙂\n置換🙂");
+        }
+    }
+
+    #[test]
+    fn find_dialog_input_never_types_into_document_and_no_match_preserves_state() {
+        let mut app = WriterApp::new();
+        app.editor
+            .replace_document(office_core::Document::with_text("keep text"));
+        app.find_query = "missing".into();
+        let selection = app.editor.selection();
+        app.find_body(true);
+        assert_eq!(app.find_message, "No matches in body paragraphs");
+        assert_eq!(app.editor.selection(), selection);
+        let ctx = Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Text("search input".into())],
+            ..Default::default()
+        });
+        app.open_find();
+        app.handle_text_input(&ctx);
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        assert_eq!(app.editor.document().plain_text(), "keep text");
+        assert!(!app.is_dirty());
+        assert!(!app.editor.can_undo());
+    }
 
     #[test]
     fn failed_docx_open_retains_document_selection_history_and_unsaved_edits() {

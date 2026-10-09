@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+mod search;
+
 use crate::document::{Block, Document, Image, Paragraph, Run, Section, Table};
 use crate::selection::{CellAddress, DocPosition, EditFocus, Selection};
 use crate::style::{
@@ -19,6 +21,8 @@ pub enum EditError {
     EmptyDocument,
     #[error("table cell out of range")]
     InvalidCell,
+    #[error("replacement text must not contain paragraph breaks")]
+    InvalidReplacement,
 }
 
 #[derive(Debug, Clone)]
