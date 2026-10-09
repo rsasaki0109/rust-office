@@ -41,7 +41,12 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 * Interchange-friendly formats (JSON / ODT / DOCX / XLSX / PPTX / PDF)
 * Incremental delivery: ship real apps early, deepen fidelity continuously
 
-## Current status (~42% suite completeness)
+## Current status (55% of the daily-use roadmap)
+
+The [90% roadmap](docs/ROADMAP_90.md) tracks 20 acceptance milestones for daily
+use across Writer, Calc, Impress, data protection, and distribution. This is a
+project milestone score, not a measure of full Microsoft Office / LibreOffice
+compatibility. Unmerged work is tracked separately.
 
 ### Writer
 
