@@ -424,3 +424,41 @@ current document; Undo/Redo and the native save path remain usable.
 These limits bound admitted input/model sizes, not exact peak RAM or processing
 time. Recovery copies and equivalent aggregate limits for other formats remain
 unfinished, so this does not complete the data-protection roadmap milestone.
+
+
+### Writer crash recovery
+
+Writer records a native JSON recovery copy immediately on the first dirty frame,
+then at most every 15 seconds, including while Calc or Impress is active. The copy
+is limited to 32 MiB and atomically replaced; a failed write keeps the previous
+copy and reports an error. Serialization and disk I/O currently run on the UI
+thread, so large documents or slow storage can briefly pause interaction. Changes
+since the last successful copy can be lost. This covers Writer only.
+
+Copies live under `rust-office/recovery/writer` in Linux `XDG_STATE_HOME` (or
+`~/.local/state`), macOS `~/Library/Application Support`, or Windows
+`LOCALAPPDATA`. Each process holds a separate session file lock. Copies belonging
+to running processes are excluded from recovery candidates. At startup, stale
+copies can be recovered, kept for later, or deleted with confirmation. File →
+Recovery copies reopens this list. Unreadable or oversized copies remain on disk
+until explicitly deleted. Recovery is unavailable if the state directory cannot
+be created or locked; normal editing and saving remain available.
+
+Recovery preserves the native document model, including embedded image bytes and
+headers/footers, but does not restore runtime Undo/Redo or the original save path.
+The recovered document is dirty and its first Save asks for a destination. A new
+recovery copy is written before retiring the old one, so another crash remains
+recoverable. External image paths still depend on the referenced files being
+available. Successful Save, New, Open, or an authorized normal close removes the
+current session copy. Failed operations and cancelled close dialogs retain it.
+Copies postponed from previous sessions remain available.
+
+Regression coverage checks live-session exclusion, repeated recovery, bounded
+write failure, corrupt copies, native model preservation, dirty-state/history
+reset, save-path isolation and unavailable storage. Calc/Impress recovery and
+aggregate limits for other formats remain pending; this work adds no roadmap
+points until the complete stability milestone is accepted on main.
+A Linux Xvfb/Openbox native test killed the Writer process with SIGKILL, restarted
+it, recovered Japanese text plus unsaved edits, verified original-file bytes were
+unchanged, saved to a newly selected path, and checked copy cleanup and normal
+close. Native Windows/macOS recovery has not been verified.

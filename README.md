@@ -57,6 +57,7 @@ compatibility. Unmerged work is tracked separately.
 * Tables, images, lists (incl. nested), hyperlinks
 * Open/save: `.roffice.json`, `.odt`, `.docx` (MVP round-trips)
 * Print / Export PDF from on-screen layout (embedded images)
+* Writer recovery copies for unsaved edits; restart recovery opens an unsaved document for Save As
 
 ### Calc
 

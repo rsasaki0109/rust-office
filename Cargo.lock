@@ -2495,6 +2495,7 @@ dependencies = [
  "office-render",
  "open",
  "rfd",
+ "serde_json",
  "tempfile",
 ]
 
