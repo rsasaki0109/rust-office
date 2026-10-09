@@ -25,6 +25,10 @@ pub enum SwitchTo {
 }
 
 pub struct CalcApp {
+    recovery: Option<crate::recovery::Recovery<crate::calc_recovery::CalcSnapshot>>,
+    recovery_open: bool,
+    recovery_selected: usize,
+    recovery_delete: Option<usize>,
     copied_cells: Option<CopiedCells>,
     clipboard: Option<arboard::Clipboard>,
     copy_pending: bool,
@@ -66,6 +70,10 @@ impl CalcApp {
         let edit_buf = workbook.active_sheet().raw(CellAddr::new(0, 0)).to_owned();
 
         Self {
+            recovery: None,
+            recovery_open: false,
+            recovery_selected: 0,
+            recovery_delete: None,
             copied_cells: None,
             clipboard: None,
             copy_pending: false,
@@ -84,6 +92,198 @@ impl CalcApp {
             last_error: None,
             pending_action: None,
             pending_switch: None,
+        }
+    }
+
+    pub(super) fn has_pending_recovery(&self) -> bool {
+        self.recovery_open
+    }
+
+    pub(super) fn enable_recovery(&mut self, root: Result<PathBuf, String>) {
+        match root.and_then(|root| crate::recovery::Recovery::new(&root)) {
+            Ok(store) => {
+                self.recovery_open = !store.entries.is_empty();
+                self.recovery = Some(store);
+            }
+            Err(e) => self.set_error(format!("Calc recovery unavailable: {e}")),
+        }
+    }
+    pub(super) fn recovery_tick(&mut self, ctx: &Context) {
+        let label = self
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled Calc document".into());
+        let dirty = self.is_dirty();
+        if let Some(store) = &mut self.recovery {
+            ctx.request_repaint_after(crate::recovery::INTERVAL);
+            if dirty && store.due(std::time::Instant::now()) {
+                let draft = self
+                    .editing
+                    .then_some((self.active, self.edit_buf.as_str()));
+                let snapshot = crate::calc_recovery::CalcSnapshot::capture(&self.workbook, draft);
+                if let Err(e) = store.tick(&snapshot, true, &label, std::time::Instant::now()) {
+                    self.set_error(format!("Calc recovery copy failed: {e}"));
+                }
+            } else if !dirty {
+                self.clear_recovery();
+            }
+        }
+    }
+    pub(super) fn clear_recovery(&mut self) {
+        if let Some(store) = &mut self.recovery {
+            if let Err(e) = store.clear() {
+                self.set_error(format!("Calc recovery cleanup failed: {e}"));
+            }
+        }
+    }
+    fn open_recovery(&mut self) {
+        let Some(store) = &mut self.recovery else {
+            self.set_error("Calc recovery is unavailable");
+            return;
+        };
+        match store.refresh() {
+            Ok(()) => {
+                self.recovery_selected = 0;
+                self.recovery_open = true;
+            }
+            Err(e) => self.set_error(format!("Could not list recovery copies: {e}")),
+        }
+    }
+    fn restore_recovery(&mut self, index: usize) -> bool {
+        if self.is_dirty() {
+            self.set_error("Save the current document before recovering another copy");
+            return false;
+        }
+        let Some(store) = &mut self.recovery else {
+            return false;
+        };
+        match store.restore(index) {
+            Ok(doc) => {
+                let warning = store.cleanup_warning.take();
+                self.workbook = doc.into_workbook();
+                self.file_path = None;
+                self.reset_copy();
+                self.editing = false;
+                self.select_cell(CellAddr::new(0, 0), false);
+                self.focus_formula = false;
+                self.scroll_to_active = true;
+                self.recovery_open = false;
+                self.recovery_delete = None;
+                self.recovery.as_mut().unwrap().postpone();
+                self.set_status("Recovered unsaved Calc document — use Save As to keep it");
+                if let Some(e) = warning {
+                    self.set_error(format!(
+                        "Recovered document; older copy cleanup failed: {e}"
+                    ));
+                }
+                true
+            }
+            Err(e) => {
+                self.set_error(format!("Recovery failed: {e}"));
+                false
+            }
+        }
+    }
+    fn show_recovery_dialog(&mut self, ctx: &Context) {
+        if !self.recovery_open {
+            return;
+        }
+        let mut restore = None;
+        let mut delete = None;
+        let mut later = false;
+        let response = egui::Modal::new(egui::Id::new("calc_recovery")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            if let Some(index) = self.recovery_delete {
+                ui.heading("Delete recovery copy?");
+                ui.label("Permanently delete this recovery copy?");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        delete = Some(index);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.recovery_delete = None;
+                    }
+                });
+            } else {
+                ui.heading("Unsaved Calc documents found");
+                ui.label("Select a copy to recover. Recovered documents use Save As.");
+                let entries = self.recovery.as_ref().map(|s| &s.entries);
+                let count = entries.map_or(0, Vec::len);
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        if let Some(entries) = entries {
+                            for (index, entry) in entries.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.recovery_selected,
+                                    index,
+                                    &entry.label,
+                                );
+                            }
+                        }
+                    });
+                if count == 0 {
+                    ui.label("No available recovery copies.");
+                }
+                if self.is_dirty() {
+                    ui.label("Save your current document before recovering another copy.");
+                }
+                if let Some(error) = &self.last_error {
+                    ui.colored_label(Color32::RED, error);
+                }
+                let can_restore = count > 0 && !self.is_dirty();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_restore, egui::Button::new("Recover (Enter)"))
+                        .clicked()
+                    {
+                        restore = Some(self.recovery_selected);
+                    }
+                    if ui.button("Keep for later").clicked() {
+                        later = true;
+                    }
+                    if ui
+                        .add_enabled(count > 0, egui::Button::new("Delete copy…"))
+                        .clicked()
+                    {
+                        self.recovery_delete = Some(self.recovery_selected);
+                    }
+                });
+                if can_restore
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+                {
+                    restore = Some(self.recovery_selected);
+                }
+            }
+        });
+        if response.should_close() {
+            if self.recovery_delete.is_some() {
+                self.recovery_delete = None;
+            } else {
+                later = true;
+            }
+        }
+        if let Some(index) = delete {
+            let result = self.recovery.as_mut().unwrap().delete(index);
+            match result {
+                Ok(()) => {
+                    self.recovery_selected = 0;
+                    self.recovery_delete = None;
+                }
+                Err(e) => self.set_error(format!("Recovery copy deletion failed: {e}")),
+            }
+        }
+        if let Some(index) = restore {
+            self.restore_recovery(index);
+        }
+        if later {
+            self.recovery_open = false;
+            self.recovery_delete = None;
+            if let Some(store) = &mut self.recovery {
+                store.postpone();
+            }
         }
     }
 
@@ -329,6 +529,7 @@ impl CalcApp {
     fn do_new_sheet(&mut self) {
         self.reset_copy();
         self.workbook = Workbook::new();
+        self.clear_recovery();
         self.file_path = None;
         self.editing = false;
         self.select_cell(CellAddr::new(0, 0), false);
@@ -363,6 +564,7 @@ impl CalcApp {
             Ok(wb) => {
                 self.reset_copy();
                 self.workbook = wb;
+                self.clear_recovery();
                 self.file_path = Some(path.clone());
                 self.editing = false;
                 self.select_cell(CellAddr::new(0, 0), false);
@@ -464,6 +666,7 @@ impl CalcApp {
             Ok(()) => {
                 self.workbook = workbook;
                 self.workbook.mark_clean();
+                self.clear_recovery();
                 self.editing = false;
                 self.file_path = Some(path.to_path_buf());
                 self.set_status(format!("Saved {}", path.display()));
@@ -493,6 +696,10 @@ impl CalcApp {
                 }
                 if ui.button("Save As…").clicked() {
                     self.save_file_as();
+                    ui.close();
+                }
+                if ui.button("Recovery copies…").clicked() {
+                    self.open_recovery();
                     ui.close();
                 }
                 ui.separator();
@@ -880,11 +1087,13 @@ impl App for CalcApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
-        if self.pending_action.is_none() && ui.is_enabled() {
+        let recovery_was_open = self.recovery_open;
+        self.show_recovery_dialog(&ctx);
+        if self.pending_action.is_none() && !recovery_was_open && ui.is_enabled() {
             self.handle_keys(&ctx);
         }
         self.show_unsaved_dialog(&ctx);
-        if self.pending_action.is_some() {
+        if self.pending_action.is_some() || recovery_was_open {
             ui.disable();
         }
 
@@ -1404,5 +1613,101 @@ mod reference_tests {
             restored.active_sheet().display(CellAddr::new(0, 0)),
             "#REF!"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::{calc_recovery::CalcSnapshot, recovery::Recovery};
+    fn crash_copy(root: &std::path::Path) {
+        let mut book = Workbook::new();
+        book.set_cell(CellAddr::new(0, 0), "日本語");
+        book.add_sheet("Other");
+        let mut store = Recovery::new(root).unwrap();
+        store
+            .tick(
+                &CalcSnapshot::capture(&book, None),
+                true,
+                "original.xlsx",
+                std::time::Instant::now(),
+            )
+            .unwrap();
+    }
+    #[test]
+    fn restore_is_dirty_without_original_path_and_failed_save_keeps_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        crash_copy(dir.path());
+        let original = dir.path().join("original.xlsx");
+        std::fs::write(&original, b"original bytes").unwrap();
+        let mut app = CalcApp::new();
+        app.file_path = Some(original.clone());
+        app.enable_recovery(Ok(dir.path().into()));
+        assert!(app.restore_recovery(0));
+        assert!(app.file_path.is_none() && app.is_dirty());
+        assert!(!app.workbook.can_undo());
+        assert_eq!(app.workbook.sheet_count(), 2);
+        assert!(app.recovery.as_ref().unwrap().has_snapshot);
+        assert!(!app.save_to(&dir.path().join("lossy.csv")));
+        assert!(app.is_dirty() && app.recovery.as_ref().unwrap().has_snapshot);
+        assert_eq!(std::fs::read(&original).unwrap(), b"original bytes");
+        let destination = dir.path().join("restored.xlsx");
+        assert!(app.save_to(&destination));
+        assert!(!app.is_dirty() && !app.recovery.as_ref().unwrap().has_snapshot);
+        assert_eq!(
+            load_xlsx_path(&destination).unwrap().sheets[0].raw(CellAddr::new(0, 0)),
+            "日本語"
+        );
+    }
+    #[test]
+    fn formula_draft_is_captured_without_committing_live_edit_or_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = CalcApp::new();
+        app.enable_recovery(Ok(dir.path().into()));
+        app.editing = true;
+        app.edit_buf = "未確定 draft".into();
+        app.recovery_tick(&Context::default());
+        assert_eq!(app.workbook.active_sheet().raw(CellAddr::new(0, 0)), "Item");
+        assert!(app.editing && !app.workbook.can_undo());
+        drop(app);
+        let mut next = CalcApp::new();
+        next.enable_recovery(Ok(dir.path().into()));
+        assert!(next.restore_recovery(0));
+        assert_eq!(
+            next.workbook.active_sheet().raw(CellAddr::new(0, 0)),
+            "未確定 draft"
+        );
+        assert!(!next.editing && next.is_dirty());
+    }
+    #[test]
+    fn pending_draft_blocks_restore_and_postponed_copy_survives_new() {
+        let dir = tempfile::tempdir().unwrap();
+        crash_copy(dir.path());
+        let mut app = CalcApp::new();
+        app.enable_recovery(Ok(dir.path().into()));
+        app.editing = true;
+        app.edit_buf = "keep this".into();
+        assert!(!app.restore_recovery(0));
+        assert_eq!(app.edit_buf, "keep this");
+        app.recovery.as_mut().unwrap().postpone();
+        app.do_new_sheet();
+        drop(app);
+        assert_eq!(
+            Recovery::<CalcSnapshot>::new(dir.path())
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn unavailable_recovery_does_not_block_normal_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"x").unwrap();
+        let mut app = CalcApp::new();
+        app.enable_recovery(Ok(root));
+        assert!(app.recovery.is_none() && app.last_error.is_some());
+        assert!(app.save_to(&dir.path().join("normal.xlsx")));
     }
 }

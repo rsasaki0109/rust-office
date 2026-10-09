@@ -1,4 +1,4 @@
-//! Writer recovery copies, isolated by live-session file locks.
+//! Typed recovery copies, isolated by live-session file locks.
 use office_core::Document;
 use office_format::{DocumentFormat, JsonFormat};
 use std::{
@@ -37,7 +37,31 @@ pub struct Entry {
     pub label: String,
     modified: SystemTime,
 }
-pub struct Recovery {
+pub trait RecoveryData: serde::Serialize {
+    const PREFIX: &'static str;
+    fn validate(&self) -> Result<(), String>;
+    fn decode(bytes: &[u8]) -> Result<Self, String>
+    where
+        Self: Sized;
+}
+impl RecoveryData for Document {
+    const PREFIX: &'static str = "writer-";
+    fn validate(&self) -> Result<(), String> {
+        if self.sections.is_empty() || self.format_version > Document::CURRENT_FORMAT_VERSION {
+            Err("Invalid recovery document version or sections".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        JsonFormat
+            .load_from_reader(&mut io::Cursor::new(bytes))
+            .map_err(|e| e.to_string())
+    }
+}
+
+pub struct Recovery<T: RecoveryData = Document> {
+    kind: std::marker::PhantomData<T>,
     root: PathBuf,
     own: PathBuf,
     lease: Option<File>,
@@ -61,7 +85,7 @@ fn protect_target(path: &Path) -> Result<(), String> {
         Err(e) => Err(e.to_string()),
     }
 }
-impl Recovery {
+impl<T: RecoveryData> Recovery<T> {
     pub fn new(root: &Path) -> Result<Self, String> {
         fs::create_dir_all(root).map_err(|e| e.to_string())?;
         #[cfg(unix)]
@@ -71,7 +95,7 @@ impl Recovery {
                 .map_err(|e| e.to_string())?;
         }
         let own = tempfile::Builder::new()
-            .prefix("writer-")
+            .prefix(T::PREFIX)
             .tempdir_in(root)
             .map_err(|e| e.to_string())?
             .keep();
@@ -84,6 +108,7 @@ impl Recovery {
             .map_err(|e| e.to_string())?;
         lease.try_lock().map_err(|e| e.to_string())?;
         let mut this = Self {
+            kind: std::marker::PhantomData,
             root: root.into(),
             own,
             lease: Some(lease),
@@ -103,7 +128,7 @@ impl Recovery {
                 || !candidate
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("writer-")
+                    .starts_with(T::PREFIX)
             {
                 continue;
             }
@@ -137,9 +162,9 @@ impl Recovery {
                             .ok()
                             .map(|_| value)
                     })
-                    .unwrap_or_else(|| "Unsaved Writer document".into())
+                    .unwrap_or_else(|| "Unsaved document".into())
             } else {
-                "Unsaved Writer document".into()
+                "Unsaved document".into()
             };
             let modified = fs::metadata(directory.join(SNAPSHOT))
                 .and_then(|m| m.modified())
@@ -164,13 +189,7 @@ impl Recovery {
         self.last_attempt
             .is_none_or(|last| now.saturating_duration_since(last) >= INTERVAL)
     }
-    pub fn tick(
-        &mut self,
-        doc: &Document,
-        dirty: bool,
-        label: &str,
-        now: Instant,
-    ) -> Result<(), String> {
+    pub fn tick(&mut self, doc: &T, dirty: bool, label: &str, now: Instant) -> Result<(), String> {
         if !dirty {
             return self.clear();
         }
@@ -180,13 +199,11 @@ impl Recovery {
         self.last_attempt = Some(now);
         self.save(doc, label)
     }
-    fn save(&mut self, doc: &Document, label: &str) -> Result<(), String> {
+    fn save(&mut self, doc: &T, label: &str) -> Result<(), String> {
         self.save_with_limit(doc, label, MAX_SNAPSHOT)
     }
-    fn save_with_limit(&mut self, doc: &Document, label: &str, limit: u64) -> Result<(), String> {
-        if doc.sections.is_empty() || doc.format_version > Document::CURRENT_FORMAT_VERSION {
-            return Err("Invalid recovery document version or sections".into());
-        }
+    fn save_with_limit(&mut self, doc: &T, label: &str, limit: u64) -> Result<(), String> {
+        doc.validate()?;
         let snapshot = self.own.join(SNAPSHOT);
         let source = self.own.join(SOURCE);
         protect_target(&snapshot)?;
@@ -203,7 +220,7 @@ impl Recovery {
         office_core::storage::atomic_write(&source, label.as_bytes()).map_err(|e| e.to_string())?;
         Ok(())
     }
-    pub fn restore(&mut self, index: usize) -> Result<Document, String> {
+    pub fn restore(&mut self, index: usize) -> Result<T, String> {
         let entry = self
             .entries
             .get(index)
@@ -223,9 +240,8 @@ impl Recovery {
         if bytes.len() as u64 > MAX_SNAPSHOT {
             return Err("Recovery copy exceeds the 32 MiB limit".into());
         }
-        let doc = JsonFormat
-            .load_from_reader(&mut io::Cursor::new(bytes))
-            .map_err(|e| e.to_string())?;
+        let doc = T::decode(&bytes)?;
+        doc.validate()?;
         let label = entry.label.clone();
         // Transfer durably before retiring the old copy. A second crash remains recoverable.
         self.save(&doc, &label)?;
@@ -262,7 +278,7 @@ impl Recovery {
         Ok(())
     }
 }
-impl Drop for Recovery {
+impl<T: RecoveryData> Drop for Recovery<T> {
     fn drop(&mut self) {
         self.lease.take();
         if !self.has_snapshot {
@@ -297,14 +313,14 @@ mod tests {
     fn live_sessions_are_skipped_and_crashed_copies_are_claimed_once() {
         let dir = tempfile::tempdir().unwrap();
         let doc = Document::with_text("日本語 recovery");
-        let mut first = Recovery::new(dir.path()).unwrap();
+        let mut first = Recovery::<Document>::new(dir.path()).unwrap();
         first.save(&doc, "original.docx").unwrap();
-        let mut second = Recovery::new(dir.path()).unwrap();
+        let mut second = Recovery::<Document>::new(dir.path()).unwrap();
         assert!(second.entries.is_empty());
         drop(first);
         second.refresh().unwrap();
         assert_eq!(second.entries.len(), 1);
-        let third = Recovery::new(dir.path()).unwrap();
+        let third = Recovery::<Document>::new(dir.path()).unwrap();
         assert!(third.entries.is_empty());
         drop(third);
         second.postpone();
@@ -315,24 +331,27 @@ mod tests {
     fn restored_data_is_durable_before_old_copy_is_retired() {
         let dir = tempfile::tempdir().unwrap();
         let doc = Document::with_text("日本語 & <text>\nsecond");
-        let mut first = Recovery::new(dir.path()).unwrap();
+        let mut first = Recovery::<Document>::new(dir.path()).unwrap();
         first.save(&doc, "untitled").unwrap();
         drop(first);
-        let mut second = Recovery::new(dir.path()).unwrap();
+        let mut second = Recovery::<Document>::new(dir.path()).unwrap();
         assert_eq!(second.restore(0).unwrap(), doc);
         assert!(second.entries.is_empty());
         drop(second);
-        let mut third = Recovery::new(dir.path()).unwrap();
+        let mut third = Recovery::<Document>::new(dir.path()).unwrap();
         assert_eq!(third.entries.len(), 1);
         assert_eq!(third.restore(0).unwrap(), doc);
         third.clear().unwrap();
         drop(third);
-        assert!(Recovery::new(dir.path()).unwrap().entries.is_empty());
+        assert!(Recovery::<Document>::new(dir.path())
+            .unwrap()
+            .entries
+            .is_empty());
     }
     #[test]
     fn failed_write_preserves_prior_copy_and_timer_does_not_change_document() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Recovery::new(dir.path()).unwrap();
+        let mut store = Recovery::<Document>::new(dir.path()).unwrap();
         let doc = Document::with_text("first");
         let now = Instant::now();
         store.tick(&doc, true, "original.odt", now).unwrap();
@@ -355,12 +374,12 @@ mod tests {
     #[test]
     fn corrupt_or_oversized_copies_are_retained_when_restore_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let mut first = Recovery::new(dir.path()).unwrap();
+        let mut first = Recovery::<Document>::new(dir.path()).unwrap();
         first.save(&Document::new(), "bad").unwrap();
         let path = first.own.join(SNAPSHOT);
         drop(first);
         fs::write(&path, b"not json").unwrap();
-        let mut next = Recovery::new(dir.path()).unwrap();
+        let mut next = Recovery::<Document>::new(dir.path()).unwrap();
         assert!(next.restore(0).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"not json");
         assert_eq!(next.entries.len(), 1);
@@ -386,10 +405,10 @@ mod tests {
             .push(office_core::Block::Image(
                 office_core::Image::from_embedded("image/png", vec![1, 2, 3], "image", 32.0, 24.0),
             ));
-        let mut first = Recovery::new(dir.path()).unwrap();
+        let mut first = Recovery::<Document>::new(dir.path()).unwrap();
         first.save(&doc, "document.roffice.json").unwrap();
         drop(first);
-        let mut second = Recovery::new(dir.path()).unwrap();
+        let mut second = Recovery::<Document>::new(dir.path()).unwrap();
         assert_eq!(second.restore(0).unwrap(), doc);
     }
 }

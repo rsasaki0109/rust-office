@@ -462,3 +462,41 @@ A Linux Xvfb/Openbox native test killed the Writer process with SIGKILL, restart
 it, recovered Japanese text plus unsaved edits, verified original-file bytes were
 unchanged, saved to a newly selected path, and checked copy cleanup and normal
 close. Native Windows/macOS recovery has not been verified.
+
+
+### Calc crash recovery
+
+Calc uses the shared session-lock, bounded atomic-write and recovery-candidate
+storage from Writer, in the sibling `rust-office/recovery/calc` state directory.
+Writer's previous snapshot names and native JSON schema remain compatible. If
+only Calc has pending copies, the suite starts in Calc to show recovery; Writer
+copies take priority when both modules have pending copies. Calc's File → Recovery
+copies menu makes postponed copies available later.
+
+A versioned JSON snapshot stores each sheet's name, dimensions and sparse raw
+cells, plus the active sheet index. Cell tuples use arrays rather than JSON map
+keys. This preserves formulas, apostrophe-prefixed text and Japanese content in
+the current Calc model. A changed formula-bar draft is overlaid on the copy only;
+the live workbook, selection, draft and Undo/Redo remain unchanged. A recovered
+draft becomes the corresponding cell's raw content, rather than an editing
+session. Undo/Redo runtime history and the original save destination are omitted.
+The recovered workbook is dirty, including after Undo back to the recovered
+baseline, until explicitly saved.
+
+Snapshots share the 32 MiB serialized limit and first-dirty/15-second cadence.
+Calc additionally admits at most 1000 sheets and 100,000 stored cells with valid
+Excel-sized dimensions, unique in-bounds cell addresses and a valid active sheet.
+Unsupported versions, unknown fields and malformed copies are rejected and kept
+for later. Snapshot capture allocates a sparse-cell copy and runs on the UI thread;
+these admission limits do not claim a precise peak RAM or latency bound.
+
+Successful Save/New/Open and an authorized suite close clear the current Calc
+copy. Failed Save (including lossy multi-sheet CSV refusal), cancelled actions and
+postponed old copies retain recovery data. Background ticks continue while another
+suite module is active. Native Linux Xvfb/Openbox verification killed Calc with an
+uncommitted formula-bar draft, restarted, recovered Japanese sheet names, multiple
+sheets and formulas, saved to a newly chosen XLSX destination, and independently
+checked the result with openpyxl, unchanged original bytes and copy cleanup.
+Writer's native crash/restart check is repeated after sharing the storage code.
+Windows/macOS native recovery remains unverified. Impress recovery and the rest of
+the stability milestone remain unfinished; completion stays 65%.

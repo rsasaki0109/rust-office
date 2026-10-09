@@ -2,6 +2,7 @@
 
 mod app;
 mod calc_app;
+mod calc_recovery;
 mod calc_clipboard;
 mod fonts;
 mod impress_app;

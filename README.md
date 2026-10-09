@@ -67,6 +67,7 @@ compatibility. Unmerged work is tracked separately.
 * Formula copies adjust relative, absolute and mixed A1 references (including ranges)
 * Literal text input with `'`; XLSX keeps numeric/formula-shaped text and error values
 * Undo/Redo for cell edits, range operations and adding sheets; save state tracking
+* Crash recovery of sparse cells, formulas, multiple sheets and formula-bar drafts
 
 ### Impress
 
