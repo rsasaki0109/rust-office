@@ -207,7 +207,7 @@ pub fn apply_named_paragraph_defaults(style: &mut ParagraphStyle, named: NamedPa
     style.list = list;
 }
 
-/// Page geometry and margins. v0.1 uses a fixed A4 page.
+/// Page geometry and margins in points.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PageStyle {
     /// Page width in points (1 point = 1/72 inch).
@@ -235,6 +235,16 @@ impl Default for PageStyle {
 }
 
 impl PageStyle {
+    /// Whether paper and margins leave at least half an inch of usable content.
+    pub fn is_valid(&self) -> bool {
+        [self.width, self.height].into_iter()
+            .all(|value| value.is_finite() && (72.0..=2880.0).contains(&value))
+            && [self.margin_top, self.margin_bottom, self.margin_left, self.margin_right]
+                .into_iter().all(|value| value.is_finite() && value >= 0.0)
+            && self.width - self.margin_left - self.margin_right >= 36.0
+            && self.height - self.margin_top - self.margin_bottom >= 36.0
+    }
+
     pub fn content_width(&self) -> f32 {
         (self.width - self.margin_left - self.margin_right).max(1.0)
     }
@@ -247,6 +257,27 @@ impl PageStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_geometry_rejects_nonfinite_and_unusable_dimensions() {
+        let defaults = PageStyle::default();
+        assert!(defaults.is_valid());
+        for value in [f32::NAN, f32::INFINITY, -1.0, 0.0, 71.0, 2881.0] {
+            assert!(!PageStyle { width: value, ..defaults.clone() }.is_valid());
+            assert!(!PageStyle { height: value, ..defaults.clone() }.is_valid());
+        }
+        for value in [f32::NAN, f32::INFINITY, -1.0, 600.0] {
+            assert!(!PageStyle { margin_left: value, ..defaults.clone() }.is_valid());
+            assert!(!PageStyle { margin_right: value, ..defaults.clone() }.is_valid());
+        }
+        for value in [f32::NAN, f32::INFINITY, -1.0, 850.0] {
+            assert!(!PageStyle { margin_top: value, ..defaults.clone() }.is_valid());
+            assert!(!PageStyle { margin_bottom: value, ..defaults.clone() }.is_valid());
+        }
+        assert!(PageStyle { width: 72.0, height: 72.0,
+            margin_left: 18.0, margin_right: 18.0,
+            margin_top: 18.0, margin_bottom: 18.0 }.is_valid());
+    }
 
     #[test]
     fn heading_builtins_are_larger_than_normal() {

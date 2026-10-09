@@ -526,9 +526,27 @@ impl WriterApp {
         });
         if apply {
             let (header, footer) = self.header_footer_dialog.take().unwrap_or_default();
-            let _ = self.editor.set_header_text(header.trim());
-            let _ = self.editor.set_footer_text(footer.trim());
-            self.set_status("Header / footer updated");
+            let section = &self.editor.document().sections[0];
+            // Keep existing runs and paragraph formatting when a field is unchanged.
+            let margin = |original: &Option<office_core::Paragraph>, text: String| {
+                if original.as_ref().map(|p| p.plain_text()).unwrap_or_default() == text {
+                    original.clone()
+                } else if text.is_empty() {
+                    None
+                } else {
+                    Some(office_core::Paragraph::from_text(&text))
+                }
+            };
+            let result = self.editor.set_section_settings(
+                0,
+                section.page_style.clone(),
+                margin(&section.header, header),
+                margin(&section.footer, footer),
+            );
+            match result {
+                Ok(()) => self.set_status("Header / footer updated"),
+                Err(error) => self.set_error(error.to_string()),
+            }
         } else if cancel {
             self.header_footer_dialog = None;
         }
