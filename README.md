@@ -69,6 +69,9 @@ compatibility. Unmerged work is tracked separately.
 
 ### Impress
 
+* Slide Show from the beginning (F5) or current slide (Shift+F5); arrows/Space, Home/End and Esc
+* F11 window fullscreen, mouse/button navigation and return to the unchanged editor
+
 * Select, drag and resize title/body text, added text boxes, rectangles, ellipses and embedded images
 * Native JSON preserves object geometry and image bytes; object operations support Undo/Redo
 * PPTX export rejects added objects until their interchange is supported
@@ -104,7 +107,7 @@ rust-office/
 * Named styles beyond Heading 1–3; floating images; footnotes
 * Exact PDF glyph metrics / richer table borders
 * Calc charts / full Excel function library
-* Impress shape/image PPTX interchange, presentation mode and animations
+* Impress shape/image PPTX interchange, PDF sharing and animations
 * Spell check; full accessibility tree
 * Signed Win / macOS installers
 

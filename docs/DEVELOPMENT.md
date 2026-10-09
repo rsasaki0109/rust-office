@@ -178,7 +178,7 @@ Not yet:
 * Calc copies raw values/formulas as tab-separated text. Formatting is not
   exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.
-* Impress: added shape/image PPTX interchange, presentation mode and animations remain unsupported
+* Impress: added shape/image PPTX interchange, PDF sharing and animations remain unsupported
 * Packaging: CI builds Linux binary; no signed macOS/Windows installers yet
 
 ## Suggested next PRs
@@ -287,3 +287,28 @@ subset; added native objects and speaker notes are not supported interchange yet
 Rotation, grouping, object reordering, aspect-lock resize and animations are later
 work. Original title/body geometry is saved in JSON and emitted by the existing
 PPTX writer, but the PPTX reader does not promise geometry round-trip fidelity.
+
+
+Impress slide show starts with F5 (beginning) or Shift+F5 (current slide), or the
+Slide Show menu. The window becomes fullscreen and uses the same renderer as the
+editor for title/body boxes, additional text, shapes and embedded images. A 16:9
+slide fits centrally with black letterboxing and no editing handles or notes.
+Previous/Next buttons, left/right clicks and keyboard navigation control the show;
+Space/Enter/PageDown/right/down advance, PageUp/Backspace/left/up go back, Home/End
+select the endpoints, and Esc/Exit returns to the editor. Endpoints do not wrap.
+
+Show navigation is transient: it never changes document contents, active editing
+slide, object selection, file destination, dirty revision or Undo/Redo history.
+Text events are processed before a pending show starts, then focus is released;
+editing/New/Open/Save/Undo shortcuts are inactive during the show. Closing the
+window ends the show before the existing suite-wide unsaved confirmation. Cancel
+keeps the edited documents and history in the normal editor.
+
+F11 or Slide Show → Window fullscreen toggles the editor window fullscreen.
+Show exit restores the fullscreen flag reported at start. External window-manager
+fullscreen changes were not reported by the X11 backend in the native test;
+application F11 is the tested way to manage and restore fullscreen state. Other
+OS/Wayland behavior still requires the separate platform acceptance checks.
+PDF sharing, PPTX interchange for added objects, presenter-notes views and
+animations remain later work. Completing slide show alone does not complete the
+roadmap milestone that also requires PDF and basic-shape PPTX output.

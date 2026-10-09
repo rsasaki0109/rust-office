@@ -7,6 +7,7 @@ mod fonts;
 mod impress_app;
 mod office;
 mod print_sys;
+mod slideshow;
 mod theme;
 mod unsaved;
 
