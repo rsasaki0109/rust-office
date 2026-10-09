@@ -6,6 +6,10 @@
 mod read;
 mod styles;
 mod write;
+mod xml;
+
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
@@ -17,6 +21,8 @@ use crate::{DocumentFormat, FormatError};
 pub use read::{parse_content_xml, parse_content_xml_with_pictures};
 pub use styles::{apply_styles_xml, parse_master_header_footer};
 pub use write::build_content_xml;
+
+use xml::{content_images, image_part_path, invalid, part_error};
 
 /// OpenDocument Text backend (ZIP package).
 #[derive(Debug, Default, Clone, Copy)]
@@ -31,37 +37,19 @@ impl OdtFormat {
         let cursor = Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(FormatError::from)?;
 
+        let content = utf8_part(read_zip_bytes(&mut archive, "content.xml")?, "content.xml")?;
         let mut pictures: HashMap<String, Vec<u8>> = HashMap::new();
-        let names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
-            .collect();
-        for name in names {
-            let lower = name.to_ascii_lowercase();
-            if !(lower.starts_with("pictures/") || lower.starts_with("media/")) {
-                continue;
+        for href in content_images(&content)? {
+            let path = image_part_path(&href).map_err(|e| part_error("content.xml", e))?;
+            if !pictures.contains_key(&path) {
+                pictures.insert(path.clone(), read_zip_bytes(&mut archive, &path)?);
             }
-            if name.ends_with('/') {
-                continue;
-            }
-            let mut file = archive.by_name(&name).map_err(FormatError::from)?;
-            let mut data = Vec::new();
-            file.read_to_end(&mut data)?;
-            pictures.insert(name, data);
-        }
-
-        let mut content = String::new();
-        {
-            let mut file = archive
-                .by_name("content.xml")
-                .map_err(|_| FormatError::InvalidDocument("ODT missing content.xml".into()))?;
-            file.read_to_string(&mut content)?;
         }
         let mut doc = parse_content_xml_with_pictures(&content, &pictures)?;
 
-        if let Ok(mut file) = archive.by_name("styles.xml") {
-            let mut styles = String::new();
-            file.read_to_string(&mut styles)?;
-            let _ = apply_styles_xml(&mut doc, &styles);
+        if let Some(bytes) = read_optional_zip_bytes(&mut archive, "styles.xml")? {
+            let styles = utf8_part(bytes, "styles.xml")?;
+            apply_styles_xml(&mut doc, &styles)?;
         }
 
         Ok(doc)
@@ -72,6 +60,32 @@ impl OdtFormat {
         write::write_odt_package(document, &mut cursor)?;
         Ok(cursor.into_inner())
     }
+}
+
+fn utf8_part(bytes: Vec<u8>, path: &str) -> Result<String, FormatError> {
+    String::from_utf8(bytes).map_err(|e| part_error(path, invalid(e.to_string())))
+}
+
+fn read_zip_bytes(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<Vec<u8>, FormatError> {
+    read_optional_zip_bytes(archive, path)?.ok_or_else(|| invalid(format!("ODT missing {path}")))
+}
+
+fn read_optional_zip_bytes(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    path: &str,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    let mut file = match archive.by_name(path) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(part_error(path, error.into())),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| part_error(path, e.into()))?;
+    Ok(Some(bytes))
 }
 
 impl DocumentFormat for OdtFormat {

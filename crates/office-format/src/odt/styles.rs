@@ -3,8 +3,9 @@
 use office_core::{Document, Paragraph, Run, TextStyle};
 use quick_xml::events::Event;
 use quick_xml::name::QName;
-use quick_xml::reader::Reader;
+use quick_xml::reader::NsReader;
 
+use super::xml::{self, OFFICE_NS};
 use crate::FormatError;
 
 /// Apply header/footer paragraphs from `styles.xml` onto `document` (in place).
@@ -23,7 +24,9 @@ pub fn apply_styles_xml(document: &mut Document, xml: &str) -> Result<(), Format
 pub fn parse_master_header_footer(
     xml: &str,
 ) -> Result<(Option<Paragraph>, Option<Paragraph>), FormatError> {
-    let mut reader = Reader::from_str(xml);
+    xml::read_xml(xml, "document-styles", OFFICE_NS, |_, _, _| Ok(()))
+        .map_err(|e| xml::part_error("styles.xml", e))?;
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
 
     let mut in_header = false;
@@ -52,9 +55,11 @@ pub fn parse_master_header_footer(
                         current_runs.clear();
                     }
                     "s" if in_p => {
-                        let count = attr_c(&e).unwrap_or(1);
+                        let count = xml::space_count(&e, &reader)?;
                         push_plain(&mut current_runs, &" ".repeat(count));
                     }
+                    "tab" if in_p => push_plain(&mut current_runs, "\t"),
+                    "line-break" if in_p => push_plain(&mut current_runs, "\n"),
                     _ => {}
                 }
             }
@@ -62,9 +67,11 @@ pub fn parse_master_header_footer(
                 let local = local_name(e.name());
                 match local.as_str() {
                     "s" if in_p => {
-                        let count = attr_c(&e).unwrap_or(1);
+                        let count = xml::space_count(&e, &reader)?;
                         push_plain(&mut current_runs, &" ".repeat(count));
                     }
+                    "tab" if in_p => push_plain(&mut current_runs, "\t"),
+                    "line-break" if in_p => push_plain(&mut current_runs, "\n"),
                     "p" if in_header || in_footer => {
                         let para = runs_to_para(std::mem::take(&mut current_runs));
                         if in_header && header.is_none() {
@@ -78,11 +85,18 @@ pub fn parse_master_header_footer(
             }
             Ok(Event::Text(t)) => {
                 if in_p {
-                    let text = t.unescape().unwrap_or_default();
+                    let text = t
+                        .unescape()
+                        .map_err(|e| xml::part_error("styles.xml", xml::invalid(e.to_string())))?;
                     if !text.is_empty() {
                         push_plain(&mut current_runs, &text);
                     }
                 }
+            }
+            Ok(Event::CData(t)) if in_p => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|e| xml::part_error("styles.xml", xml::invalid(e.to_string())))?;
+                push_plain(&mut current_runs, text);
             }
             Ok(Event::End(e)) => {
                 let local = local_name(e.name());
@@ -144,14 +158,4 @@ fn push_plain(runs: &mut Vec<Run>, text: &str) {
 fn local_name(name: QName<'_>) -> String {
     let raw = name.local_name();
     String::from_utf8_lossy(raw.as_ref()).into_owned()
-}
-
-fn attr_c(e: &quick_xml::events::BytesStart<'_>) -> Option<usize> {
-    for a in e.attributes().flatten() {
-        let key = String::from_utf8_lossy(a.key.local_name().as_ref()).into_owned();
-        if key == "c" {
-            return String::from_utf8_lossy(&a.value).parse().ok();
-        }
-    }
-    None
 }
