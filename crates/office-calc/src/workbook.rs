@@ -71,8 +71,10 @@ enum Change {
         index: usize,
         before: String,
         after: String,
+        references: Vec<(usize, CellChange)>,
     },
     DeleteSheet {
+        references: Vec<(usize, CellChange)>,
         sheet: Sheet,
         index: usize,
         previous_active: usize,
@@ -110,6 +112,14 @@ impl Workbook {
             saved_revision: 0,
             next_revision: 0,
         }
+    }
+
+    /// Evaluate with all sheets in one bounded cycle-detection context.
+    pub fn evaluate(&self, sheet: usize, addr: CellAddr) -> crate::Value {
+        crate::formula::evaluate_workbook(self, sheet, addr)
+    }
+    pub fn display(&self, sheet: usize, addr: CellAddr) -> String {
+        self.sheets.get(sheet).map_or_else(|| crate::CalcError::Ref.to_string(), |s| s.format(addr).display(self.evaluate(sheet, addr)))
     }
 
     pub fn active_sheet(&self) -> &Sheet {
@@ -458,21 +468,29 @@ impl Workbook {
                 index,
                 before,
                 after,
+                references,
             } => {
+                for (sheet, change) in references {
+                    let cell = if forward { &change.after } else { &change.before };
+                    self.sheets[*sheet].set_raw(change.addr, cell.as_ref().map_or("", |cell| cell.raw.as_str()));
+                }
                 self.sheets[*index].name = if forward { after } else { before }.clone();
                 self.active = *index;
             }
             Change::DeleteSheet {
+                references,
                 sheet,
                 index,
                 previous_active,
                 next_active,
             } => {
                 if forward {
+                    for (sheet, change) in references { self.sheets[*sheet].set_raw(change.addr, &change.after.as_ref().unwrap().raw); }
                     self.sheets.remove(*index);
                     self.active = *next_active;
                 } else {
                     self.sheets.insert(*index, sheet.clone());
+                    for (sheet, change) in references { self.sheets[*sheet].set_raw(change.addr, &change.before.as_ref().unwrap().raw); }
                     self.active = *previous_active;
                 }
             }
@@ -547,11 +565,24 @@ impl Workbook {
         if before == name {
             return Ok(false);
         }
+        let mut references = Vec::new();
+        for (sheet_index, sheet) in self.sheets.iter().enumerate() {
+            for (addr, cell) in sheet.occupied() {
+                let raw = crate::reference::rename_sheet_references(&cell.raw, &before, &name);
+                if raw != cell.raw {
+                    references.push((sheet_index, CellChange { addr, before: Some(cell.clone()), after: Some(Cell::new(raw)) }));
+                }
+            }
+        }
+        for (sheet_index, change) in &references {
+            self.sheets[*sheet_index].set_raw(change.addr, &change.after.as_ref().unwrap().raw);
+        }
         self.sheets[index].name = name.clone();
         self.record(Change::RenameSheet {
             index,
             before,
             after: name,
+            references,
         });
         Ok(true)
     }
@@ -564,6 +595,15 @@ impl Workbook {
         if self.sheets.len() == 1 {
             return Err(SheetError::LastSheet);
         }
+        let mut references = Vec::new();
+        let name = self.sheets[index].name.clone();
+        for (sheet_index, sheet) in self.sheets.iter().enumerate().filter(|(i, _)| *i != index) {
+            for (addr, cell) in sheet.occupied() {
+                let raw = crate::reference::rewrite_sheet_references(&cell.raw, &name, None);
+                if raw != cell.raw { references.push((sheet_index, CellChange { addr, before: Some(cell.clone()), after: Some(Cell::new(raw)) })); }
+            }
+        }
+        for (sheet_index, change) in &references { self.sheets[*sheet_index].set_raw(change.addr, &change.after.as_ref().unwrap().raw); }
         let previous_active = self.active;
         let sheet = self.sheets.remove(index);
         self.active = if previous_active > index {
@@ -574,6 +614,7 @@ impl Workbook {
             previous_active
         };
         self.record(Change::DeleteSheet {
+            references,
             sheet,
             index,
             previous_active,

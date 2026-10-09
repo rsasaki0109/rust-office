@@ -167,6 +167,46 @@ impl Reference {
     }
 }
 
+/// Rewrite only worksheet qualifiers, retaining strings, local refs and anchors.
+pub(crate) fn rename_sheet_references(raw: &str, old: &str, new: &str) -> String {
+    rewrite_sheet_references(raw, old, Some(new))
+}
+pub(crate) fn rewrite_sheet_references(raw: &str, old: &str, new: Option<&str>) -> String {
+    if !raw.trim_start().starts_with('=') { return raw.to_owned(); }
+    let mut output=String::new();let mut cursor=0;
+    while cursor<raw.len() {
+        let ch=raw[cursor..].chars().next().unwrap();
+        if ch=='"' {
+            let end=quoted_end(raw,cursor,ch);output.push_str(&raw[cursor..end]);cursor=end;continue;
+        }
+        if ch=='\'' || identifier_char(ch) {
+            let end=if ch=='\'' {quoted_end(raw,cursor,ch)} else {token_end(raw,cursor,identifier_char)};
+            let token=&raw[cursor..end];let next=skip_space(raw,end);
+            let name=if ch=='\'' && token.ends_with('\'') { token[1..token.len()-1].replace("''","'") } else {token.to_string()};
+            if raw.as_bytes().get(next)==Some(&b'!') && name.to_lowercase()==old.to_lowercase()
+                && raw.as_bytes().get(cursor.wrapping_sub(1))!=Some(&b']') {
+                if let Some(new) = new {
+                    output.push('\'');output.push_str(&new.replace('\'',"''"));output.push('\'');
+                } else {
+                    let first=skip_space(raw,next+1);
+                    let first_end=token_end(raw,first,identifier_char);
+                    if Reference::parse(&raw[first..first_end]).is_some() {
+                        let mut end=first_end;let colon=skip_space(raw,end);
+                        if raw.as_bytes().get(colon)==Some(&b':') {
+                            let last=skip_space(raw,colon+1);let last_end=token_end(raw,last,identifier_char);
+                            if Reference::parse(&raw[last..last_end]).is_some() {end=last_end;}
+                        }
+                        output.push_str("#REF!");cursor=end;continue;
+                    }
+                    output.push_str(token);
+                }
+            } else {output.push_str(token);}
+            cursor=end;
+        } else {output.push(ch);cursor+=ch.len_utf8();}
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
