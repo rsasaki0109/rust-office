@@ -190,7 +190,7 @@ Not yet:
 
 ## Suggested next PRs
 
-1. Native acceptance of Writer section settings, then aggregate DOCX/ODT input limits
+1. Aggregate DOCX/ODT input limits and recovery acceptance
 2. Win/macOS packaging artifacts + accessibility tree stubs
 3. Calc charting MVP / Impress richer shapes
 
@@ -683,5 +683,14 @@ Insert → Page / Section Setup で、現在のセクションの用紙サイズ
 
 ローカル検証は全341テスト、Clippy、UI ビルド成功。混在用紙、余白、基本書式、
 継承と空欄、二度の形式往復、名前空間別名、不正な参照、PDF の MediaBox を確認した。
-新しい設定ダイアログの実画面テストは実行要求が中断され、未実施。ロードマップは
-受け入れ確認が終わるまで75%のままとする。
+新しい設定ダイアログの実画面テストは当初の実行要求が中断されたが、追加の許可後に
+Linux Xvfb/Openbox 上で完了した。先頭の A4縦と書式付き日本語ヘッダーを保持したまま、
+後続を Letter横・左余白10mm・空白付きヘッダー／フッターに変更できた。設定全体の
+一度の Undo/Redo、未変更の適用で履歴を増やさないこと、幅1mmの適用拒否と取消を確認。
+DOCX/ODT を UI で保存・再読込し、寸法・本文・ヘッダー／フッターと先頭の太字を検証した。
+画面のセクション境界とページ番号を確認し、pypdf で PDF の2ページの MediaBox が
+595.28×841.89 pt と 792×612 pt であることを確認した。
+
+PR #28 は main にマージ済みで、CI の test + clippy と Linux release smoke も成功。
+これで Writer の最後の5点を受け入れ、ロードマップの現在値は80%（16/20項目）となる。
+これは日常利用の MVP の達成度であり、全機能・全OSの互換性を示すものではない。
