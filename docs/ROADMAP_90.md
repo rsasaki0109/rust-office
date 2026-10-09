@@ -66,8 +66,9 @@
   既存テキスト枠・ノート・テーマを含む [PR #16](https://github.com/rsasaki0109/rust-office/pull/16) で実装・検証・マージ済み。
 - [ ] 全画面の発表、次／前・終了操作、PDF 共有と PPTX の基本図形出力を備える。
   発表モード [PR #18](https://github.com/rsasaki0109/rust-office/pull/18)、
-  画像形式の PDF 共有 [PR #19](https://github.com/rsasaki0109/rust-office/pull/19) が進行中。
-  PPTX 基本図形出力と各 PR のマージが揃うまで加点しない。
+  画像形式の PDF 共有 [PR #19](https://github.com/rsasaki0109/rust-office/pull/19)、
+  基本オブジェクトの PPTX 出力・再読込が進行中。
+  各 PR のマージと受け入れ確認が揃うまで加点しない。
 
 ### 配布・使いやすさ（15点）
 

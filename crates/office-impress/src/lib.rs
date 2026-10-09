@@ -6,6 +6,7 @@ mod json;
 mod model;
 mod objects;
 mod pptx;
+mod pptx_objects;
 mod pptx_read;
 mod theme;
 

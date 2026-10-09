@@ -77,11 +77,12 @@ compatibility. Unmerged work is tracked separately.
 
 * Select, drag and resize title/body text, added text boxes, rectangles, ellipses and embedded images
 * Native JSON preserves object geometry and image bytes; object operations support Undo/Redo
-* PPTX export rejects added objects until their interchange is supported
-* PPTX import rejects images, shapes without text bodies, groups, connectors and charts instead of silently dropping them
+* Editable PPTX export of text boxes, rectangles, ellipses, embedded images and plain speaker notes
+* Reopen rust-office basic PPTX files with geometry, colors, font sizes, object order and themes preserved
+* Other PPTX files retain title/body MVP import; unsupported objects produce an error
 
 * Slides, Light / Dark / Ocean themes
-* JSON + PPTX open/export (title + body MVP)
+* Native JSON open/save and separate PPTX import/export
 
 ### Platform
 
@@ -111,7 +112,7 @@ rust-office/
 * Named styles beyond Heading 1–3; floating images; footnotes
 * Exact PDF glyph metrics / richer table borders
 * Calc charts / full Excel function library
-* Impress shape/image PPTX interchange, searchable/vector slide PDF and animations
+* Arbitrary third-party PPTX object/layout interchange, searchable/vector slide PDF and animations
 * Spell check; full accessibility tree
 * Signed Win / macOS installers
 

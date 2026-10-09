@@ -265,6 +265,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&p).unwrap()).unwrap();
         assert!(load_json_path(&path).is_err());
         p.slides[0].objects[0] = SlideObject::shape(ShapeKind::Rectangle);
+        p.slides[0].objects[0].bounds.w = -1.0;
         let pptx = dir.path().join("existing.pptx");
         std::fs::write(&pptx, b"original pptx").unwrap();
         assert!(write_pptx_path(&p, &pptx).is_err());
