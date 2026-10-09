@@ -323,6 +323,15 @@ impl Workbook {
         self.saved_revision = self.revision;
     }
 
+    /// Restored data has no saved revision and no runtime history.
+    pub fn mark_recovered(&mut self) {
+        self.clear_history();
+        self.revision = 0;
+        self.next_revision = 0;
+        self.saved_revision = u64::MAX;
+        self.dirty = true;
+    }
+
     /// Drop demo/import history without changing the current save state.
     pub fn clear_history(&mut self) {
         self.undo_stack.clear();

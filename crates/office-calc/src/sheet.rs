@@ -34,6 +34,53 @@ fn default_cols() -> u32 {
     DEFAULT_COLS
 }
 
+/// JSON-safe presentation data for crash recovery, including styled blank cells.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SheetPresentation {
+    formats: Vec<(u32, u32, crate::CellFormat)>,
+    dimensions: crate::dimensions::Dimensions,
+}
+
+impl SheetPresentation {
+    pub fn validate(&self, rows: u32, cols: u32) -> Result<(), String> {
+        if rows == 0
+            || rows > crate::MAX_SHEET_ROWS
+            || cols == 0
+            || cols > crate::MAX_SHEET_COLS
+            || self.formats.len() > 100_000
+        {
+            return Err("Invalid presentation bounds or format count".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (col, row, _) in &self.formats {
+            if *col >= cols || *row >= rows || !seen.insert((*col, *row)) {
+                return Err("Invalid or duplicate presentation cell".into());
+            }
+        }
+        for (axis, limit) in [
+            (crate::DimensionAxis::Rows, rows),
+            (crate::DimensionAxis::Columns, cols),
+        ] {
+            axis.validate(self.dimensions.default_size(axis))
+                .map_err(|e| e.to_string())?;
+            for (index, size) in self.dimensions.iter(axis) {
+                if index >= limit {
+                    return Err("Presentation dimension exceeds sheet bounds".into());
+                }
+                axis.validate(size).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.formats.len()
+            + self.dimensions.iter(crate::DimensionAxis::Rows).count()
+            + self.dimensions.iter(crate::DimensionAxis::Columns).count()
+    }
+}
+
 impl Sheet {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -44,6 +91,30 @@ impl Sheet {
             rows: DEFAULT_ROWS,
             cols: DEFAULT_COLS,
         }
+    }
+
+    pub fn presentation(&self) -> SheetPresentation {
+        let mut formats: Vec<_> = self
+            .formatted()
+            .map(|(addr, format)| (addr.col, addr.row, format.clone()))
+            .collect();
+        formats.sort_by_key(|(col, row, _)| (*row, *col));
+        SheetPresentation {
+            formats,
+            dimensions: self.dimensions.clone(),
+        }
+    }
+
+    /// Restore validated presentation without creating editing history.
+    pub fn restore_presentation(&mut self, presentation: SheetPresentation) -> Result<(), String> {
+        presentation.validate(self.rows, self.cols)?;
+        self.formats = presentation
+            .formats
+            .into_iter()
+            .map(|(col, row, format)| ((col, row), format))
+            .collect();
+        self.dimensions = presentation.dimensions;
+        Ok(())
     }
 
     pub fn get(&self, addr: CellAddr) -> Option<&Cell> {

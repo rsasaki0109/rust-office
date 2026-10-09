@@ -37,6 +37,7 @@ impl DimensionAxis {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Dimensions {
     pub(crate) default_column: f64,
     pub(crate) default_row: f64,

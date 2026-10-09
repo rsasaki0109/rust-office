@@ -130,6 +130,10 @@ impl WriterApp {
         }
     }
 
+    pub(super) fn has_pending_recovery(&self) -> bool {
+        self.recovery_open
+    }
+
     pub(super) fn enable_recovery(&mut self, root: Result<PathBuf, String>) {
         match root.and_then(|root| crate::recovery::Recovery::new(&root)) {
             Ok(store) => {
@@ -2317,7 +2321,7 @@ mod recovery_tests {
     use super::*;
     use office_core::Document;
     fn crashed_copy(root: &std::path::Path, doc: &Document) {
-        let mut store = crate::recovery::Recovery::new(root).unwrap();
+        let mut store = crate::recovery::Recovery::<office_core::Document>::new(root).unwrap();
         store
             .tick(doc, true, "original.docx", Instant::now())
             .unwrap();
@@ -2345,7 +2349,7 @@ mod recovery_tests {
         assert!(app.save_file());
         assert_eq!(load_document(&restored).unwrap(), doc);
         drop(app);
-        assert!(crate::recovery::Recovery::new(&root)
+        assert!(crate::recovery::Recovery::<office_core::Document>::new(&root)
             .unwrap()
             .entries
             .is_empty());
@@ -2365,7 +2369,7 @@ mod recovery_tests {
         app.recovery.as_mut().unwrap().postpone();
         drop(app);
         assert_eq!(
-            crate::recovery::Recovery::new(dir.path())
+            crate::recovery::Recovery::<office_core::Document>::new(dir.path())
                 .unwrap()
                 .entries
                 .len(),

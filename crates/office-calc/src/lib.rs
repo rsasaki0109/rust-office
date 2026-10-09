@@ -26,6 +26,6 @@ pub use dimensions::{DimensionAxis, DimensionError, DEFAULT_COLUMN_WIDTH, DEFAUL
 pub use format::{CellFormat, FormatChange};
 pub use formula::evaluate_formula;
 pub use reference::translate_formula;
-pub use sheet::{Sheet, DEFAULT_COLS, DEFAULT_ROWS};
+pub use sheet::{Sheet, SheetPresentation, DEFAULT_COLS, DEFAULT_ROWS};
 pub use workbook::{SheetError, Workbook};
 pub use xlsx::{load_xlsx_path, write_xlsx_bytes, write_xlsx_path, XlsxError};
