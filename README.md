@@ -41,7 +41,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 * Interchange-friendly formats (JSON / ODT / DOCX / XLSX / PPTX / PDF)
 * Incremental delivery: ship real apps early, deepen fidelity continuously
 
-## Current status (45% of the daily-use roadmap)
+## Current status (55% of the daily-use roadmap)
 
 The [90% roadmap](docs/ROADMAP_90.md) tracks 20 acceptance milestones for daily
 use across Writer, Calc, Impress, data protection, and distribution. This is a
