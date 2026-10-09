@@ -2423,6 +2423,7 @@ version = "0.1.0"
 dependencies = [
  "calamine",
  "office-core",
+ "quick-xml 0.37.5",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
