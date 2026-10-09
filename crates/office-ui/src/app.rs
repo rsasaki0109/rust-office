@@ -52,6 +52,7 @@ pub struct WriterApp {
     focus_document: bool,
     /// Last frame's page layout (for visual-line caret movement).
     last_layout: Option<DocumentLayout>,
+    margin_page: usize,
     /// Preferred screen X while moving with ↑/↓ (cleared on horizontal moves).
     preferred_caret_x: Option<f32>,
     /// When set, show the unsaved-changes modal.
@@ -61,7 +62,7 @@ pub struct WriterApp {
     /// When set, show the hyperlink URL modal; holds the draft URL.
     link_dialog: Option<String>,
     /// When set, show header/footer modal: (header draft, footer draft).
-    header_footer_dialog: Option<(String, String)>,
+    header_footer_dialog: Option<crate::page_setup::PageSetupDraft>,
     /// When set, show the print dialog.
     print_dialog: Option<PrintDialog>,
     find_open: bool,
@@ -113,6 +114,7 @@ impl WriterApp {
             clipboard: arboard::Clipboard::new().ok(),
             focus_document: true,
             last_layout: None,
+            margin_page: 0,
             preferred_caret_x: None,
             pending_action: None,
             image_textures: HashMap::new(),
@@ -479,72 +481,25 @@ impl WriterApp {
     }
 
     fn open_header_footer_dialog(&mut self) {
-        let header = self
-            .editor
-            .document()
-            .header()
-            .map(|p| p.plain_text())
-            .unwrap_or_default();
-        let footer = self
-            .editor
-            .document()
-            .footer()
-            .map(|p| p.plain_text())
-            .unwrap_or_default();
-        self.header_footer_dialog = Some((header, footer));
+        self.header_footer_dialog = Some(crate::page_setup::PageSetupDraft::new(
+            self.editor.document(),
+            self.editor.current_section(),
+        ));
     }
 
     fn show_header_footer_dialog(&mut self, ctx: &Context) {
-        let Some((header, footer)) = self.header_footer_dialog.as_mut() else {
+        let Some(draft) = self.header_footer_dialog.as_mut() else {
             return;
         };
-        let mut apply = false;
-        let mut cancel = false;
-        egui::Modal::new(egui::Id::new("header_footer_dialog")).show(ctx, |ui| {
-            ui.heading("Header and Footer");
-            ui.label("Header");
-            ui.add(
-                egui::TextEdit::singleline(header)
-                    .desired_width(360.0)
-                    .hint_text("Document title…"),
-            );
-            ui.add_space(8.0);
-            ui.label("Footer (use {page} / {pages} for page numbers)");
-            ui.add(
-                egui::TextEdit::singleline(footer)
-                    .desired_width(360.0)
-                    .hint_text("Page {page} of {pages}"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    apply = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
+        let (apply, cancel) = draft.show(ctx, self.editor.document());
         if apply {
-            let (header, footer) = self.header_footer_dialog.take().unwrap_or_default();
-            let section = &self.editor.document().sections[0];
-            // Keep existing runs and paragraph formatting when a field is unchanged.
-            let margin = |original: &Option<office_core::Paragraph>, text: String| {
-                if original.as_ref().map(|p| p.plain_text()).unwrap_or_default() == text {
-                    original.clone()
-                } else if text.is_empty() {
-                    None
-                } else {
-                    Some(office_core::Paragraph::from_text(&text))
-                }
-            };
-            let result = self.editor.set_section_settings(
-                0,
-                section.page_style.clone(),
-                margin(&section.header, header),
-                margin(&section.footer, footer),
-            );
-            match result {
-                Ok(()) => self.set_status("Header / footer updated"),
+            let draft = self.header_footer_dialog.take().unwrap();
+            let (header, footer) = draft.margins(self.editor.document());
+            match self
+                .editor
+                .set_section_settings(draft.section, draft.style, header, footer)
+            {
+                Ok(()) => self.set_status("Section settings updated"),
                 Err(error) => self.set_error(error.to_string()),
             }
         } else if cancel {
@@ -1198,7 +1153,7 @@ impl WriterApp {
                     }
                     ui.close();
                 }
-                if ui.button("Header and Footer…").clicked() {
+                if ui.button("Page / Section Setup…").clicked() {
                     self.open_header_footer_dialog();
                     ui.close();
                 }
@@ -1313,16 +1268,16 @@ impl WriterApp {
                     .cell_paragraph(addr)
                     .map(|p| p.style.alignment)
                     .unwrap_or_default(),
-                EditFocus::Header => self
+                EditFocus::Header(section) => self
                     .editor
                     .document()
-                    .header()
+                    .section_header(section)
                     .map(|p| p.style.alignment)
                     .unwrap_or_default(),
-                EditFocus::Footer => self
+                EditFocus::Footer(section) => self
                     .editor
                     .document()
-                    .footer()
+                    .section_footer(section)
                     .map(|p| p.style.alignment)
                     .unwrap_or_default(),
                 EditFocus::Body => self
@@ -1421,12 +1376,12 @@ impl WriterApp {
                     ui.label(format!("Cell R{}C{}", addr.row + 1, addr.col + 1));
                     ui.separator();
                 }
-                EditFocus::Header => {
-                    ui.label("Header");
+                EditFocus::Header(section) => {
+                    ui.label(format!("Header — Section {}", section + 1));
                     ui.separator();
                 }
-                EditFocus::Footer => {
-                    ui.label("Footer");
+                EditFocus::Footer(section) => {
+                    ui.label(format!("Footer — Section {}", section + 1));
                     ui.separator();
                 }
                 EditFocus::Body => {}
@@ -1447,8 +1402,14 @@ impl WriterApp {
 
     fn document_canvas(&mut self, ui: &mut Ui) {
         let zoom = self.zoom;
-        let page = self.editor.document().page_style().clone();
-        let page_size = Vec2::new(page.width, page.height) * zoom;
+        let max_width = self
+            .editor
+            .document()
+            .sections
+            .iter()
+            .map(|s| s.page_style.width)
+            .fold(0.0_f32, f32::max)
+            * zoom;
         let margin = 32.0;
         let doc_id = egui::Id::new("writer_document");
 
@@ -1460,7 +1421,7 @@ impl WriterApp {
                 let probe = layout_document(ui, self.editor.document(), Pos2::ZERO, zoom);
                 let canvas = document_canvas_size(&probe);
                 let desired = Vec2::new(
-                    (page_size.x + margin * 2.0).max(ui.available_width()),
+                    (max_width + margin * 2.0).max(ui.available_width()),
                     canvas.y + margin * 2.0,
                 );
                 let (response, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
@@ -1470,7 +1431,7 @@ impl WriterApp {
 
                 let origin = Pos2::new(
                     response.rect.left()
-                        + ((response.rect.width() - page_size.x) * 0.5).max(margin),
+                        + ((response.rect.width() - max_width) * 0.5).max(margin),
                     response.rect.top() + margin,
                 );
 
@@ -1526,6 +1487,8 @@ impl WriterApp {
                             self.open_hyperlink_url(&url);
                         } else {
                             let extend = ui.input(|i| i.modifiers.shift);
+                            let hit_section = layout.pages.iter().find(|p| p.page_rect.contains(pos))
+                                .map(|p| p.section_index).unwrap_or(self.editor.current_section());
                             match hit {
                                 HitResult::Cell { address, offset } => {
                                     if extend
@@ -1544,23 +1507,25 @@ impl WriterApp {
                                     }
                                 }
                                 HitResult::Header(doc_pos) => {
+                                    self.margin_page = layout.pages.iter().find(|p| p.page_rect.contains(pos)).map(|p| p.page_number).unwrap_or(0);
                                     if extend
-                                        && matches!(self.editor.edit_focus(), EditFocus::Header)
+                                        && matches!(self.editor.edit_focus(), EditFocus::Header(s) if s == hit_section)
                                     {
                                         let sel = self.editor.selection().with_focus(doc_pos);
                                         self.editor.set_selection(sel);
                                     } else {
-                                        self.editor.focus_header(doc_pos.offset);
+                                        let _ = self.editor.focus_section_header(hit_section, doc_pos.offset);
                                     }
                                 }
                                 HitResult::Footer(doc_pos) => {
+                                    self.margin_page = layout.pages.iter().find(|p| p.page_rect.contains(pos)).map(|p| p.page_number).unwrap_or(0);
                                     if extend
-                                        && matches!(self.editor.edit_focus(), EditFocus::Footer)
+                                        && matches!(self.editor.edit_focus(), EditFocus::Footer(s) if s == hit_section)
                                     {
                                         let sel = self.editor.selection().with_focus(doc_pos);
                                         self.editor.set_selection(sel);
                                     } else {
-                                        self.editor.focus_footer(doc_pos.offset);
+                                        let _ = self.editor.focus_section_footer(hit_section, doc_pos.offset);
                                     }
                                 }
                                 HitResult::Body(doc_pos) => {
@@ -1582,6 +1547,8 @@ impl WriterApp {
                 if self.dragging {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                         if response.rect.contains(pos) || response.dragged() {
+                            let hit_section = layout.pages.iter().find(|p| p.page_rect.contains(pos))
+                                .map(|p| p.section_index).unwrap_or(self.editor.current_section());
                             match layout.hit_test_full(pos) {
                                 HitResult::Cell { address, offset }
                                     if matches!(
@@ -1596,13 +1563,13 @@ impl WriterApp {
                                     self.editor.set_selection(sel);
                                 }
                                 HitResult::Header(doc_pos)
-                                    if matches!(self.editor.edit_focus(), EditFocus::Header) =>
+                                    if matches!(self.editor.edit_focus(), EditFocus::Header(s) if s == hit_section) =>
                                 {
                                     let sel = self.editor.selection().with_focus(doc_pos);
                                     self.editor.set_selection(sel);
                                 }
                                 HitResult::Footer(doc_pos)
-                                    if matches!(self.editor.edit_focus(), EditFocus::Footer) =>
+                                    if matches!(self.editor.edit_focus(), EditFocus::Footer(s) if s == hit_section) =>
                                 {
                                     let sel = self.editor.selection().with_focus(doc_pos);
                                     self.editor.set_selection(sel);
@@ -1664,10 +1631,11 @@ impl WriterApp {
                         EditFocus::Cell(addr) => {
                             layout.cell_caret_rect(addr, self.editor.selection().focus)
                         }
-                        EditFocus::Header | EditFocus::Footer => layout.margin_caret_rect(
+                        EditFocus::Header(_) | EditFocus::Footer(_) => layout.margin_caret_rect(
                             self.editor.edit_focus(),
                             self.editor.selection().focus,
-                            1,
+                            layout.pages.iter().find(|p| p.page_number == self.margin_page && p.section_index == self.editor.current_section())
+                                .map(|p| p.page_number).unwrap_or(0),
                         ),
                     };
                     if let Some(caret) = caret_opt {
@@ -1698,10 +1666,11 @@ impl WriterApp {
                         EditFocus::Cell(addr) => {
                             layout.cell_caret_rect(addr, self.editor.selection().focus)
                         }
-                        EditFocus::Header | EditFocus::Footer => layout.margin_caret_rect(
+                        EditFocus::Header(_) | EditFocus::Footer(_) => layout.margin_caret_rect(
                             self.editor.edit_focus(),
                             self.editor.selection().focus,
-                            1,
+                            layout.pages.iter().find(|p| p.page_number == self.margin_page && p.section_index == self.editor.current_section())
+                                .map(|p| p.page_number).unwrap_or(0),
                         ),
                     };
                     if let Some(rect) = ime_rect {

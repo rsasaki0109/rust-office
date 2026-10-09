@@ -401,7 +401,7 @@ impl Block {
     }
 }
 
-/// A document section (future: multiple sections with distinct page styles).
+/// A document section with its own page geometry and margin content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Section {
     pub blocks: Vec<Block>,
@@ -722,16 +722,35 @@ impl Document {
     pub fn section_header(&self, section: usize) -> Option<&Paragraph> {
         self.sections
             .get(section)
-            .and_then(|s| s.header.as_ref())
-            .or_else(|| self.header())
+            .and_then(|s| s.header.as_ref().or_else(|| self.header()))
     }
 
     /// Footer for a specific section (falls back to section 0).
     pub fn section_footer(&self, section: usize) -> Option<&Paragraph> {
         self.sections
             .get(section)
-            .and_then(|s| s.footer.as_ref())
-            .or_else(|| self.footer())
+            .and_then(|s| s.footer.as_ref().or_else(|| self.footer()))
+    }
+
+    /// Materialize inherited content only when a margin is actually edited.
+    pub fn ensure_section_header_mut(&mut self, section: usize) -> Option<&mut Paragraph> {
+        let inherited = self
+            .section_header(section)
+            .cloned()
+            .unwrap_or_else(Paragraph::empty);
+        self.sections
+            .get_mut(section)
+            .map(|s| s.header.get_or_insert(inherited))
+    }
+
+    pub fn ensure_section_footer_mut(&mut self, section: usize) -> Option<&mut Paragraph> {
+        let inherited = self
+            .section_footer(section)
+            .cloned()
+            .unwrap_or_else(Paragraph::empty);
+        self.sections
+            .get_mut(section)
+            .map(|s| s.footer.get_or_insert(inherited))
     }
 
     pub fn ensure_header_mut(&mut self) -> &mut Paragraph {

@@ -116,6 +116,7 @@ pub enum HitResult {
 /// Geometry and lines for one paper page.
 #[derive(Clone)]
 pub struct PageLayout {
+    pub section_index: usize,
     pub page_rect: Rect,
     pub content_rect: Rect,
     pub lines: Vec<LayoutLine>,
@@ -187,12 +188,13 @@ impl DocumentLayout {
             .pages
             .iter()
             .find(|p| p.page_number == page_number)
-            .or_else(|| self.pages.first())?;
+            .or_else(|| self.pages.iter().find(|p| page_number == 0 &&
+                matches!(focus, EditFocus::Header(s) | EditFocus::Footer(s) if s == p.section_index)))?;
         match focus {
-            EditFocus::Header => {
+            EditFocus::Header(section) if page.section_index == section => {
                 page.margin_caret_rect(&page.header_lines, page.header_band(), pos)
             }
-            EditFocus::Footer => {
+            EditFocus::Footer(section) if page.section_index == section => {
                 page.margin_caret_rect(&page.footer_lines, page.footer_band(), pos)
             }
             _ => None,
@@ -214,8 +216,12 @@ impl DocumentLayout {
             return Vec::new();
         };
         match focus {
-            EditFocus::Header => page.margin_selection_rects(&page.header_lines, selection),
-            EditFocus::Footer => page.margin_selection_rects(&page.footer_lines, selection),
+            EditFocus::Header(section) if page.section_index == section => {
+                page.margin_selection_rects(&page.header_lines, selection)
+            }
+            EditFocus::Footer(section) if page.section_index == section => {
+                page.margin_selection_rects(&page.footer_lines, selection)
+            }
             _ => Vec::new(),
         }
     }
@@ -412,6 +418,7 @@ impl PageLayout {
             ));
         }
         let tmp = PageLayout {
+            section_index: 0,
             page_rect: band,
             content_rect: band,
             lines: lines.to_vec(),
@@ -433,6 +440,7 @@ impl PageLayout {
             return Vec::new();
         }
         let tmp = PageLayout {
+            section_index: 0,
             page_rect: self.page_rect,
             content_rect: self.content_rect,
             lines: lines.to_vec(),
@@ -584,32 +592,49 @@ struct PageMetrics {
     content_height: f32,
 }
 
-/// Layout the document into one or more A4 pages.
+/// Lay out each section with its own page geometry, starting on a new page.
 pub fn layout_document(ui: &Ui, document: &Document, origin: Pos2, zoom: f32) -> DocumentLayout {
-    let page_style = document.page_style();
-    let page_size = Vec2::new(page_style.width, page_style.height) * zoom;
-    let margin_top = page_style.margin_top * zoom;
-    let margin_bottom = page_style.margin_bottom * zoom;
-    let margin_left = page_style.margin_left * zoom;
-    let margin_right = page_style.margin_right * zoom;
-    let metrics = PageMetrics {
-        origin,
-        zoom,
-        page_size,
-        margin_left,
-        margin_top,
-        margin_right,
-        margin_bottom,
-        content_width: (page_size.x - margin_left - margin_right).max(1.0),
-        content_height: (page_size.y - margin_top - margin_bottom).max(1.0),
-    };
-    layout_document_paginated(ui, document, &metrics)
+    let mut pages = Vec::new();
+    let mut next_y = origin.y;
+    let max_width = document
+        .sections
+        .iter()
+        .map(|s| s.page_style.width)
+        .fold(0.0_f32, f32::max)
+        * zoom;
+    for (section_index, section) in document.sections.iter().enumerate() {
+        let style = &section.page_style;
+        let page_size = Vec2::new(style.width, style.height) * zoom;
+        let metrics = PageMetrics {
+            origin: Pos2::new(origin.x + (max_width - page_size.x) * 0.5, next_y),
+            zoom,
+            page_size,
+            margin_left: style.margin_left * zoom,
+            margin_top: style.margin_top * zoom,
+            margin_right: style.margin_right * zoom,
+            margin_bottom: style.margin_bottom * zoom,
+            content_width: style.content_width() * zoom,
+            content_height: style.content_height() * zoom,
+        };
+        let section_layout = layout_document_paginated(ui, document, &metrics, section_index);
+        if let Some(last) = section_layout.pages.last() {
+            next_y = last.page_rect.bottom() + PAGE_GAP * zoom.max(0.5);
+        }
+        pages.extend(section_layout.pages);
+    }
+    for (index, page) in pages.iter_mut().enumerate() {
+        page.page_number = index + 1;
+    }
+    let mut layout = DocumentLayout { pages };
+    layout_header_footer(ui, document, &mut layout, zoom);
+    layout
 }
 
 fn layout_document_paginated(
     ui: &Ui,
     document: &Document,
     metrics: &PageMetrics,
+    section_index: usize,
 ) -> DocumentLayout {
     let PageMetrics {
         origin,
@@ -628,12 +653,15 @@ fn layout_document_paginated(
     let mut flow_decorations: Vec<(f32, PageDecoration)> = Vec::new(); // (flow_top, dec)
     let mut forced_breaks: Vec<f32> = Vec::new();
     let mut cursor_y = 0.0_f32;
-    let mut para_idx = 0usize;
+    let mut para_idx = document.paragraph_offset_of_section(section_index);
 
-    for (sec_i, section) in document.sections.iter().enumerate() {
-        if sec_i > 0 {
-            forced_breaks.push(cursor_y);
-        }
+    for (sec_i, section) in document
+        .sections
+        .iter()
+        .enumerate()
+        .skip(section_index)
+        .take(1)
+    {
         for (block_idx, block) in section.blocks.iter().enumerate() {
             match block {
                 Block::Paragraph(paragraph) => {
@@ -722,8 +750,9 @@ fn layout_document_paginated(
                 page_origin.y + page_size.y - margin_bottom,
             ),
         );
-        let mut layout = DocumentLayout {
+        let layout = DocumentLayout {
             pages: vec![PageLayout {
+                section_index,
                 page_rect,
                 content_rect,
                 lines: Vec::new(),
@@ -733,7 +762,6 @@ fn layout_document_paginated(
                 page_number: 1,
             }],
         };
-        layout_header_footer(ui, document, &mut layout, zoom);
         return layout;
     }
 
@@ -790,6 +818,7 @@ fn layout_document_paginated(
                 ),
             );
             PageLayout {
+                section_index,
                 page_rect,
                 content_rect,
                 lines: Vec::new(),
@@ -850,9 +879,7 @@ fn layout_document_paginated(
         pages[p].decorations.push(dec);
     }
 
-    let mut layout = DocumentLayout { pages };
-    layout_header_footer(ui, document, &mut layout, zoom);
-    layout
+    DocumentLayout { pages }
 }
 
 fn expand_page_fields(text: &str, page: usize, pages: usize) -> String {
@@ -870,13 +897,13 @@ fn paragraph_with_page_fields(para: &Paragraph, page: usize, pages: usize) -> Pa
 
 fn layout_header_footer(ui: &Ui, document: &Document, layout: &mut DocumentLayout, zoom: f32) {
     let page_count = layout.pages.len().max(1);
-    let header = document.header().cloned();
-    let footer = document.footer().cloned();
     for page in &mut layout.pages {
+        let header = document.section_header(page.section_index);
+        let footer = document.section_footer(page.section_index);
         let page_no = page.page_number;
         let width = page.content_rect.width().max(8.0);
         let left = page.content_rect.left();
-        if let Some(ref header_para) = header {
+        if let Some(header_para) = header {
             let para = paragraph_with_page_fields(header_para, page_no, page_count);
             let band_top = page.page_rect.top() + 12.0 * zoom;
             let band_bottom = page.content_rect.top() - 4.0 * zoom;
@@ -885,7 +912,7 @@ fn layout_header_footer(ui: &Ui, document: &Document, layout: &mut DocumentLayou
             lines.retain(|l| l.rect.top() < band_top + max_h);
             page.header_lines = lines;
         }
-        if let Some(ref footer_para) = footer {
+        if let Some(footer_para) = footer {
             let para = paragraph_with_page_fields(footer_para, page_no, page_count);
             let band_top = page.content_rect.bottom() + 4.0 * zoom;
             let band_bottom = page.page_rect.bottom() - 12.0 * zoom;
@@ -1100,13 +1127,16 @@ fn list_layout_extras(
 }
 
 fn numbered_item_index(document: &Document, para_idx: usize, level: u8) -> usize {
-    let paras: Vec<&Paragraph> = document
-        .blocks()
+    let Some((section, local)) = document.locate_paragraph(para_idx) else {
+        return 1;
+    };
+    let paras: Vec<&Paragraph> = document.sections[section]
+        .blocks
         .iter()
         .filter_map(Block::as_paragraph)
         .collect();
     let mut n = 1usize;
-    let mut i = para_idx;
+    let mut i = local;
     while i > 0 {
         i -= 1;
         match paras.get(i).and_then(|p| p.style.list) {
@@ -1194,9 +1224,9 @@ pub fn paint_document(
                 }
             }
         }
-        EditFocus::Header | EditFocus::Footer => {
-            for page in &layout.pages {
-                let band = if matches!(focus, EditFocus::Header) {
+        EditFocus::Header(section) | EditFocus::Footer(section) => {
+            for page in layout.pages.iter().filter(|p| p.section_index == section) {
+                let band = if matches!(focus, EditFocus::Header(_)) {
                     page.header_band()
                 } else {
                     page.footer_band()
@@ -1228,7 +1258,7 @@ pub fn paint_document(
         let caret_rects: Vec<Rect> = match focus {
             EditFocus::Body => layout.caret_rect(caret).into_iter().collect(),
             EditFocus::Cell(addr) => layout.cell_caret_rect(addr, caret).into_iter().collect(),
-            EditFocus::Header | EditFocus::Footer => layout
+            EditFocus::Header(_) | EditFocus::Footer(_) => layout
                 .pages
                 .iter()
                 .filter_map(|p| layout.margin_caret_rect(focus, caret, p.page_number))
@@ -1265,6 +1295,7 @@ fn cell_layout_caret_rect(cell: &TableCellLayout, pos: DocPosition) -> Option<Re
     }
     // Reuse PageLayout caret logic by building a temporary page.
     let page = PageLayout {
+        section_index: 0,
         page_rect: cell.rect,
         content_rect: cell.rect,
         lines: cell.lines.clone(),
@@ -1286,6 +1317,7 @@ fn cell_layout_selection_rects(cell: &TableCellLayout, selection: Selection) -> 
         return Vec::new();
     }
     let page = PageLayout {
+        section_index: 0,
         page_rect: cell.rect,
         content_rect: cell.rect,
         lines: cell.lines.clone(),
@@ -1463,7 +1495,11 @@ pub fn document_canvas_size(layout: &DocumentLayout) -> Vec2 {
     let first = layout.pages.first().unwrap().page_rect;
     let last = layout.pages.last().unwrap().page_rect;
     Vec2::new(
-        first.width().max(last.width()),
+        layout
+            .pages
+            .iter()
+            .map(|p| p.page_rect.width())
+            .fold(0.0, f32::max),
         last.bottom() - first.top(),
     )
 }
@@ -1476,7 +1512,66 @@ mod tests {
     use egui::{Galley, Pos2, Rect, Vec2};
     use office_core::{DocPosition, PageStyle};
 
-    use super::{DocumentLayout, GlyphCell, LayoutLine, PageLayout, VerticalDir};
+    use super::{
+        document_canvas_size, layout_document, DocumentLayout, EditFocus, GlyphCell, HitResult,
+        LayoutLine, PageDecoration, PageLayout, VerticalDir,
+    };
+
+    #[test]
+    fn mixed_sections_use_local_geometry_margins_addresses_and_page_fields() {
+        use office_core::{Block, Document, Paragraph, Section, Table};
+        let mut document = Document::with_text("First");
+        document.sections[0].header = Some(Paragraph::from_text("First {page}/{pages}"));
+        let style = PageStyle {
+            width: 792.0,
+            height: 612.0,
+            margin_left: 36.0,
+            margin_top: 48.0,
+            ..Default::default()
+        };
+        document.sections.push(Section {
+            page_style: style.clone(),
+            header: Some(Paragraph::from_text("Second {page}/{pages}")),
+            footer: None,
+            blocks: vec![
+                Block::Paragraph(Paragraph::from_text("Second")),
+                Block::Table(Table::new(1, 1)),
+            ],
+        });
+        document.sections.push(document.sections[0].clone());
+        egui::__run_test_ui(|ui| {
+            let layout = layout_document(ui, &document, Pos2::new(10.0, 20.0), 1.0);
+            assert_eq!(layout.pages.len(), 3);
+            assert_eq!(document_canvas_size(&layout).x, 792.0);
+            let second = &layout.pages[1];
+            assert_eq!(second.section_index, 1);
+            assert_eq!(second.page_number, 2);
+            assert_eq!(second.page_rect.size(), Vec2::new(792.0, 612.0));
+            assert_eq!(second.content_rect.left() - second.page_rect.left(), 36.0);
+            assert_eq!(second.content_rect.top() - second.page_rect.top(), 48.0);
+            assert!(second.page_rect.top() > layout.pages[0].page_rect.bottom());
+            assert!(layout.pages[2].page_rect.top() > second.page_rect.bottom());
+            assert_eq!(second.header_lines[0].galley.job.text, "Second 2/3");
+            assert_eq!(second.lines[0].paragraph, 1);
+            let PageDecoration::Table { cells, .. } = &second.decorations[0] else {
+                panic!("table");
+            };
+            assert_eq!(cells[0].address.section, 1);
+            assert!(
+                matches!(layout.hit_test_full(cells[0].rect.center()), HitResult::Cell { address, .. } if address.section == 1)
+            );
+            assert!(layout
+                .margin_caret_rect(EditFocus::Header(1), DocPosition::zero(), 1)
+                .is_none());
+            assert!(layout
+                .margin_caret_rect(EditFocus::Header(1), DocPosition::zero(), 2)
+                .is_some());
+            assert_eq!(
+                layout.margin_caret_rect(EditFocus::Header(1), DocPosition::zero(), 0),
+                layout.margin_caret_rect(EditFocus::Header(1), DocPosition::zero(), 2)
+            );
+        });
+    }
 
     #[test]
     fn a4_content_box() {
@@ -1517,6 +1612,7 @@ mod tests {
         let layout = DocumentLayout {
             pages: vec![
                 PageLayout {
+                    section_index: 0,
                     page_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0)),
                     content_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0)),
                     lines: vec![stub_line(0, 0, 5, 0.0, 0.0, 50.0)],
@@ -1526,8 +1622,12 @@ mod tests {
                     page_number: 1,
                 },
                 PageLayout {
+                    section_index: 0,
                     page_rect: Rect::from_min_size(Pos2::new(0.0, 120.0), Vec2::new(100.0, 100.0)),
-                    content_rect: Rect::from_min_size(Pos2::new(0.0, 120.0), Vec2::new(100.0, 100.0)),
+                    content_rect: Rect::from_min_size(
+                        Pos2::new(0.0, 120.0),
+                        Vec2::new(100.0, 100.0),
+                    ),
                     lines: vec![stub_line(0, 5, 10, 120.0, 0.0, 50.0)],
                     decorations: Vec::new(),
                     header_lines: Vec::new(),
@@ -1547,6 +1647,7 @@ mod tests {
     fn line_home_end() {
         let layout = DocumentLayout {
             pages: vec![PageLayout {
+                section_index: 0,
                 page_rect: Rect::ZERO,
                 content_rect: Rect::ZERO,
                 lines: vec![stub_line(0, 0, 5, 0.0, 0.0, 50.0)],

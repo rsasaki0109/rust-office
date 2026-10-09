@@ -1,4 +1,4 @@
-//! Export a [`Document`] to a multi-page A4 PDF.
+//! Simple text PDF export with per-section page geometry.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -25,7 +25,7 @@ impl From<printpdf::Error> for PdfError {
     }
 }
 
-/// Write `document` as PDF bytes (A4 pages, body + header/footer).
+/// Write `document` as PDF bytes (section pages, body + header/footer).
 pub fn document_to_pdf_bytes(document: &Document) -> Result<Vec<u8>, PdfError> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     write_document_pdf(document, &mut cursor)?;
@@ -43,13 +43,14 @@ fn write_document_pdf<W: std::io::Write>(
     document: &Document,
     writer: &mut W,
 ) -> Result<(), PdfError> {
+    if document.sections.is_empty() || document.sections.iter().any(|s| !s.page_style.is_valid()) {
+        return Err(PdfError::Pdf(
+            "Invalid section paper size or margins".into(),
+        ));
+    }
     let page_style = document.page_style();
     let page_w = Mm(pt_to_mm(page_style.width));
     let page_h = Mm(pt_to_mm(page_style.height));
-    let margin_l = Mm(pt_to_mm(page_style.margin_left));
-    let margin_r = Mm(pt_to_mm(page_style.margin_right));
-    let margin_t = Mm(pt_to_mm(page_style.margin_top));
-    let margin_b = Mm(pt_to_mm(page_style.margin_bottom));
 
     let title = if document.title.is_empty() {
         "rust-office document"
@@ -61,64 +62,64 @@ fn write_document_pdf<W: std::io::Write>(
     let font = load_best_font(&doc)?;
     let font_size = 11.0_f32;
     let line_h_mm = Mm(pt_to_mm(font_size * 1.35));
-    let content_width_mm = page_w.0 - margin_l.0 - margin_r.0;
-
-    let lines = collect_export_lines(document);
-    let header = document
-        .header()
-        .map(|p| p.plain_text())
-        .filter(|s| !s.is_empty());
-    let footer_template = document
-        .footer()
-        .map(|p| p.plain_text())
-        .filter(|s| !s.is_empty());
-
-    // Pack lines into pages.
-    let usable_top = page_h.0 - margin_t.0;
-    let usable_bottom = margin_b.0;
-    let mut pages_lines: Vec<Vec<ExportLine>> = Vec::new();
-    let mut current: Vec<ExportLine> = Vec::new();
-    let mut y = usable_top;
-
-    for line in &lines {
-        if line.text == "\u{000C}" {
-            pages_lines.push(std::mem::take(&mut current));
-            y = usable_top;
-            continue;
-        }
-        let wrapped = wrap_line(&line.text, content_width_mm, font_size);
-        for (i, piece) in wrapped.into_iter().enumerate() {
-            if y - line_h_mm.0 < usable_bottom {
-                pages_lines.push(std::mem::take(&mut current));
+    let mut pages_lines: Vec<(usize, Vec<ExportLine>)> = Vec::new();
+    for (section_index, section) in document.sections.iter().enumerate() {
+        let style = &section.page_style;
+        let usable_top = pt_to_mm(style.height - style.margin_top);
+        let usable_bottom = pt_to_mm(style.margin_bottom);
+        let content_width_mm = pt_to_mm(style.content_width());
+        let lines = collect_export_lines(&section.blocks);
+        let mut current = Vec::new();
+        let first_page = pages_lines.len();
+        let mut y = usable_top;
+        for line in &lines {
+            if line.text == "\u{000C}" {
+                pages_lines.push((section_index, std::mem::take(&mut current)));
                 y = usable_top;
+                continue;
             }
-            current.push(ExportLine {
-                text: piece,
-                align: line.align,
-                bold: line.bold && i == 0,
-            });
-            y -= line_h_mm.0;
+            let wrapped = wrap_line(&line.text, content_width_mm, font_size);
+            for (i, piece) in wrapped.into_iter().enumerate() {
+                if y - line_h_mm.0 < usable_bottom {
+                    pages_lines.push((section_index, std::mem::take(&mut current)));
+                    y = usable_top;
+                }
+                current.push(ExportLine {
+                    text: piece,
+                    align: line.align,
+                    bold: line.bold && i == 0,
+                });
+                y -= line_h_mm.0;
+            }
         }
-    }
-    if current.is_empty() && pages_lines.is_empty() {
-        current.push(ExportLine {
-            text: String::new(),
-            align: Alignment::Left,
-            bold: false,
-        });
-    }
-    if !current.is_empty() {
-        pages_lines.push(current);
+        if !current.is_empty()
+            || pages_lines.len() == first_page
+            || lines.last().is_some_and(|l| l.text == "\u{000C}")
+        {
+            pages_lines.push((section_index, current));
+        }
     }
 
     let page_count = pages_lines.len().max(1);
     let mut page_handles: Vec<(PdfPageIndex, printpdf::PdfLayerIndex)> = vec![(page1, layer1)];
-    for i in 1..page_count {
-        let (p, l) = doc.add_page(page_w, page_h, format!("Page {}, Layer 1", i + 1));
+    for (i, (section, _)) in pages_lines.iter().enumerate().skip(1) {
+        let style = &document.sections[*section].page_style;
+        let (p, l) = doc.add_page(
+            Mm(pt_to_mm(style.width)),
+            Mm(pt_to_mm(style.height)),
+            format!("Page {}, Layer 1", i + 1),
+        );
         page_handles.push((p, l));
     }
 
-    for (page_idx, page_lines) in pages_lines.iter().enumerate() {
+    for (page_idx, (section, page_lines)) in pages_lines.iter().enumerate() {
+        let style = &document.sections[*section].page_style;
+        let page_h = Mm(pt_to_mm(style.height));
+        let margin_l = Mm(pt_to_mm(style.margin_left));
+        let content_width_mm = pt_to_mm(style.content_width());
+        let usable_top = pt_to_mm(style.height - style.margin_top);
+        let header = document.section_header(*section).map(|p| p.plain_text());
+        let footer_template = document.section_footer(*section).map(|p| p.plain_text());
         let (page, layer) = page_handles[page_idx];
         let layer = doc.get_page(page).get_layer(layer);
         let page_no = page_idx + 1;
@@ -201,9 +202,9 @@ struct ExportLine {
     bold: bool,
 }
 
-fn collect_export_lines(document: &Document) -> Vec<ExportLine> {
+fn collect_export_lines(blocks: &[Block]) -> Vec<ExportLine> {
     let mut out = Vec::new();
-    for block in document.blocks() {
+    for block in blocks {
         match block {
             Block::Paragraph(para) => {
                 let mut text = para.plain_text();
@@ -358,6 +359,35 @@ fn load_best_font(doc: &PdfDocumentReference) -> Result<printpdf::IndirectFontRe
 mod tests {
     use super::*;
     use office_core::DocumentEditor;
+
+    #[test]
+    fn simple_pdf_includes_all_sections_with_their_page_sizes() {
+        let mut editor = office_core::DocumentEditor::default();
+        editor.insert_text("A4").unwrap();
+        editor
+            .insert_section_break_with_style(Some(office_core::PageStyle {
+                width: 792.0,
+                height: 612.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        editor.insert_text("Letter").unwrap();
+        let bytes = document_to_pdf_bytes(editor.document()).unwrap();
+        let pdf = printpdf::lopdf::Document::load_mem(&bytes).unwrap();
+        let pages = pdf.get_pages();
+        assert_eq!(pages.len(), 2);
+        for (id, (width, height)) in pages.values().zip([(595.28, 841.89), (792.0, 612.0)]) {
+            let bounds = pdf
+                .get_dictionary(*id)
+                .unwrap()
+                .get(b"MediaBox")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            assert!((bounds[2].as_float().unwrap() - width).abs() < 0.03);
+            assert!((bounds[3].as_float().unwrap() - height).abs() < 0.03);
+        }
+    }
 
     #[test]
     fn pdf_export_produces_nonzero_bytes() {

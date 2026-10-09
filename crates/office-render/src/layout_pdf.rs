@@ -19,6 +19,9 @@ fn pt_to_mm(pt: f32) -> f32 {
 
 /// Layout `document` at zoom 1.0 (headless fonts) and export PDF bytes.
 pub fn document_to_layout_pdf_bytes(document: &Document) -> Result<Vec<u8>, String> {
+    if document.sections.is_empty() || document.sections.iter().any(|s| !s.page_style.is_valid()) {
+        return Err("Invalid section page geometry".into());
+    }
     let mut out = Ok(Vec::new());
     egui::__run_test_ui(|ui| {
         let layout = layout_document(ui, document, Pos2::ZERO, 1.0);
@@ -48,9 +51,9 @@ fn write_layout_pdf<W: std::io::Write>(
     layout: &DocumentLayout,
     writer: &mut W,
 ) -> Result<(), String> {
-    let page_style = document.page_style();
-    let page_w = Mm(pt_to_mm(page_style.width));
-    let page_h = Mm(pt_to_mm(page_style.height));
+    if document.sections.iter().any(|s| !s.page_style.is_valid()) {
+        return Err("Invalid section page geometry".into());
+    }
     let title = if document.title.is_empty() {
         "rust-office document"
     } else {
@@ -64,19 +67,40 @@ fn write_layout_pdf<W: std::io::Write>(
     };
 
     let images = collect_images(document);
-    let (doc, page1, layer1) = PdfDocument::new(title, page_w, page_h, "Layer 1");
+    let page_style = document
+        .sections
+        .get(pages[0].section_index)
+        .ok_or("Invalid layout section")?
+        .page_style
+        .clone();
+    let (doc, page1, layer1) = PdfDocument::new(
+        title,
+        Mm(pt_to_mm(page_style.width)),
+        Mm(pt_to_mm(page_style.height)),
+        "Layer 1",
+    );
     let font = load_best_font(&doc)?;
 
     let mut handles = vec![(page1, layer1)];
-    for i in 1..pages.len() {
-        let (p, l) = doc.add_page(page_w, page_h, format!("Page {}, Layer 1", i + 1));
+    for (i, page) in pages.iter().enumerate().skip(1) {
+        let style = &document
+            .sections
+            .get(page.section_index)
+            .ok_or("Invalid layout section")?
+            .page_style;
+        let (p, l) = doc.add_page(
+            Mm(pt_to_mm(style.width)),
+            Mm(pt_to_mm(style.height)),
+            format!("Page {}, Layer 1", i + 1),
+        );
         handles.push((p, l));
     }
 
     for (idx, page) in pages.iter().enumerate() {
         let (page_idx, layer_idx) = handles[idx];
         let layer = doc.get_page(page_idx).get_layer(layer_idx);
-        paint_page(page, &layer, &font, page_style.height, &images);
+        let height = document.sections[page.section_index].page_style.height;
+        paint_page(page, &layer, &font, height, &images);
     }
 
     let mut buf = BufWriter::new(writer);
@@ -267,6 +291,35 @@ mod tests {
             0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
             0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ]
+    }
+
+    #[test]
+    fn pdf_media_boxes_match_mixed_section_pages() {
+        let mut editor = DocumentEditor::default();
+        editor.insert_text("A4").unwrap();
+        editor
+            .insert_section_break_with_style(Some(office_core::PageStyle {
+                width: 792.0,
+                height: 612.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        editor.insert_text("Landscape Letter").unwrap();
+        let bytes = document_to_layout_pdf_bytes(editor.document()).unwrap();
+        let pdf = printpdf::lopdf::Document::load_mem(&bytes).unwrap();
+        let pages = pdf.get_pages();
+        assert_eq!(pages.len(), 2);
+        for (id, (width, height)) in pages.values().zip([(595.28, 841.89), (792.0, 612.0)]) {
+            let bounds = pdf
+                .get_dictionary(*id)
+                .unwrap()
+                .get(b"MediaBox")
+                .unwrap()
+                .as_array()
+                .unwrap();
+            assert!((bounds[2].as_float().unwrap() - width).abs() < 0.03);
+            assert!((bounds[3].as_float().unwrap() - height).abs() < 0.03);
+        }
     }
 
     #[test]

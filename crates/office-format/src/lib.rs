@@ -3,7 +3,7 @@
 //! * JSON (`.roffice.json`) — native interchange
 //! * ODT (`.odt`) — minimal OpenDocument Text round-trip
 //! * DOCX (`.docx`) — minimal Office Open XML Word round-trip
-//! * PDF — export-only multi-page A4
+//! * PDF — export-only multi-page with section geometry
 
 mod docx;
 mod odt;
@@ -82,6 +82,11 @@ impl DocumentFormat for JsonFormat {
                 "document has no sections".into(),
             ));
         }
+        if doc.sections.iter().any(|s| !s.page_style.is_valid()) {
+            return Err(FormatError::InvalidDocument(
+                "Invalid section paper size or margins".into(),
+            ));
+        }
         Ok(doc)
     }
 
@@ -90,6 +95,13 @@ impl DocumentFormat for JsonFormat {
         document: &Document,
         writer: &mut dyn Write,
     ) -> Result<(), FormatError> {
+        if document.sections.is_empty()
+            || document.sections.iter().any(|s| !s.page_style.is_valid())
+        {
+            return Err(FormatError::InvalidDocument(
+                "Invalid section paper size or margins".into(),
+            ));
+        }
         let json = serde_json::to_string_pretty(document)?;
         writer.write_all(json.as_bytes())?;
         writer.write_all(b"\n")?;
@@ -521,7 +533,7 @@ mod tests {
             .unwrap();
         let content = build_content_xml(ed.document());
         assert!(
-            content.contains(r#"text:style-name="Heading2""#),
+            content.contains(r#"style:parent-style-name="Heading2""#),
             "content={content}"
         );
         let bytes = OdtFormat.save_to_bytes(ed.document()).unwrap();

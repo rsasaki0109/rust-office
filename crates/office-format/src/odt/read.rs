@@ -27,6 +27,8 @@ struct TextProps {
 struct ParaProps {
     alignment: Alignment,
     break_before: bool,
+    master_page: Option<String>,
+    parent_style: Option<String>,
 }
 
 /// Parse `content.xml` into a [`Document`] (no package pictures).
@@ -39,6 +41,13 @@ pub fn parse_content_xml_with_pictures(
     xml: &str,
     pictures: &HashMap<String, Vec<u8>>,
 ) -> Result<Document, FormatError> {
+    parse_content_and_masters(xml, pictures).map(|(document, _)| document)
+}
+
+pub(super) fn parse_content_and_masters(
+    xml: &str,
+    pictures: &HashMap<String, Vec<u8>>,
+) -> Result<(Document, Vec<Option<String>>), FormatError> {
     // XML-only callers may omit images. The package loader reads all actual
     // references before calling this parser.
     content_images(xml)?;
@@ -49,6 +58,41 @@ pub fn parse_content_xml_with_pictures(
     let mut para_styles: HashMap<String, ParaProps> = HashMap::new();
 
     let mut blocks: Vec<Block> = Vec::new();
+    let mut sections = Vec::new();
+    let mut masters = Vec::new();
+    let mut current_master = None;
+    let mut section_page_start = false;
+    let mut current_style_master = None;
+    let mut current_style_parent = None;
+    let begin_section = |style_name: Option<&str>,
+                         para_styles: &HashMap<String, ParaProps>,
+                         in_cell: bool,
+                         blocks: &mut Vec<Block>,
+                         sections: &mut Vec<office_core::Section>,
+                         masters: &mut Vec<Option<String>>,
+                         current_master: &mut Option<String>| {
+        if in_cell {
+            return false;
+        }
+        let Some(master) = style_name
+            .and_then(|name| para_styles.get(name))
+            .and_then(|props| props.master_page.as_ref())
+        else {
+            return false;
+        };
+        let changed = current_master.as_ref() != Some(master);
+        if changed && !blocks.is_empty() {
+            sections.push(office_core::Section {
+                blocks: std::mem::take(blocks),
+                page_style: Default::default(),
+                header: None,
+                footer: None,
+            });
+            masters.push(current_master.take());
+        }
+        *current_master = Some(master.clone());
+        changed
+    };
     let mut in_automatic_styles = false;
     let mut current_style_name: Option<String> = None;
     let mut current_style_family: Option<String> = None;
@@ -100,6 +144,20 @@ pub fn parse_content_xml_with_pictures(
                     "style" if in_automatic_styles => {
                         current_style_name = attr(&e, "name");
                         current_style_family = attr(&e, "family");
+                        current_style_master = attr(&e, "master-page-name");
+                        current_style_parent = attr(&e, "parent-style-name");
+                        if current_style_family.as_deref() == Some("paragraph") {
+                            if let Some(name) = &current_style_name {
+                                para_styles.insert(
+                                    name.clone(),
+                                    ParaProps {
+                                        master_page: current_style_master.clone(),
+                                        parent_style: current_style_parent.clone(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
                     }
                     "text-properties" if in_automatic_styles => {
                         if let (Some(name), Some(family)) =
@@ -115,7 +173,10 @@ pub fn parse_content_xml_with_pictures(
                             (current_style_name.clone(), current_style_family.clone())
                         {
                             if family == "paragraph" {
-                                para_styles.insert(name, parse_para_props(&e));
+                                let mut props = parse_para_props(&e);
+                                props.master_page = current_style_master.clone();
+                                props.parent_style = current_style_parent.clone();
+                                para_styles.insert(name, props);
                             }
                         }
                     }
@@ -142,6 +203,15 @@ pub fn parse_content_xml_with_pictures(
                     "p" if in_text => {
                         in_paragraph = true;
                         current_para_style = attr(&e, "style-name");
+                        section_page_start = begin_section(
+                            current_para_style.as_deref(),
+                            &para_styles,
+                            in_cell,
+                            &mut blocks,
+                            &mut sections,
+                            &mut masters,
+                            &mut current_master,
+                        );
                         current_runs.clear();
                         current_span_style = None;
                         paragraph_has_image = false;
@@ -214,7 +284,10 @@ pub fn parse_content_xml_with_pictures(
                             (current_style_name.clone(), current_style_family.clone())
                         {
                             if family == "paragraph" {
-                                para_styles.insert(name, parse_para_props(&e));
+                                let mut props = parse_para_props(&e);
+                                props.master_page = current_style_master.clone();
+                                props.parent_style = current_style_parent.clone();
+                                para_styles.insert(name, props);
                             }
                         }
                     }
@@ -279,7 +352,21 @@ pub fn parse_content_xml_with_pictures(
                     }
                     "p" if in_text => {
                         let style_name = attr(&e, "style-name");
-                        if !in_cell && is_pagebreak_style(style_name.as_deref(), &para_styles) {
+                        let section_start = begin_section(
+                            style_name.as_deref(),
+                            &para_styles,
+                            in_cell,
+                            &mut blocks,
+                            &mut sections,
+                            &mut masters,
+                            &mut current_master,
+                        );
+                        if is_section_marker(style_name.as_deref(), &para_styles) {
+                            // A carrier changes the master page without adding body content.
+                        } else if !in_cell
+                            && !section_start
+                            && is_pagebreak_style(style_name.as_deref(), &para_styles)
+                        {
                             blocks.push(Block::PageBreak);
                         } else {
                             push_finished_para(
@@ -360,9 +447,12 @@ pub fn parse_content_xml_with_pictures(
                         let only_image = paragraph_has_image && runs.is_empty() && !in_cell;
                         let style_name = current_para_style.as_deref();
                         let pagebreak = !in_cell
+                            && !section_page_start
                             && (is_pagebreak_style(style_name, &para_styles)
                                 || (saw_soft_page_break && runs.is_empty()));
-                        if pagebreak && runs.is_empty() && !paragraph_has_image {
+                        if is_section_marker(style_name, &para_styles) && runs.is_empty() {
+                            // Empty carrier for a master-page change before a table/image.
+                        } else if pagebreak && runs.is_empty() && !paragraph_has_image {
                             blocks.push(Block::PageBreak);
                         } else if !only_image {
                             if pagebreak && !runs.is_empty() {
@@ -429,9 +519,26 @@ pub fn parse_content_xml_with_pictures(
         blocks.push(Block::Paragraph(Paragraph::empty()));
     }
 
+    sections.push(office_core::Section {
+        blocks,
+        page_style: Default::default(),
+        header: None,
+        footer: None,
+    });
+    masters.push(current_master);
+    for section in &mut sections {
+        section.ensure_paragraph();
+    }
     let mut doc = Document::new();
-    doc.sections[0].blocks = blocks;
-    Ok(doc)
+    doc.sections = sections;
+    Ok((doc, masters))
+}
+
+fn is_section_marker(name: Option<&str>, styles: &HashMap<String, ParaProps>) -> bool {
+    name.is_some_and(|name| {
+        name.starts_with("RustOfficeSectionMarker")
+            && styles.get(name).is_some_and(|s| s.master_page.is_some())
+    })
 }
 
 fn make_paragraph(
@@ -448,7 +555,11 @@ fn make_paragraph(
         }
     };
     if let Some(name) = style_name {
-        if let Some(named) = parse_odt_named_style(name) {
+        let parent = para_styles
+            .get(name)
+            .and_then(|p| p.parent_style.as_deref())
+            .unwrap_or(name);
+        if let Some(named) = parse_odt_named_style(parent) {
             apply_named_paragraph_defaults(&mut para.style, named);
         }
         if let Some(props) = para_styles.get(name) {
@@ -614,7 +725,7 @@ fn finish_frame_image(
     ))
 }
 
-fn parse_length_pt(s: &str) -> Option<f32> {
+pub(super) fn parse_length_pt(s: &str) -> Option<f32> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("cm") {
         let cm: f32 = num.trim().parse().ok()?;

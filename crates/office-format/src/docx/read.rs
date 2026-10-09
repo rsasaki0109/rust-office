@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use office_core::{
     apply_named_paragraph_defaults, mime_from_path, Alignment, Block, Document, Image, ListKind,
-    ListStyle, NamedParagraphStyle, Paragraph, ParagraphStyle, Run, Table, TableCell, TableRow,
-    TextStyle,
+    ListStyle, NamedParagraphStyle, Paragraph, ParagraphStyle, Run, Section, Table, TableCell,
+    TableRow, TextStyle,
 };
 use quick_xml::events::Event;
 use quick_xml::name::QName;
@@ -94,7 +94,6 @@ impl ReferenceKind {
 pub(super) struct Reference {
     pub id: String,
     pub kind: ReferenceKind,
-    pub is_default: bool,
 }
 pub(super) struct Relationship {
     pub target: String,
@@ -179,12 +178,7 @@ pub(super) fn document_references(text: &str) -> Result<Vec<Reference>, FormatEr
                         return Err(invalid("external linked images are unsupported"));
                     }
                     match id {
-                        Some(id) if !id.is_empty() => references.push(Reference {
-                            id,
-                            kind,
-                            is_default: xml::namespaced_attr(e, reader, "type", WORD_NS)?
-                                .is_none_or(|value| value == "default"),
-                        }),
+                        Some(id) if !id.is_empty() => references.push(Reference { id, kind }),
                         None if matches!(kind, ReferenceKind::Image | ReferenceKind::Hyperlink) => {
                         }
                         _ => {
@@ -250,6 +244,24 @@ fn parse_body(
     reader.config_mut().trim_text(false);
 
     let mut blocks: Vec<Block> = Vec::new();
+    let mut sections = Vec::new();
+    let mut properties = super::sections::read(xml)?.into_iter();
+    let mut section_end = false;
+    let mut section_marker = false;
+    let finish_section =
+        |blocks: &mut Vec<Block>,
+         sections: &mut Vec<Section>,
+         properties: &mut std::vec::IntoIter<super::sections::Properties>| {
+            let props = properties.next().unwrap_or_default();
+            let mut section = Section {
+                blocks: std::mem::take(blocks),
+                page_style: props.style,
+                header: None,
+                footer: None,
+            };
+            section.ensure_paragraph();
+            sections.push(section);
+        };
     let mut in_body = false;
     let mut in_p = false;
     let mut in_r = false;
@@ -290,6 +302,7 @@ fn parse_body(
                 let local = local_name(e.name());
                 match local.as_str() {
                     "body" => in_body = true,
+                    "sectPr" if in_body && !in_tc => section_end = true,
                     "tbl" if in_body => {
                         in_tbl = true;
                         table_rows.clear();
@@ -307,6 +320,7 @@ fn parse_body(
                         p_align = Alignment::Left;
                         p_indent_level = None;
                         p_named = NamedParagraphStyle::Normal;
+                        section_marker = false;
                         para_runs.clear();
                         page_break_pending = false;
                         pending_image = None;
@@ -315,6 +329,7 @@ fn parse_body(
                     "pStyle" if in_p => {
                         if let Some(val) = attr(&e, "val") {
                             p_named = parse_docx_pstyle(&val);
+                            section_marker = val == "RustOfficeSectionBreak";
                         }
                     }
                     "jc" if in_p => {
@@ -372,9 +387,11 @@ fn parse_body(
             Ok(Event::Empty(e)) => {
                 let local = local_name(e.name());
                 match local.as_str() {
+                    "sectPr" if in_body && !in_tc => section_end = true,
                     "pStyle" if in_p => {
                         if let Some(val) = attr(&e, "val") {
                             p_named = parse_docx_pstyle(&val);
+                            section_marker = val == "RustOfficeSectionBreak";
                         }
                     }
                     "jc" if in_p => {
@@ -485,8 +502,14 @@ fn parse_body(
                                 cell_paragraphs.push(para);
                             } else {
                                 detect_list_prefix(&mut para);
-                                blocks.push(Block::Paragraph(para));
+                                if !(section_marker && section_end && para.is_empty()) {
+                                    blocks.push(Block::Paragraph(para));
+                                }
                             }
+                        }
+                        if section_end && !in_tc {
+                            finish_section(&mut blocks, &mut sections, &mut properties);
+                            section_end = false;
                         }
                         in_p = false;
                         page_break_pending = false;
@@ -528,40 +551,77 @@ fn parse_body(
         buf.clear();
     }
 
-    if blocks.is_empty() {
-        blocks.push(Block::Paragraph(Paragraph::empty()));
+    if !blocks.is_empty() || sections.is_empty() || section_end {
+        finish_section(&mut blocks, &mut sections, &mut properties);
     }
     let mut doc = Document::new();
-    doc.sections[0].blocks = blocks;
+    doc.sections = sections;
     Ok(doc)
 }
 
 pub(super) fn parse_hf_paragraph(text: &str, root: &str) -> Result<Option<Paragraph>, FormatError> {
-    let mut in_text = false;
-    let mut output = String::new();
-    xml::read_xml(text, root, WORD_NS, |event, reader, _| {
+    use quick_xml::{
+        events::{BytesEnd, BytesStart},
+        Writer,
+    };
+    let mut writer = Writer::new(Vec::new());
+    let mut prefix = String::new();
+    xml::read_xml(text, root, WORD_NS, |event, _reader, parents| {
         match event {
-            Event::Start(e) if xml::element(reader, e.name(), "t", WORD_NS) => in_text = true,
-            Event::End(e) if xml::element(reader, e.name(), "t", WORD_NS) => in_text = false,
-            Event::End(e) if xml::element(reader, e.name(), "p", WORD_NS) => output.push('\n'),
-            Event::Start(e) | Event::Empty(e) if xml::element(reader, e.name(), "br", WORD_NS) => {
-                output.push('\n')
+            Event::Start(e) if parents.is_empty() => {
+                let mut index = 0;
+                loop {
+                    prefix = format!("rodoc{index}");
+                    if e.try_get_attribute(format!("xmlns:{prefix}").as_str())
+                        .map_err(|e| invalid(e.to_string()))?
+                        .is_none()
+                    {
+                        break;
+                    }
+                    index += 1;
+                }
+                let mut start = e.clone().into_owned();
+                let name = format!("{prefix}:document");
+                start.set_name(name.as_bytes());
+                let namespace = format!("xmlns:{prefix}");
+                start.push_attribute((namespace.as_str(), WORD_NS[0]));
+                writer.write_event(Event::Start(start))?;
+                writer.write_event(Event::Start(BytesStart::new(format!("{prefix}:body"))))?;
             }
-            Event::Empty(e) if xml::element(reader, e.name(), "p", WORD_NS) => output.push('\n'),
-            Event::Empty(e) if xml::element(reader, e.name(), "tab", WORD_NS) => output.push('\t'),
-            Event::Text(t) if in_text => {
-                output.push_str(&t.unescape().map_err(|e| invalid(e.to_string()))?)
+            Event::End(_) if parents.len() == 1 => {
+                writer.write_event(Event::End(BytesEnd::new(format!("{prefix}:body"))))?;
+                writer.write_event(Event::End(BytesEnd::new(format!("{prefix}:document"))))?;
             }
-            Event::CData(t) if in_text => output
-                .push_str(std::str::from_utf8(t.as_ref()).map_err(|e| invalid(e.to_string()))?),
-            _ => {}
+            Event::Empty(_) if parents.is_empty() => {}
+            Event::Decl(_) => {}
+            _ => {
+                writer.write_event(event.clone())?;
+            }
         }
         Ok(())
     })?;
-    if output.ends_with('\n') {
-        output.pop();
+    if prefix.is_empty() {
+        return Ok(Some(Paragraph::empty()));
     }
-    Ok((!output.is_empty()).then(|| Paragraph::from_text(output)))
+    let content = String::from_utf8(writer.into_inner()).map_err(|e| invalid(e.to_string()))?;
+    let document = parse_body(&content, &HashMap::new(), &MediaMap::new())?;
+    let mut paragraphs = document
+        .sections
+        .into_iter()
+        .flat_map(|s| s.blocks)
+        .filter_map(|b| {
+            if let Block::Paragraph(p) = b {
+                Some(p)
+            } else {
+                None
+            }
+        });
+    let mut paragraph = paragraphs.next().unwrap_or_else(Paragraph::empty);
+    for next in paragraphs {
+        paragraph.runs.push(Run::new("\n", TextStyle::default()));
+        paragraph.runs.extend(next.runs);
+    }
+    Ok(Some(paragraph))
 }
 
 fn parse_jc(val: &str) -> Alignment {

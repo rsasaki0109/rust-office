@@ -18,7 +18,7 @@ use office_core::Document;
 
 use crate::{DocumentFormat, FormatError};
 
-pub use read::{parse_content_xml, parse_content_xml_with_pictures};
+pub use read::parse_content_xml;
 pub use styles::{apply_styles_xml, parse_master_header_footer};
 pub use write::build_content_xml;
 
@@ -45,11 +45,16 @@ impl OdtFormat {
                 pictures.insert(path.clone(), read_zip_bytes(&mut archive, &path)?);
             }
         }
-        let mut doc = parse_content_xml_with_pictures(&content, &pictures)?;
+        let (mut doc, masters) = read::parse_content_and_masters(&content, &pictures)?;
 
         if let Some(bytes) = read_optional_zip_bytes(&mut archive, "styles.xml")? {
             let styles = utf8_part(bytes, "styles.xml")?;
-            apply_styles_xml(&mut doc, &styles)?;
+            styles::apply_section_styles(&mut doc, &styles, &masters)?;
+        } else if masters.iter().any(Option::is_some) {
+            return Err(part_error(
+                "styles.xml",
+                invalid("Missing referenced master pages"),
+            ));
         }
 
         Ok(doc)

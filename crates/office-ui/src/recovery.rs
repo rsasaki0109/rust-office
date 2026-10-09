@@ -47,7 +47,10 @@ pub trait RecoveryData: serde::Serialize {
 impl RecoveryData for Document {
     const PREFIX: &'static str = "writer-";
     fn validate(&self) -> Result<(), String> {
-        if self.sections.is_empty() || self.format_version > Document::CURRENT_FORMAT_VERSION {
+        if self.sections.is_empty()
+            || self.format_version > Document::CURRENT_FORMAT_VERSION
+            || self.sections.iter().any(|s| !s.page_style.is_valid())
+        {
             Err("Invalid recovery document version or sections".into())
         } else {
             Ok(())

@@ -1,6 +1,7 @@
 //! Minimal Office Open XML Word (.docx) read/write.
 
 mod read;
+mod sections;
 mod write;
 mod xml;
 
@@ -46,8 +47,7 @@ impl DocxFormat {
             .transpose()?
             .unwrap_or_default();
         let mut media = MediaMap::new();
-        let mut header: Option<(bool, String)> = None;
-        let mut footer: Option<(bool, String)> = None;
+        let mut margins = std::collections::HashMap::new();
         for reference in &references {
             let relationship = resolve_reference(&typed, reference)?;
             match reference.kind {
@@ -75,30 +75,46 @@ impl DocxFormat {
                     } else {
                         "ftr"
                     };
-                    parse_hf_paragraph(&text, root).map_err(|e| part_error(&path, e))?;
-                    let selected = if reference.kind == ReferenceKind::Header {
-                        &mut header
-                    } else {
-                        &mut footer
-                    };
-                    if selected
-                        .as_ref()
-                        .is_none_or(|(is_default, _)| reference.is_default && !is_default)
-                    {
-                        *selected = Some((reference.is_default, text));
-                    }
+                    let paragraph = parse_hf_paragraph(&text, root)
+                        .map_err(|e| part_error(&path, e))?
+                        .unwrap_or_else(office_core::Paragraph::empty);
+                    margins.insert(reference.id.clone(), paragraph);
                 }
                 ReferenceKind::Hyperlink => {}
             }
         }
 
-        parse_document_parts(
+        let mut document = parse_document_parts(
             &document_xml,
             rels.as_deref().unwrap_or(""),
             &media,
-            header.as_ref().map(|(_, text)| text.as_str()),
-            footer.as_ref().map(|(_, text)| text.as_str()),
-        )
+            None,
+            None,
+        )?;
+        let properties = sections::read(&document_xml)?;
+        let mut header = None;
+        let mut footer = None;
+        for (section, properties) in document.sections.iter_mut().zip(properties) {
+            if let Some(id) = properties.header {
+                header = Some(
+                    margins
+                        .get(&id)
+                        .ok_or_else(|| invalid("Missing section header"))?
+                        .clone(),
+                );
+            }
+            if let Some(id) = properties.footer {
+                footer = Some(
+                    margins
+                        .get(&id)
+                        .ok_or_else(|| invalid("Missing section footer"))?
+                        .clone(),
+                );
+            }
+            section.header = header.clone();
+            section.footer = footer.clone();
+        }
+        Ok(document)
     }
 
     pub fn save_to_bytes(&self, document: &Document) -> Result<Vec<u8>, FormatError> {
