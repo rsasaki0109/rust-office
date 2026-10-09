@@ -13,15 +13,15 @@ use crate::model::{Presentation, Slide};
 use crate::pptx::PptxError;
 use crate::theme::Theme;
 
-const PRESENTATION_NS: &[&str] = &[
+pub(super) const PRESENTATION_NS: &[&str] = &[
     "http://schemas.openxmlformats.org/presentationml/2006/main",
     "http://purl.oclc.org/ooxml/presentationml/main",
 ];
-const DRAWING_NS: &[&str] = &[
+pub(super) const DRAWING_NS: &[&str] = &[
     "http://schemas.openxmlformats.org/drawingml/2006/main",
     "http://purl.oclc.org/ooxml/drawingml/main",
 ];
-const REL_NS: &[&str] = &[
+pub(super) const REL_NS: &[&str] = &[
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     "http://purl.oclc.org/ooxml/officeDocument/relationships",
 ];
@@ -50,6 +50,7 @@ pub fn load_pptx_bytes(bytes: &[u8]) -> Result<Presentation, PptxError> {
         None => return Err(parse_error(format!("missing {rels_path}"))),
     };
     let mut slides = Vec::new();
+    let mut basic_style = None;
     for id in ids {
         let rel = rels
             .get(&id)
@@ -61,7 +62,52 @@ pub fn load_pptx_bytes(bytes: &[u8]) -> Result<Presentation, PptxError> {
         }
         let path = slide_part_path(&rel.target).map_err(|e| part_error(rels_path, e))?;
         let xml = read_zip_string(&mut archive, &path)?;
-        slides.push(parse_slide_xml(&xml).map_err(|e| part_error(&path, e))?);
+        if let Some(imported) = crate::pptx_objects::read_slide(&xml, &path, &mut archive)
+            .map_err(|e| part_error(&path, e))?
+        {
+            let style = (imported.title, imported.body, imported.background);
+            if basic_style.is_some_and(|previous| previous != style) {
+                return Err(parse_error(format!(
+                    "{path}: per-slide title/body themes are unsupported"
+                )));
+            }
+            basic_style = Some(style);
+            slides.push(imported.slide);
+        } else {
+            slides.push(parse_slide_xml(&xml).map_err(|e| part_error(&path, e))?);
+        }
+    }
+    if basic_style.is_some() {
+        let mut size_seen = false;
+        read_xml(
+            &manifest,
+            "presentation",
+            PRESENTATION_NS,
+            |event, reader, parents| {
+                if let Event::Start(e) | Event::Empty(e) = event {
+                    if parents == ["presentation"]
+                        && element(reader, e.name(), "sldSz", PRESENTATION_NS)
+                    {
+                        if size_seen
+                            || required_attr(e, "cx")? != "12192000"
+                            || required_attr(e, "cy")? != "6858000"
+                        {
+                            return Err(parse_error(
+                                "Basic slides require a 960 × 540 pt slide size",
+                            ));
+                        }
+                        size_seen = true;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| part_error(manifest_path, e))?;
+        if !size_seen {
+            return Err(parse_error(format!(
+                "{manifest_path}: missing basic slide size"
+            )));
+        }
     }
     // A valid presentation with no listed slides opens as an editable blank deck.
     // Unlisted/orphan slide files are deliberately ignored.
@@ -70,7 +116,31 @@ pub fn load_pptx_bytes(bytes: &[u8]) -> Result<Presentation, PptxError> {
     }
     let theme_path = "ppt/theme/theme1.xml";
     let theme = match read_optional_zip_string(&mut archive, theme_path)? {
-        Some(xml) => parse_theme_accent(&xml).map_err(|e| part_error(theme_path, e))?,
+        Some(xml) => {
+            let mut theme = parse_theme_accent(&xml).map_err(|e| part_error(theme_path, e))?;
+            if let Some((title, body, background)) = basic_style {
+                theme.title_font_pt = title.font;
+                theme.title_color = title.color;
+                theme.body_font_pt = body.font;
+                theme.body_color = body.color;
+                theme.background = background;
+                read_xml(&xml, "theme", DRAWING_NS, |event, reader, _| {
+                    if let Event::Start(e) = event {
+                        if element(reader, e.name(), "theme", DRAWING_NS) {
+                            theme.name = attr(e, "name")?.unwrap_or_else(|| "Imported".into());
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(|e| part_error(theme_path, e))?;
+            }
+            theme
+        }
+        None if basic_style.is_some() => {
+            return Err(parse_error(format!(
+                "missing {theme_path} for basic slides"
+            )))
+        }
         None => Theme::light(),
     };
     let title_path = "docProps/core.xml";
@@ -100,24 +170,30 @@ fn part_error(path: &str, error: PptxError) -> PptxError {
     }
 }
 
-fn read_zip_string<R: Read + std::io::Seek>(
+pub(super) fn read_zip_string<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     path: &str,
 ) -> Result<String, PptxError> {
     read_optional_zip_string(archive, path)?.ok_or_else(|| parse_error(format!("missing {path}")))
 }
 
-fn read_optional_zip_string<R: Read + std::io::Seek>(
+pub(super) fn read_optional_zip_string<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     path: &str,
 ) -> Result<Option<String>, PptxError> {
-    let mut file = match archive.by_name(path) {
+    let file = match archive.by_name(path) {
         Ok(file) => file,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
         Err(error) => return Err(parse_error(format!("cannot read {path}: {error}"))),
     };
+    if file.size() > 8 * 1024 * 1024 {
+        return Err(parse_error(format!(
+            "{path}: XML part exceeds the 8 MiB limit"
+        )));
+    }
     let mut text = String::new();
-    file.read_to_string(&mut text)
+    file.take(8 * 1024 * 1024 + 1)
+        .read_to_string(&mut text)
         .map_err(|e| parse_error(format!("cannot read {path}: {e}")))?;
     Ok(Some(text))
 }
@@ -133,7 +209,7 @@ fn element(reader: &NsReader<&[u8]>, name: QName<'_>, local: &str, namespaces: &
 
 // quick-xml detects mismatched closing tags, but EOF alone does not reject a
 // truncated document. Track open elements and require one complete OOXML root.
-fn read_xml(
+pub(super) fn read_xml(
     xml: &str,
     root: &str,
     namespaces: &[&str],
@@ -299,13 +375,13 @@ fn parse_slide_ids(xml: &str) -> Result<Vec<String>, PptxError> {
     Ok(ids)
 }
 
-struct Relationship {
-    kind: String,
-    target: String,
-    external: bool,
+pub(super) struct Relationship {
+    pub kind: String,
+    pub target: String,
+    pub external: bool,
 }
 
-fn parse_relationships(xml: &str) -> Result<HashMap<String, Relationship>, PptxError> {
+pub(super) fn parse_relationships(xml: &str) -> Result<HashMap<String, Relationship>, PptxError> {
     let mut relationships = HashMap::new();
     read_xml(
         xml,
@@ -340,6 +416,9 @@ fn parse_relationships(xml: &str) -> Result<HashMap<String, Relationship>, PptxE
 // Resolve OPC part URIs relative to ppt/presentation.xml, including absolute
 // package targets and dot segments. This is ZIP lookup only, never filesystem I/O.
 fn slide_part_path(target: &str) -> Result<String, PptxError> {
+    part_path(target, "ppt")
+}
+pub(super) fn part_path(target: &str, parent: &str) -> Result<String, PptxError> {
     if target.contains(['\\', '?', '#', ':']) {
         return Err(parse_error(format!("invalid slide target {target:?}")));
     }
@@ -370,7 +449,7 @@ fn slide_part_path(target: &str) -> Result<String, PptxError> {
     let mut parts = if decoded.starts_with('/') {
         Vec::new()
     } else {
-        vec!["ppt"]
+        parent.split('/').collect()
     };
     for part in decoded.split('/') {
         match part {
@@ -592,7 +671,9 @@ mod tests {
             "<p:sp/>",
             "<p:sp><p:spPr/></p:sp>",
         ] {
-            let xml = original_part(path).replace("</p:spTree>", &format!("{object}</p:spTree>"));
+            let xml = original_part(path)
+                .replace("name=\"rust-office:basic-v1\"", "")
+                .replace("</p:spTree>", &format!("{object}</p:spTree>"));
             let error = load_pptx_bytes(&package(&[(path, Some(xml.as_bytes()))]))
                 .unwrap_err()
                 .to_string();
@@ -774,7 +855,22 @@ mod tests {
 
     #[test]
     fn optional_parts_default_only_when_absent_and_bad_reads_are_errors() {
-        let loaded = load_pptx_bytes(&package(&[("ppt/theme/theme1.xml", None)])).unwrap();
+        let paths = [
+            "ppt/slides/slide1.xml",
+            "ppt/slides/slide2.xml",
+            "ppt/slides/slide3.xml",
+        ];
+        let legacy: Vec<String> = paths
+            .iter()
+            .map(|p| original_part(p).replace("name=\"rust-office:basic-v1\"", ""))
+            .collect();
+        let mut replacements: Vec<(&str, Option<&[u8]>)> = paths
+            .iter()
+            .zip(&legacy)
+            .map(|(p, xml)| (*p, Some(xml.as_bytes())))
+            .collect();
+        replacements.extend([("ppt/theme/theme1.xml", None), ("docProps/core.xml", None)]);
+        let loaded = load_pptx_bytes(&package(&replacements)).unwrap();
         assert_eq!(loaded.theme, Theme::light());
         assert_eq!(loaded.title, "Imported presentation");
         for (path, bad) in [

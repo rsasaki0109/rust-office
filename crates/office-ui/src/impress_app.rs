@@ -39,6 +39,7 @@ pub struct ImpressApp {
     textures: office_render::SlideTextures,
     pdf_export: Option<PdfExport>,
     pending_pdf: Option<PathBuf>,
+    pending_pptx: Option<PathBuf>,
     show: Option<SlideShow>,
     pending_show: Option<bool>,
     pub pending_switch: Option<SwitchTo>,
@@ -60,6 +61,7 @@ impl ImpressApp {
             textures: office_render::SlideTextures::default(),
             pdf_export: None,
             pending_pdf: None,
+            pending_pptx: None,
             show: None,
             pending_show: None,
             pending_switch: None,
@@ -324,9 +326,27 @@ impl ImpressApp {
         let Some(path) = path else {
             return;
         };
-        match write_pptx_path(&self.presentation, &path) {
-            Ok(()) => self.set_status(format!("Exported PPTX {}", path.display())),
-            Err(e) => self.set_error(format!("PPTX export failed: {e}")),
+        self.pending_pptx = Some(path);
+    }
+
+    fn export_pptx_to(&mut self, path: &std::path::Path) -> bool {
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("pptx"))
+        {
+            self.set_error("PPTX export failed: choose a .pptx destination");
+            return false;
+        }
+        match write_pptx_path(&self.presentation, path) {
+            Ok(()) => {
+                self.set_status(format!("Exported PPTX {}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.set_error(format!("PPTX export failed: {e}"));
+                false
+            }
         }
     }
 
@@ -1057,6 +1077,11 @@ impl ImpressApp {
             .show(ui, |ui| {
                 self.canvas(ui);
             });
+        if let Some(path) = self.pending_pptx.take() {
+            if ui.is_enabled() {
+                self.export_pptx_to(&path);
+            }
+        }
         if let Some(path) = self.pending_pdf.take() {
             if ui.is_enabled() {
                 self.export_pdf_to(&ctx, &path);
@@ -1692,5 +1717,81 @@ mod pdf_tests {
         assert_eq!(app.file_path, Some(native));
         app.history(false);
         assert!(!app.is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod pptx_object_tests {
+    use super::*;
+    #[test]
+    fn queued_export_contains_text_entered_in_the_export_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("final-text.pptx");
+        let ctx = egui::Context::default();
+        let mut app = ImpressApp::new();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run_ui(input(vec![]), |ui| app.document_ui(ui))
+            .textures_delta
+            .clear();
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("impress_text", 0usize, 0usize))));
+        app.pending_pptx = Some(path.clone());
+        ctx.run_ui(input(vec![egui::Event::Text("追加".into())]), |ui| {
+            app.document_ui(ui)
+        })
+        .textures_delta
+        .clear();
+        assert!(app.presentation.slides[0].title.text.contains("追加"));
+        assert_eq!(
+            load_pptx_path(&path).unwrap().slides[0].title.text,
+            app.presentation.slides[0].title.text
+        );
+        assert!(app.presentation.undo());
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn object_export_keeps_native_destination_unsaved_edits_selection_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = ImpressApp::new();
+        let native = dir.path().join("original.rimpress.json");
+        app.file_path = Some(native.clone());
+        assert!(app.save_file());
+        let mut slide = app.presentation.active_slide().unwrap().clone();
+        slide.objects.push(SlideObject::shape(ShapeKind::Ellipse));
+        app.presentation.update_active_slide(slide, false);
+        app.selected_object = 2;
+        let before = app.presentation.clone();
+        let path = dir.path().join("objects.pptx");
+        assert!(app.export_pptx_to(&path));
+        assert_eq!(load_pptx_path(&path).unwrap().slides, before.slides);
+        assert_eq!(app.presentation, before);
+        assert_eq!(app.file_path, Some(native.clone()));
+        assert_eq!(app.selected_object, 2);
+        assert!(app.presentation.undo());
+        assert!(!app.is_dirty());
+        assert!(app.presentation.redo());
+        assert!(app.is_dirty());
+        let bytes = std::fs::read(&native).unwrap();
+        assert!(!app.export_pptx_to(&native));
+        assert_eq!(std::fs::read(&native).unwrap(), bytes);
+        assert!(app.is_dirty());
+        assert_eq!(app.presentation.slides, before.slides);
+        // A failed write must leave the redo branch available.
+        app.presentation.undo();
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, b"keep parent").unwrap();
+        assert!(!app.export_pptx_to(&parent.join("failed.pptx")));
+        assert!(!app.is_dirty());
+        assert_eq!(std::fs::read(parent).unwrap(), b"keep parent");
+        assert!(app.presentation.redo());
+        assert_eq!(app.presentation.slides, before.slides);
+        assert_eq!(app.file_path, Some(native));
     }
 }

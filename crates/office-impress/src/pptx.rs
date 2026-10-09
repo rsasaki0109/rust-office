@@ -1,4 +1,4 @@
-//! Minimal PPTX (OOXML) writer — title + body text per slide.
+//! PPTX (OOXML) writer for editable basic slides, objects and speaker notes.
 
 use std::io::{Cursor, Seek, Write};
 use std::path::Path;
@@ -26,25 +26,37 @@ pub fn write_pptx_path(presentation: &Presentation, path: &Path) -> Result<(), P
 }
 
 pub fn write_pptx_bytes(presentation: &Presentation) -> Result<Vec<u8>, PptxError> {
-    if presentation.slides.iter().any(|s| !s.objects.is_empty()) {
-        return Err(PptxError::Parse("PPTX export does not yet support added text boxes, shapes or images. Save native JSON to preserve them.".into()));
-    }
     let mut cursor = Cursor::new(Vec::new());
     write_pptx(presentation, &mut cursor)?;
     Ok(cursor.into_inner())
 }
 
 fn write_pptx<W: Write + Seek>(presentation: &Presentation, writer: W) -> Result<(), PptxError> {
+    crate::pptx_objects::valid_text(&presentation.title)?;
+    crate::pptx_objects::valid_text(&presentation.theme.name)?;
     let mut zip = ZipWriter::new(writer);
     let opts = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    let n = presentation.slides.len().max(1);
+    let blank = crate::Slide::blank();
+    let slides = if presentation.slides.is_empty() {
+        std::slice::from_ref(&blank)
+    } else {
+        &presentation.slides
+    };
+    let parts = slides
+        .iter()
+        .enumerate()
+        .map(|(i, s)| crate::pptx_objects::slide_parts(s, &presentation.theme, i + 1))
+        .collect::<Result<Vec<_>, _>>()?;
+    let n = slides.len();
 
     zip.start_file("[Content_Types].xml", opts)?;
     zip.write_all(content_types(n).as_bytes())?;
 
     zip.start_file("_rels/.rels", opts)?;
     zip.write_all(ROOT_RELS.as_bytes())?;
+    zip.start_file("docProps/core.xml", opts)?;
+    zip.write_all(format!(r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>{}</dc:title></cp:coreProperties>"#,crate::pptx_objects::escaped(&presentation.title)).as_bytes())?;
 
     zip.start_file("ppt/presentation.xml", opts)?;
     zip.write_all(presentation_xml(n).as_bytes())?;
@@ -67,12 +79,16 @@ fn write_pptx<W: Write + Seek>(presentation: &Presentation, writer: W) -> Result
     zip.start_file("ppt/theme/theme1.xml", opts)?;
     zip.write_all(theme_xml(presentation).as_bytes())?;
 
-    for (i, slide) in presentation.slides.iter().enumerate() {
+    for (i, slide) in parts.iter().enumerate() {
         let idx = i + 1;
         zip.start_file(format!("ppt/slides/slide{idx}.xml"), opts)?;
-        zip.write_all(slide_xml(slide).as_bytes())?;
+        zip.write_all(slide.xml.as_bytes())?;
         zip.start_file(format!("ppt/slides/_rels/slide{idx}.xml.rels"), opts)?;
-        zip.write_all(SLIDE_RELS.as_bytes())?;
+        zip.write_all(slide.rels.as_bytes())?;
+        for media in &slide.media {
+            zip.start_file(&media.path, opts)?;
+            zip.write_all(&media.data)?;
+        }
     }
 
     zip.finish()?;
@@ -81,7 +97,8 @@ fn write_pptx<W: Write + Seek>(presentation: &Presentation, writer: W) -> Result
 
 fn content_types(n: usize) -> String {
     let mut overrides = String::from(
-        r#"  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+        r#"  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
   <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
   <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
   <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
@@ -89,7 +106,8 @@ fn content_types(n: usize) -> String {
     );
     for i in 1..=n {
         overrides.push_str(&format!(
-            r#"  <Override PartName="/ppt/slides/slide{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
+            r#"  <Override PartName="/ppt/notesSlides/notesSlide{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>
+  <Override PartName="/ppt/slides/slide{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>
 "#
         ));
     }
@@ -98,6 +116,8 @@ fn content_types(n: usize) -> String {
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="jpeg" ContentType="image/jpeg"/>
 {overrides}</Types>
 "#
     )
@@ -146,73 +166,6 @@ fn presentation_rels(n: usize) -> String {
 "#
     ));
     rels
-}
-
-fn slide_xml(slide: &crate::model::Slide) -> String {
-    let title = escape_xml(&slide.title.text);
-    let body = escape_xml(&slide.body.text);
-    let body_paras = body_paragraphs(&body);
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-  <p:cSld>
-    <p:spTree>
-      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
-      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
-      <p:sp>
-        <p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
-        <p:spPr>
-          <a:xfrm><a:off x="{tx}" y="{ty}"/><a:ext cx="{tw}" cy="{th}"/></a:xfrm>
-          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-        </p:spPr>
-        <p:txBody>
-          <a:bodyPr/><a:lstStyle/>
-          <a:p><a:r><a:rPr lang="en-US" sz="3600" b="1"/><a:t>{title}</a:t></a:r></a:p>
-        </p:txBody>
-      </p:sp>
-      <p:sp>
-        <p:nvSpPr><p:cNvPr id="3" name="Body"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
-        <p:spPr>
-          <a:xfrm><a:off x="{bx}" y="{by}"/><a:ext cx="{bw}" cy="{bh}"/></a:xfrm>
-          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-        </p:spPr>
-        <p:txBody>
-          <a:bodyPr/><a:lstStyle/>
-          {body_paras}
-        </p:txBody>
-      </p:sp>
-    </p:spTree>
-  </p:cSld>
-  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
-</p:sld>
-"#,
-        tx = frac_emu(slide.title.x, SLIDE_WIDTH_PT),
-        ty = frac_emu(slide.title.y, SLIDE_HEIGHT_PT),
-        tw = frac_emu(slide.title.w, SLIDE_WIDTH_PT),
-        th = frac_emu(slide.title.h, SLIDE_HEIGHT_PT),
-        bx = frac_emu(slide.body.x, SLIDE_WIDTH_PT),
-        by = frac_emu(slide.body.y, SLIDE_HEIGHT_PT),
-        bw = frac_emu(slide.body.w, SLIDE_WIDTH_PT),
-        bh = frac_emu(slide.body.h, SLIDE_HEIGHT_PT),
-    )
-}
-
-fn body_paragraphs(escaped: &str) -> String {
-    if escaped.is_empty() {
-        return "<a:p><a:endParaRPr lang=\"en-US\" sz=\"2000\"/></a:p>".into();
-    }
-    escaped
-        .split('\n')
-        .map(|line| {
-            format!(r#"<a:p><a:r><a:rPr lang="en-US" sz="2000"/><a:t>{line}</a:t></a:r></a:p>"#)
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn frac_emu(frac: f32, total_pt: f32) -> i64 {
-    let pt = frac * total_pt;
-    (pt as f64 / 72.0 * 914400.0).round() as i64
 }
 
 fn theme_xml(presentation: &Presentation) -> String {
@@ -266,12 +219,7 @@ fn escape_xml(s: &str) -> String {
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
-</Relationships>
-"#;
-
-const SLIDE_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
 </Relationships>
 "#;
 

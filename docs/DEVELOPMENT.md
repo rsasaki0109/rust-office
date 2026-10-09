@@ -51,13 +51,15 @@ Run these checks before submitting changes:
 * A missing presentation, relationship or listed slide, unreadable part, or malformed
   XML rejects the entire PPTX import and identifies the affected part. The existing
   deck, active slide, destination and unsaved edits remain intact on failure.
-  Missing optional `ppt/theme/theme1.xml` / `docProps/core.xml` use defaults; present
-  but unreadable or malformed optional parts also fail. A valid empty slide list
+  Foreign title/body imports use defaults when optional `ppt/theme/theme1.xml` /
+  `docProps/core.xml` are missing; present but unreadable or malformed optional
+  parts also fail. The rust-office basic profile requires its theme part. A valid empty slide list
   opens one editable blank slide, and may omit the presentation relationships part.
 * PPTX text import retains empty titles, paragraph breaks (including blank lines),
-  escaped XML text and CDATA. Coverage remains title/body text and a basic theme
-  accent/background; rich shapes, notes, layouts and theme relationship selection
-  are not preserved. UTF-8 XML parts with Transitional or Strict main namespaces
+  escaped XML text and CDATA. Foreign PPTX coverage remains title/body text and
+  a basic theme accent/background; arbitrary shapes, notes, layouts and theme
+  relationship selection are not preserved. The basic profile described below
+  additionally supports rust-office's own object/notes round trips. UTF-8 XML parts with Transitional or Strict main namespaces
   are supported; arbitrary presentation-part locations are not yet supported.
 * DOCX file imports validate complete `word/document.xml`, its relationships and
   referenced DrawingML images / header / footer parts. Missing, unreadable, invalid
@@ -182,7 +184,7 @@ Not yet:
 * Calc copies raw values/formulas as tab-separated text. Formatting is not
   exchanged through the clipboard. Copy/paste is limited to 1,000,000 cells
   per operation and XLSX worksheet bounds; history retains the latest 100 operations.
-* Impress: added shape/image PPTX interchange, searchable/vector slide PDF and animations remain unsupported
+* Impress: arbitrary third-party PPTX object/layout interchange, searchable/vector slide PDF and animations remain unsupported
 * Packaging: CI builds Linux binary; no signed macOS/Windows installers yet
 
 ## Suggested next PRs
@@ -309,9 +311,9 @@ Impress slide operations support duplicate, move up/down, confirmed deletion
 covers existing title/body text boxes, notes and themes; consecutive typing in
 one field is grouped until focus changes, another operation or a save boundary.
 Undo back to the saved revision clears the unsaved marker. Native JSON stores
-slide order, text box geometry and notes, but never runtime history. PPTX remains
-the existing basic title/body import/export subset; this change does not add
-speaker-note or arbitrary shape fidelity. Direct model mutation followed by
+slide order, text box geometry and notes, but never runtime history. The slide
+history implementation does not itself expand PPTX coverage; the basic-object
+PPTX profile described below provides separate interchange support. Direct model mutation followed by
 `mark_dirty` clears history to avoid replaying operations against unrelated data.
 
 
@@ -332,12 +334,10 @@ Open validate decoding and geometry before replacing the document. Saving invali
 geometry or images fails before touching the destination. This does not add global
 archive/document input limits from the separate stability milestone.
 
-PPTX export currently refuses any added objects and leaves the output destination
-untouched. Save JSON to retain them. The existing PPTX reader remains the title/body
-subset; added native objects and speaker notes are not supported interchange yet.
+The basic PPTX profile described below exports added objects and retains their
+geometry on reimport. Native JSON remains the format for complete native state.
 Rotation, grouping, object reordering, aspect-lock resize and animations are later
-work. Original title/body geometry is saved in JSON and emitted by the existing
-PPTX writer, but the PPTX reader does not promise geometry round-trip fidelity.
+work. Foreign title/body PPTX imports retain their existing geometry limitations.
 
 
 Impress slide show starts with F5 (beginning) or Shift+F5 (current slide), or the
@@ -360,7 +360,7 @@ Show exit restores the fullscreen flag reported at start. External window-manage
 fullscreen changes were not reported by the X11 backend in the native test;
 application F11 is the tested way to manage and restore fullscreen state. Other
 OS/Wayland behavior still requires the separate platform acceptance checks.
-PPTX interchange for added objects, presenter-notes views and animations remain
+Arbitrary third-party PPTX interchange, presenter-notes views and animations remain
 later work. Raster PDF sharing is implemented below. Completing slide show alone does not complete the
 roadmap milestone that also requires PDF and basic-shape PPTX output.
 
@@ -388,14 +388,60 @@ and unsupported paint callbacks are errors. Image limits from the native object
 model also apply. The writer generates the whole PDF before atomically replacing
 the destination; failure leaves a prior file intact. The UI requires a .pdf
 extension, protecting a selected native JSON destination from accidental export.
-This does not complete the combined presentation/PDF/PPTX roadmap milestone until
-basic-object PPTX output is implemented and the corresponding PRs are merged.
+The combined presentation/PDF/PPTX roadmap milestone remains in progress until the
+slide show, PDF and basic-object PPTX PRs are merged and accepted.
 
 
-PPTX import currently supports title/body text only. Listed slides containing
-images, shapes without text bodies, grouped objects, connectors, charts/tables or content
-parts are rejected with the slide part path rather than silently losing those
-objects. This applies to both transitional and strict OOXML namespaces, including
-renamed prefixes. Unlisted slide parts remain ignored. Text formatting and
-geometry remain subject to the existing title/body MVP limitations. Native JSON
-is the preservation format for presentations with added objects.
+Foreign PPTX imports support title/body text only. Listed slides containing
+images, shapes without text bodies, grouped objects, connectors, charts/tables or
+content parts are rejected with the slide part path rather than silently losing
+those objects. This applies to both transitional and strict OOXML namespaces,
+including renamed prefixes. Unlisted slide parts remain ignored. Text formatting
+and geometry remain subject to the existing foreign title/body MVP limitations.
+
+
+Impress basic PPTX export writes editable DrawingML text boxes, rectangles,
+ellipses and embedded pictures in the same drawing order as the editor. Each
+slide has an explicit theme background. Title/body colors and sizes, added text
+colors and sizes, shape fills, geometry and plain speaker notes are written to
+standard OOXML parts; the deck title is written to core properties. No JSON copy
+is embedded. PNG/JPEG bytes are retained. GIF/BMP/WebP images become PNGs of the
+first decoded frame; decoded pixels are retained, but original source bytes are
+not. Converted PNGs must also fit the 8 MiB image limit. Fonts are not embedded,
+so another viewer's font selection, wrapping and rendering can differ.
+
+The supported import profile is identified by `p:cSld name="rust-office:basic-v1"`
+and the exported object names. Reopening these exports reads actual OOXML geometry,
+text styles, relationships and image parts, restoring title/body layout, object
+order, theme and plain notes. Geometry is rounded to integral EMUs (one point is
+12,700 EMUs), and font sizes to 0.01 pt. The profile uses 960×540 pt slides; arbitrary
+slide sizes, mixed title/body themes per slide, rotation/flip, groups, rich text,
+gradient/outline effects, crop, transitions and animations are rejected when
+recognized as unsupported. Renaming the profile marker or object names, or editing
+the file with another application, can move it outside this supported subset.
+Foreign decks continue to use the separate guarded title/body reader.
+
+Missing/corrupt/external image relationships, invalid image decoding, malformed
+notes, missing basic-profile themes and invalid geometry reject the entire import
+before changing the current document. XML parts have an 8 MiB expanded limit;
+slide/notes trees are limited to depth 128 and 100,000 nodes per part. Image limits
+remain 8 MiB encoded, 4096 pixels per edge and 64 MiB decode allocation. These are
+part limits, not an aggregate ZIP/deck memory limit or the complete input-limit
+roadmap milestone.
+
+File → Export PPTX captures text events from the export frame before generating
+the file. Generation completes before atomic destination replacement. A failure
+leaves any old output intact. The UI requires a .pptx destination, protecting
+native JSON files from accidental export. Export preserves the native save path,
+selection, dirty revision and Undo/Redo; after opening an exported PPTX, Save still
+uses Save As for JSON. PPTX export currently runs synchronously on the UI thread.
+
+Validation includes basic-object/notes round trips across Light/Dark/Ocean themes,
+Japanese text and blank paragraphs, PNG/JPEG byte preservation, GIF/BMP/WebP pixel
+preservation, strict namespaces and aliases, failed exports, missing/corrupt/
+oversized images and notes, unsupported edits and changed slide size. Native
+Xvfb/Openbox tests exported and reopened a four-slide object deck, checked native
+Save and Undo/Redo after export, and retained the document/redo after a failed
+image import. Independent python-pptx checks confirmed editable shape types,
+geometry, fills, text styles, images, theme backgrounds, metadata and notes.
+Microsoft PowerPoint / LibreOffice rendering has not been manually verified.
