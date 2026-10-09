@@ -1217,7 +1217,7 @@ impl CalcApp {
                         );
                         let style = self.workbook.active_sheet().format(addr);
                         let job = egui::text::LayoutJob::single_section(
-                            self.workbook.active_sheet().display(addr),
+                            self.workbook.display(self.workbook.active, addr),
                             egui::TextFormat {
                                 font_id: egui::FontId::proportional(13.0),
                                 color: Color32::BLACK,

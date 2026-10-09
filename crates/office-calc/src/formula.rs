@@ -19,6 +19,8 @@ enum Expr {
     Number(f64),
     Text(String),
     Ref(CellAddr),
+    SheetRef(String, CellAddr),
+    SheetRange(String, crate::CellRange),
     Range(crate::addr::CellRange),
     UnaryNeg(Box<Expr>),
     BinOp(BinOp, Box<Expr>, Box<Expr>),
@@ -171,9 +173,10 @@ impl<'a> Parser<'a> {
                 Ok(e)
             }
             Some(b'"') => self.parse_string(),
+            Some(b'\'') => self.parse_quoted_sheet(),
             Some(b'#') => self.parse_error(),
             Some(c) if c.is_ascii_digit() || c == b'.' => self.parse_number(),
-            Some(c) if c.is_ascii_alphabetic() || c == b'$' => self.parse_ident_or_ref(),
+            Some(c) if c.is_ascii_alphabetic() || c == b'$' || c >= 128 => self.parse_ident_or_ref(),
             _ => Err(CalcError::Value),
         }
     }
@@ -230,16 +233,54 @@ impl<'a> Parser<'a> {
         Ok(Expr::Number(n))
     }
 
+    fn parse_quoted_sheet(&mut self) -> Result<Expr, CalcError> {
+        self.bump();
+        let mut name = Vec::new();
+        loop {
+            match self.bump() {
+                Some(b'\'') if self.peek() == Some(b'\'') => { self.bump(); name.push(b'\''); }
+                Some(b'\'') => break,
+                Some(byte) => name.push(byte),
+                None => return Err(CalcError::Value),
+            }
+        }
+        self.skip_ws();
+        self.parse_sheet_reference(String::from_utf8(name).map_err(|_| CalcError::Value)?)
+    }
+    fn parse_sheet_reference(&mut self, name: String) -> Result<Expr, CalcError> {
+        if self.bump() != Some(b'!') || name.is_empty() || name.contains(['[', ']']) {
+            return Err(CalcError::Ref);
+        }
+        self.skip_ws();
+        let start = self.i;
+        while matches!(self.peek(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$')) { self.i += 1; }
+        let first = std::str::from_utf8(&self.src[start..self.i]).map_err(|_| CalcError::Ref)?;
+        let addr = parse_a1(first).map_err(|_| CalcError::Ref)?;
+        if !in_bounds(addr) { return Err(CalcError::Ref); }
+        self.skip_ws();
+        if self.peek() == Some(b':') {
+            self.bump(); self.skip_ws(); let start = self.i;
+            while matches!(self.peek(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$')) { self.i += 1; }
+            let last = std::str::from_utf8(&self.src[start..self.i]).map_err(|_| CalcError::Ref)?;
+            let range = parse_a1_range(&format!("{first}:{last}")).map_err(|_| CalcError::Ref)?;
+            if !in_bounds(range.end) { return Err(CalcError::Ref); }
+            Ok(Expr::SheetRange(name, range))
+        } else { Ok(Expr::SheetRef(name, addr)) }
+    }
+
     fn parse_ident_or_ref(&mut self) -> Result<Expr, CalcError> {
         let start = self.i;
         while matches!(
             self.peek(),
-            Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$' | b'_')
+            Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'$' | b'_' | b'.' | 128..=255)
         ) {
             self.i += 1;
         }
         let ident = std::str::from_utf8(&self.src[start..self.i]).map_err(|_| CalcError::Value)?;
         self.skip_ws();
+        if self.peek() == Some(b'!') {
+            return self.parse_sheet_reference(ident.to_owned());
+        }
         if self.peek() == Some(b'(') {
             self.bump();
             let mut args = Vec::new();
@@ -298,17 +339,21 @@ fn in_bounds(addr: CellAddr) -> bool {
 }
 
 // A fresh context for each displayed cell keeps caching valid after edits/Undo.
-struct EvalContext {
-    visiting: HashSet<CellAddr>,
-    cache: HashMap<CellAddr, Value>,
+struct EvalContext<'a> {
+    workbook: Option<&'a crate::Workbook>,
+    sheet_index: usize,
+    visiting: HashSet<(usize, CellAddr)>,
+    cache: HashMap<(usize, CellAddr), Value>,
     depth: usize,
     work: usize,
     limited: bool,
 }
 
-impl EvalContext {
+impl<'a> EvalContext<'a> {
     fn new() -> Self {
         Self {
+            workbook: None,
+            sheet_index: 0,
             visiting: HashSet::new(),
             cache: HashMap::new(),
             depth: 0,
@@ -348,7 +393,7 @@ impl EvalContext {
 /// Evaluate a formula body (without leading `=`).
 pub fn evaluate_formula(sheet: &Sheet, body: &str, origin: CellAddr) -> Value {
     let mut context = EvalContext::new();
-    context.visiting.insert(origin);
+    context.visiting.insert((0, origin));
     let value = eval_body(sheet, body, &mut context);
     context.finish(value)
 }
@@ -357,6 +402,30 @@ pub(crate) fn evaluate_cell(sheet: &Sheet, addr: CellAddr) -> Value {
     let mut context = EvalContext::new();
     let value = eval_cell(sheet, addr, &mut context);
     context.finish(value)
+}
+
+pub(crate) fn evaluate_workbook(book: &crate::Workbook, sheet_index: usize, addr: CellAddr) -> Value {
+    let Some(sheet) = book.sheets.get(sheet_index) else { return Value::Error(CalcError::Ref); };
+    let mut context = EvalContext::new();
+    context.workbook = Some(book); context.sheet_index = sheet_index;
+    let value = eval_cell(sheet, addr, &mut context);
+    context.finish(value)
+}
+fn target_sheet<'a>(name: &str, context: &mut EvalContext<'a>) -> Result<(usize, &'a Sheet), CalcError> {
+    let book = context.workbook.ok_or(CalcError::Ref)?;
+    let name = name.to_lowercase();
+    for (index, sheet) in book.sheets.iter().enumerate() {
+        context.spend(1)?;
+        if sheet.name.to_lowercase() == name {
+            return Ok((index, sheet));
+        }
+    }
+    Err(CalcError::Ref)
+}
+fn eval_sheet_reference(name: &str, addr: CellAddr, context: &mut EvalContext) -> Value {
+    let (index, sheet) = match target_sheet(name, context) { Ok(target) => target, Err(e) => return Value::Error(e) };
+    let previous = context.sheet_index; context.sheet_index = index;
+    let value = eval_cell(sheet, addr, context); context.sheet_index = previous; value
 }
 
 fn eval_body(sheet: &Sheet, body: &str, context: &mut EvalContext) -> Value {
@@ -389,7 +458,8 @@ fn eval_expr_inner(sheet: &Sheet, expr: &Expr, context: &mut EvalContext) -> Val
         Expr::Number(n) => Value::Number(*n),
         Expr::Text(t) => Value::Text(t.clone()),
         Expr::Ref(addr) => eval_cell(sheet, *addr, context),
-        Expr::Range(_) => Value::Error(CalcError::Value),
+        Expr::SheetRef(name, addr) => eval_sheet_reference(name, *addr, context),
+        Expr::Range(_) | Expr::SheetRange(_, _) => Value::Error(CalcError::Value),
         Expr::UnaryNeg(e) => match eval_expr(sheet, e, context).as_number() {
             Ok(n) => Value::Number(-n),
             Err(e) => Value::Error(e),
@@ -480,29 +550,20 @@ fn aggregate(
     for arg in args {
         match arg {
             Expr::Range(range) => {
-                // Scan the sparse model, never expand billions of empty addresses.
-                // Sort matching cells for stable floating-point/error order.
-                let mut addresses = Vec::new();
-                for (addr, _) in sheet.occupied() {
-                    context.spend(1)?;
-                    if range.contains(addr) {
-                        addresses.push(addr);
-                    }
-                }
-                // evaluate_formula can supply a formula at an otherwise empty
-                // origin. Include that active address to retain cycle detection.
-                for addr in &context.visiting {
-                    if range.contains(*addr) && sheet.get(*addr).is_none() {
-                        addresses.push(*addr);
-                    }
-                }
-                addresses.sort_unstable_by_key(|addr| (addr.row, addr.col));
-                for addr in addresses {
-                    add(eval_cell(sheet, addr, context), true)?;
-                    context.spend(0)?;
-                }
+                for addr in range_addresses(sheet, *range, context)? { add(eval_cell(sheet, addr, context), true)?; context.spend(0)?; }
+            }
+            Expr::SheetRange(name, range) => {
+                let (index, target) = target_sheet(name, context)?;
+                let previous = context.sheet_index; context.sheet_index = index;
+                let result = (|| {
+                    for addr in range_addresses(target, *range, context)? { add(eval_cell(target, addr, context), true)?; context.spend(0)?; }
+                    Ok::<(), CalcError>(())
+                })();
+                context.sheet_index = previous;
+                result?;
             }
             Expr::Ref(addr) => add(eval_cell(sheet, *addr, context), true)?,
+            Expr::SheetRef(name, addr) => add(eval_sheet_reference(name, *addr, context), true)?,
             other => add(eval_expr(sheet, other, context), false)?,
         }
         // COUNT may ignore spreadsheet error values, but must not swallow limits.
@@ -525,6 +586,19 @@ fn aggregate(
     })
 }
 
+fn range_addresses(sheet: &Sheet, range: crate::CellRange, context: &mut EvalContext) -> Result<Vec<CellAddr>, CalcError> {
+    let mut addresses = Vec::new();
+    for (addr, _) in sheet.occupied() {
+        context.spend(1)?;
+        if range.contains(addr) { addresses.push(addr); }
+    }
+    for (index, addr) in &context.visiting {
+        if *index == context.sheet_index && range.contains(*addr) && sheet.get(*addr).is_none() { addresses.push(*addr); }
+    }
+    addresses.sort_unstable_by_key(|addr| (addr.row, addr.col));
+    Ok(addresses)
+}
+
 fn eval_cell(sheet: &Sheet, addr: CellAddr, context: &mut EvalContext) -> Value {
     if !in_bounds(addr) {
         return Value::Error(CalcError::Ref);
@@ -538,13 +612,14 @@ fn eval_cell(sheet: &Sheet, addr: CellAddr, context: &mut EvalContext) -> Value 
 }
 
 fn eval_cell_inner(sheet: &Sheet, addr: CellAddr, context: &mut EvalContext) -> Value {
-    if context.visiting.contains(&addr) {
+    let key = (context.sheet_index, addr);
+    if context.visiting.contains(&key) {
         return Value::Error(CalcError::Cycle);
     }
-    if let Some(value) = context.cache.get(&addr) {
+    if let Some(value) = context.cache.get(&key) {
         return value.clone();
     }
-    context.visiting.insert(addr);
+    context.visiting.insert(key);
     let value = match sheet.get(addr) {
         None => Value::Empty,
         Some(cell) => {
@@ -567,10 +642,10 @@ fn eval_cell_inner(sheet: &Sheet, addr: CellAddr, context: &mut EvalContext) -> 
             }
         }
     };
-    context.visiting.remove(&addr);
+    context.visiting.remove(&key);
     // Avoid retaining/duplicating large strings in the memoization table.
     if !matches!(value, Value::Text(_)) {
-        context.cache.insert(addr, value.clone());
+        context.cache.insert(key, value.clone());
     }
     value
 }
