@@ -1,0 +1,112 @@
+name: Publish v0.1.0 Linux preview
+
+on:
+  push:
+    branches: [codex/release-v0.1.0]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-preview-v0.1.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'rsasaki0109/rust-office'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: rsasaki0109/rust-office
+      SOURCE_RUN: '37978404810'
+      SOURCE_SHA: eba3d97ae97f53b9dcbc2152da39ecb69a8a25bd
+      RELEASE_TAG: v0.1.0
+    steps:
+      - name: Verify validated source and draft release
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN" > source-run.json
+          gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,targetCommitish,assets > release.json
+          python3 - <<'PYTHON'
+          import json, os
+          run = json.load(open('source-run.json'))
+          release = json.load(open('release.json'))
+          assert run['conclusion'] == 'success'
+          assert run['head_sha'] == os.environ['SOURCE_SHA']
+          assert run['path'] == '.github/workflows/ci.yml'
+          assert release['isDraft'] and release['isPrerelease']
+          assert release['targetCommitish'] == os.environ['SOURCE_SHA']
+          assert release['assets'] == [], 'Refuse to overwrite existing assets'
+          PYTHON
+
+      - uses: actions/checkout@v4
+        with:
+          ref: eba3d97ae97f53b9dcbc2152da39ecb69a8a25bd
+          persist-credentials: false
+
+      - name: Download successful main CI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-office-linux-x86_64
+          path: binary
+          run-id: 37978404810
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package executable, licenses and startup instructions
+        run: |
+          set -euo pipefail
+          name=rust-office-v0.1.0-linux-x86_64
+          mkdir -p "dist/$name"
+          install -m 755 binary/rust-office "dist/$name/rust-office"
+          cp LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cat > "dist/$name/README.txt" <<'README'
+          rust-office v0.1.0 Linux x86_64 preview
+          Source: https://github.com/rsasaki0109/rust-office
+          Commit: eba3d97ae97f53b9dcbc2152da39ecb69a8a25bd
+          Built by successful main CI using Ubuntu 24.04 and Rust 1.99.0.
+          Run ./rust-office on a graphical Linux desktop. Rust is not required.
+          Ubuntu 24.04 is the initial target; older glibc systems are unsupported.
+          Graphics/X11/Wayland runtime libraries may be required.
+          Japanese text needs CJK fonts: sudo apt install fonts-noto-cjk
+          File -> New Spreadsheet (Calc) / New Presentation (Impress) switches apps.
+          Daily-use roadmap: 85%; not full Office compatibility.
+          Calc charts, Windows/macOS and IME/accessibility acceptance are pending.
+          This release binary's GUI startup has not been verified.
+          Recovery copies do not replace independent backups.
+          Unsigned preview; not a static binary or installer.
+          Licensed MIT OR Apache-2.0. See both included licenses.
+          Docs: https://github.com/rsasaki0109/rust-office/blob/main/docs/DEVELOPMENT.md
+          Limits: https://github.com/rsasaki0109/rust-office/blob/main/docs/INPUT_LIMITS.md
+          README
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          cd dist
+          sha256sum "$name.tar.gz" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          tar -tzf "$name.tar.gz"
+
+      - name: Upload and publish preview
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json body --jq .body > release-notes.md
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('release-notes.md')
+          s = p.read_text()
+          s = s.replace('Debian 13上でビルドした初回配布です。glibc 2.39以降とグラフィカルなLinux環境が必要です。', '成功済みのmain CIでUbuntu 24.04上にてビルドしたLinux x86_64版です。Ubuntu 24.04以降のグラフィカルな環境を初期対象としています。')
+          s = s.replace('同じアプリケーションコードのLinux CIでテスト・Clippy・リリースビルド成功を確認し、配布バイナリはDebian 13上でRust 1.99.0によりビルドしました。', 'Linux CIのテスト・Clippy・リリースビルド成功を確認し、そのCI成果物を再梱包して配布しています。Rust 1.99.0でビルドしました。')
+          p.write_text(s)
+          PYTHON
+          gh release upload "$RELEASE_TAG" dist/rust-office-v0.1.0-linux-x86_64.tar.gz dist/SHA256SUMS
+          gh release view "$RELEASE_TAG" --json assets > uploaded.json
+          python3 - <<'PYTHON'
+          import json
+          from pathlib import Path
+          assets = json.load(open('uploaded.json'))['assets']
+          assert {a['name'] for a in assets} == {'rust-office-v0.1.0-linux-x86_64.tar.gz', 'SHA256SUMS'}
+          for asset in assets:
+              assert asset['size'] == Path('dist', asset['name']).stat().st_size
+          PYTHON
+          gh release edit "$RELEASE_TAG" --notes-file release-notes.md --draft=false --prerelease
