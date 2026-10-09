@@ -82,6 +82,21 @@ Run these checks before submitting changes:
 
 ## Recently added
 
+* Writer Find and Replace (Edit menu, Ctrl/Cmd+F or Ctrl/Cmd+H) searches literal,
+  case-sensitive text in body paragraphs across all sections, including matches
+  spanning character runs. Next/Previous wrap and scroll to the selected match.
+  Tables and header/footer text are excluded and the dialog states this scope;
+  queries/replacements cannot span paragraph breaks. Unicode scalar offsets match
+  the editor's selections; Unicode normalization and regular expressions are not
+  supported. Find never creates history or marks the document dirty. Replace
+  requires a currently selected exact match; otherwise it selects the next match.
+  An empty replacement deletes text. Replace All uses non-overlapping matches
+  from the original text and is one Undo/Redo operation. Replacements inherit the
+  first matched character's style and hyperlink; surrounding runs and paragraph
+  properties remain intact. Identical replacement and no-match actions do not
+  change the document or history. Search-field typing stays within the dialog;
+  Escape/Close returns keyboard focus to the selected body text.
+
 * Visual-line ↑/↓ caret navigation (preferred column remembered)
 * Home/End move within the visual line
 * Unsaved-changes modal on New / Open / Quit (and window close)
