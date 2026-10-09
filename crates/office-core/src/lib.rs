@@ -5,6 +5,7 @@
 
 mod document;
 mod editor;
+pub mod limits;
 mod selection;
 pub mod storage;
 mod style;

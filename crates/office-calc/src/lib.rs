@@ -17,6 +17,7 @@ mod sheet;
 mod workbook;
 mod xlsx;
 mod xlsx_limits;
+mod legacy_limits;
 mod xlsx_format;
 
 pub use addr::{col_to_letters, parse_a1, parse_a1_range, AddrError, CellAddr, CellRange};

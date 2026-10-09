@@ -34,16 +34,20 @@ impl OdtFormat {
     }
 
     pub fn load_from_bytes(&self, bytes: &[u8]) -> Result<Document, FormatError> {
+        crate::limits::package(bytes)?;
         let cursor = Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(FormatError::from)?;
 
         let content = utf8_part(read_zip_bytes(&mut archive, "content.xml")?, "content.xml")?;
         let mut pictures: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut image_bytes=0usize;
         for href in content_images(&content)? {
             let path = image_part_path(&href).map_err(|e| part_error("content.xml", e))?;
             if !pictures.contains_key(&path) {
                 pictures.insert(path.clone(), read_zip_bytes(&mut archive, &path)?);
             }
+            image_bytes=image_bytes.saturating_add(pictures[&path].len());
+            if image_bytes>64*1024*1024 { return Err(invalid("ODT repeated images exceed 64 MiB")); }
         }
         let (mut doc, masters) = read::parse_content_and_masters(&content, &pictures)?;
 
@@ -57,13 +61,17 @@ impl OdtFormat {
             ));
         }
 
+        crate::limits::model(&doc)?;
         Ok(doc)
     }
 
     pub fn save_to_bytes(&self, document: &Document) -> Result<Vec<u8>, FormatError> {
+        crate::limits::model(document)?;
         let mut cursor = Cursor::new(Vec::new());
         write::write_odt_package(document, &mut cursor)?;
-        Ok(cursor.into_inner())
+        let bytes = cursor.into_inner();
+        crate::limits::package(&bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -87,9 +95,7 @@ fn read_optional_zip_bytes(
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
         Err(error) => return Err(part_error(path, error.into())),
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| part_error(path, e.into()))?;
+    let bytes = crate::limits::part(&mut file, path)?;
     Ok(Some(bytes))
 }
 
@@ -99,8 +105,7 @@ impl DocumentFormat for OdtFormat {
     }
 
     fn load_from_reader(&self, reader: &mut dyn Read) -> Result<Document, FormatError> {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
+        let bytes = crate::limits::read(reader)?;
         self.load_from_bytes(&bytes)
     }
 

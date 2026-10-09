@@ -512,8 +512,9 @@ impl WriterApp {
         let live: std::collections::HashSet<String> = self
             .editor
             .document()
-            .blocks()
+            .sections
             .iter()
+            .flat_map(|section| &section.blocks)
             .filter_map(|b| match b {
                 Block::Image(img) => Some(img.cache_key()),
                 _ => None,

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::xlsx_limits;
-use calamine::{open_workbook_auto_from_rs, CellErrorType, Data, Reader, Sheets, Xlsx};
+use calamine::{CellErrorType, Data, Reader, Sheets, Xlsx, Xls, Ods};
 use rust_xlsxwriter::Workbook as XlsxWriter;
 use thiserror::Error;
 
@@ -38,12 +38,20 @@ pub fn load_xlsx_path(path: &Path) -> Result<Workbook, XlsxError> {
     file.take(xlsx_limits::MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     let is_xlsx = xlsx_limits::package(&bytes)?;
+    if !bytes.starts_with(b"PK") { crate::legacy_limits::xls(&bytes)?; }
     let cursor = Cursor::new(bytes.as_slice());
     // Once identified as XLSX, do not retry it through an unguarded legacy parser.
     let mut excel = if is_xlsx {
         Sheets::Xlsx(Xlsx::new(cursor).map_err(|e| XlsxError::Read(e.to_string()))?)
     } else {
-        open_workbook_auto_from_rs(cursor).map_err(|e| XlsxError::Read(e.to_string()))?
+        std::panic::catch_unwind(|| {
+            if bytes.starts_with(b"PK") {
+                Ods::new(cursor).map(Sheets::Ods).map_err(|e| e.to_string())
+            } else {
+                Xls::new(cursor).map(Sheets::Xls).map_err(|e| e.to_string())
+            }
+        }).map_err(|_| xlsx_limits::error("Malformed legacy spreadsheet rejected by parser"))?
+          .map_err(XlsxError::Read)?
     };
     let names = excel.sheet_names().to_vec();
     if names.len() > xlsx_limits::MAX_SHEETS {

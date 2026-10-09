@@ -22,6 +22,7 @@ pub fn document_to_layout_pdf_bytes(document: &Document) -> Result<Vec<u8>, Stri
     if document.sections.is_empty() || document.sections.iter().any(|s| !s.page_style.is_valid()) {
         return Err("Invalid section page geometry".into());
     }
+    office_core::limits::validate_document(document)?;
     let mut out = Ok(Vec::new());
     egui::__run_test_ui(|ui| {
         let layout = layout_document(ui, document, Pos2::ZERO, 1.0);
@@ -41,6 +42,7 @@ pub fn document_layout_to_pdf_bytes(
     document: &Document,
     layout: &DocumentLayout,
 ) -> Result<Vec<u8>, String> {
+    office_core::limits::validate_document(document)?;
     let mut cursor = std::io::Cursor::new(Vec::new());
     write_layout_pdf(document, layout, &mut cursor)?;
     Ok(cursor.into_inner())
@@ -175,8 +177,11 @@ fn draw_embedded_image(
     page_height_pt: f32,
 ) -> Result<(), String> {
     let bytes = load_image_bytes(&image.source)?;
-    // printpdf 0.7 pins `image` 0.24; use its re-export to avoid crate version mismatch.
-    let dyn_img = printpdf::image_crate::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    // Decode with limits first, then convert the bounded pixels to printpdf's image version.
+    let decoded = crate::images::decode_bounded_image(&bytes)?.to_rgba8();
+    let buffer = printpdf::image_crate::RgbaImage::from_raw(decoded.width(), decoded.height(), decoded.into_raw())
+        .ok_or_else(|| "Invalid decoded image dimensions".to_string())?;
+    let dyn_img = printpdf::image_crate::DynamicImage::ImageRgba8(buffer);
     let pw = dyn_img.width().max(1) as f32;
     let ph = dyn_img.height().max(1) as f32;
     let pdf_img = printpdf::Image::from_dynamic_image(&dyn_img);
