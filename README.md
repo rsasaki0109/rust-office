@@ -41,7 +41,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 * Interchange-friendly formats (JSON / ODT / DOCX / XLSX / PPTX / PDF)
 * Incremental delivery: ship real apps early, deepen fidelity continuously
 
-## Current status (55% of the daily-use roadmap)
+## Current status (60% of the daily-use roadmap)
 
 The [daily-use roadmap (80% intermediate target)](docs/ROADMAP_90.md) tracks 20 acceptance milestones for daily
 use across Writer, Calc, Impress, data protection, and distribution. This is a
@@ -68,6 +68,10 @@ compatibility. Unmerged work is tracked separately.
 * Undo/Redo for cell edits, range operations and adding sheets; save state tracking
 
 ### Impress
+
+* Select, drag and resize title/body text, added text boxes, rectangles, ellipses and embedded images
+* Native JSON preserves object geometry and image bytes; object operations support Undo/Redo
+* PPTX export rejects added objects until their interchange is supported
 
 * Slides, Light / Dark / Ocean themes
 * JSON + PPTX open/export (title + body MVP)
@@ -100,7 +104,7 @@ rust-office/
 * Named styles beyond Heading 1–3; floating images; footnotes
 * Exact PDF glyph metrics / richer table borders
 * Calc charts / full Excel function library
-* Impress shapes beyond title+body / animations
+* Impress shape/image PPTX interchange, presentation mode and animations
 * Spell check; full accessibility tree
 * Signed Win / macOS installers
 
