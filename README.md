@@ -43,7 +43,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 
 ## Current status (55% of the daily-use roadmap)
 
-The [90% roadmap](docs/ROADMAP_90.md) tracks 20 acceptance milestones for daily
+The [daily-use roadmap (80% intermediate target)](docs/ROADMAP_90.md) tracks 20 acceptance milestones for daily
 use across Writer, Calc, Impress, data protection, and distribution. This is a
 project milestone score, not a measure of full Microsoft Office / LibreOffice
 compatibility. Unmerged work is tracked separately.
