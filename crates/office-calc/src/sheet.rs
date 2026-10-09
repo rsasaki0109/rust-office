@@ -16,6 +16,8 @@ pub const DEFAULT_COLS: u32 = 26;
 pub struct Sheet {
     pub name: String,
     #[serde(default)]
+    formats: HashMap<(u32, u32), crate::CellFormat>,
+    #[serde(default)]
     cells: HashMap<(u32, u32), Cell>,
     #[serde(default = "default_rows")]
     pub rows: u32,
@@ -34,6 +36,7 @@ impl Sheet {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            formats: HashMap::new(),
             cells: HashMap::new(),
             rows: DEFAULT_ROWS,
             cols: DEFAULT_COLS,
@@ -58,13 +61,14 @@ impl Sheet {
         }
     }
 
-    fn ensure_bounds(&mut self, addr: CellAddr) {
+    pub(crate) fn ensure_bounds(&mut self, addr: CellAddr) {
         self.cols = self.cols.max(addr.col + 1);
         self.rows = self.rows.max(addr.row + 1);
     }
 
     pub fn clear(&mut self) {
         self.cells.clear();
+        self.formats.clear();
     }
 
     /// Evaluate cell for display (handles formulas and literals).
@@ -73,7 +77,33 @@ impl Sheet {
     }
 
     pub fn display(&self, addr: CellAddr) -> String {
-        self.evaluate(addr).display()
+        self.format(addr).display(self.evaluate(addr))
+    }
+
+    pub fn format(&self, addr: CellAddr) -> crate::CellFormat {
+        self.formats
+            .get(&(addr.col, addr.row))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_format(&mut self, addr: CellAddr, format: crate::CellFormat) {
+        if format == crate::CellFormat::default() {
+            self.formats.remove(&(addr.col, addr.row));
+        } else {
+            self.ensure_bounds(addr);
+            self.formats.insert((addr.col, addr.row), format);
+        }
+    }
+
+    pub fn has_formatting(&self) -> bool {
+        !self.formats.is_empty()
+    }
+
+    pub(crate) fn formatted(&self) -> impl Iterator<Item = (CellAddr, &crate::CellFormat)> {
+        self.formats
+            .iter()
+            .map(|(&(col, row), format)| (CellAddr::new(col, row), format))
     }
 
     pub fn occupied(&self) -> impl Iterator<Item = (CellAddr, &Cell)> {

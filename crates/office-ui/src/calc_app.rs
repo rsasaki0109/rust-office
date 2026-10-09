@@ -6,7 +6,7 @@ use eframe::App;
 use egui::{self, Color32, Context, Key, RichText, Sense, Ui, Vec2};
 use office_calc::{
     col_to_letters, load_csv_path, load_xlsx_path, write_csv_path, write_xlsx_path, CellAddr,
-    CellRange, Workbook,
+    CellRange, FormatChange, Workbook,
 };
 
 use crate::calc_clipboard::CopiedCells;
@@ -306,6 +306,14 @@ impl CalcApp {
         }
     }
 
+    fn format_selection(&mut self, change: FormatChange) {
+        self.commit_edit();
+        match self.workbook.format_range(self.selection(), change) {
+            Ok(_) => self.set_status(format!("Formatted {}", self.selection_label())),
+            Err(error) => self.set_error(format!("Format failed: {error}")),
+        }
+    }
+
     fn clear_selection(&mut self) {
         self.commit_edit();
         self.workbook.clear_range(self.selection());
@@ -569,6 +577,18 @@ impl CalcApp {
             return false;
         }
         // Include the formula-bar draft, but retain it unchanged if saving fails.
+        if ext == "csv"
+            && self
+                .workbook
+                .sheets
+                .iter()
+                .any(|sheet| sheet.has_formatting())
+        {
+            self.set_error(
+                "Save failed: CSV does not store cell formatting. Choose XLSX to preserve it.",
+            );
+            return false;
+        }
         let mut workbook = self.workbook.clone();
         if self.editing && self.edit_buf != workbook.active_sheet().raw(self.active) {
             workbook.set_cell(self.active, self.edit_buf.clone());
@@ -659,6 +679,43 @@ impl CalcApp {
                 }
                 if ui.button("Add Sheet").clicked() {
                     self.add_sheet();
+                    ui.close();
+                }
+            });
+            ui.menu_button("Format", |ui| {
+                let current = self.workbook.active_sheet().format(self.active);
+                for (label, code) in [
+                    ("General", "General"),
+                    ("Number (2 decimals)", "0.00"),
+                    ("Percentage (2 decimals)", "0.00%"),
+                    ("Date (yyyy-mm-dd)", "yyyy-mm-dd"),
+                ] {
+                    if ui
+                        .selectable_label(current.number_format == code, label)
+                        .clicked()
+                    {
+                        self.format_selection(FormatChange::Number(code.into()));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(current.bold, "Bold    Ctrl+B")
+                    .clicked()
+                {
+                    self.format_selection(FormatChange::Bold(!current.bold));
+                    ui.close();
+                }
+                if ui
+                    .selectable_label(current.italic, "Italic    Ctrl+I")
+                    .clicked()
+                {
+                    self.format_selection(FormatChange::Italic(!current.italic));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Clear Formatting").clicked() {
+                    self.format_selection(FormatChange::Clear);
                     ui.close();
                 }
             });
@@ -859,15 +916,25 @@ impl CalcApp {
                             egui::Stroke::new(1.0, Color32::from_gray(200)),
                             egui::StrokeKind::Inside,
                         );
-                        painter
-                            .with_clip_rect(rect.intersect(ui.clip_rect()).shrink(2.0))
-                            .text(
-                                rect.left_center() + Vec2::new(4.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                self.workbook.active_sheet().display(addr),
-                                egui::FontId::proportional(13.0),
-                                Color32::BLACK,
-                            );
+                        let style = self.workbook.active_sheet().format(addr);
+                        let job = egui::text::LayoutJob::single_section(
+                            self.workbook.active_sheet().display(addr),
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(13.0),
+                                color: Color32::BLACK,
+                                italics: style.italic,
+                                ..Default::default()
+                            },
+                        );
+                        let galley = painter.layout_job(job);
+                        let pos = rect.left_center() + Vec2::new(4.0, -galley.size().y / 2.0);
+                        let clipped =
+                            painter.with_clip_rect(rect.intersect(ui.clip_rect()).shrink(2.0));
+                        clipped.galley(pos, galley.clone(), Color32::BLACK);
+                        // Synthetic weight keeps CJK fallback glyphs visibly bold too.
+                        if style.bold {
+                            clipped.galley(pos + Vec2::new(0.45, 0.0), galley, Color32::BLACK);
+                        }
                         if addr == self.active {
                             painter.rect_stroke(
                                 rect,
@@ -913,6 +980,16 @@ impl CalcApp {
                 self.cancel_edit();
                 Self::leave_formula(ctx);
             }
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::B)) {
+            let bold = self.workbook.active_sheet().format(self.active).bold;
+            self.format_selection(FormatChange::Bold(!bold));
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::I)) {
+            let italic = self.workbook.active_sheet().format(self.active).italic;
+            self.format_selection(FormatChange::Italic(!italic));
             return;
         }
         let mut clipboard_events = Vec::new();
@@ -1072,6 +1149,86 @@ fn writable_extension(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatting_commits_draft_preserves_formulas_and_reloads_from_xlsx() {
+        let mut app = CalcApp::new();
+        app.select_cell(CellAddr::new(2, 3), false);
+        draft(&mut app, "=B2*C2+B3*C3");
+        app.format_selection(FormatChange::Number("0.00".into()));
+        app.format_selection(FormatChange::Bold(true));
+        app.format_selection(FormatChange::Italic(true));
+        assert!(!app.editing);
+        assert_eq!(app.workbook.active_sheet().display(app.active), "5.20");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("formatted.xlsx");
+        assert!(app.save_to(&path));
+        let loaded = load_xlsx_path(&path).unwrap();
+        assert_eq!(
+            loaded.active_sheet().format(app.active),
+            app.workbook.active_sheet().format(app.active)
+        );
+        assert_eq!(loaded.active_sheet().raw(app.active), "=B2*C2+B3*C3");
+        assert_eq!(loaded.active_sheet().display(app.active), "5.20");
+        app.history(false);
+        assert!(app.is_dirty());
+        app.history(true);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn csv_save_cannot_drop_styling_or_commit_a_pending_draft() {
+        let mut app = CalcApp::new();
+        app.format_selection(FormatChange::Bold(true));
+        draft(&mut app, "keep this draft");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.csv");
+        std::fs::write(&path, "original bytes").unwrap();
+        assert!(!app.save_to(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original bytes");
+        assert!(app.editing && app.is_dirty());
+        assert_eq!(app.edit_buf, "keep this draft");
+        assert!(app.file_path.is_none());
+        assert!(app.last_error.as_deref().unwrap().contains("formatting"));
+        assert!(app.workbook.can_undo());
+    }
+
+    #[test]
+    fn formatting_shortcuts_apply_to_grid_and_stay_out_of_rename_modals() {
+        let mut app = CalcApp::new();
+        let ctx = Context::default();
+        let bold = egui::Event::Key {
+            key: Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![bold.clone()],
+                ..Default::default()
+            },
+            |ui| app.handle_keys(ui.ctx()),
+        );
+        output.textures_delta.clear();
+        assert!(app.workbook.active_sheet().format(app.active).bold);
+        app.workbook.mark_clean();
+        app.open_sheet_dialog(true);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![bold],
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_keys(ui.ctx());
+                app.show_sheet_dialog(ui.ctx());
+            },
+        );
+        output.textures_delta.clear();
+        assert!(app.workbook.active_sheet().format(app.active).bold);
+        assert!(!app.is_dirty());
+    }
 
     #[test]
     fn sheet_management_round_trip_and_undo_preserve_drafts_and_formulas() {

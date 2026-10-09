@@ -48,6 +48,12 @@ pub enum SheetError {
 
 #[derive(Debug, Clone)]
 enum Change {
+    Formats {
+        sheet: usize,
+        cells: Vec<(CellAddr, crate::CellFormat, crate::CellFormat)>,
+        before_bounds: (u32, u32),
+        after_bounds: (u32, u32),
+    },
     Cells {
         sheet: usize,
         cells: Vec<CellChange>,
@@ -150,6 +156,40 @@ impl Workbook {
             before_bounds,
             after_bounds,
         });
+    }
+
+    /// Apply a presentation change without touching raw values or formulas.
+    pub fn format_range(
+        &mut self,
+        range: CellRange,
+        update: crate::FormatChange,
+    ) -> Result<bool, ClipboardError> {
+        let range = clipboard::validate_range(range)?;
+        let sheet = self.active_sheet();
+        let before_bounds = (sheet.rows, sheet.cols);
+        let cells: Vec<_> = range
+            .iter()
+            .filter_map(|addr| {
+                let before = sheet.format(addr);
+                let after = update.apply(before.clone());
+                (before != after).then_some((addr, before, after))
+            })
+            .collect();
+        if cells.is_empty() {
+            return Ok(false);
+        }
+        for (addr, _, after) in &cells {
+            self.active_sheet_mut().set_format(*addr, after.clone());
+        }
+        let sheet = self.active_sheet();
+        let after_bounds = (sheet.rows, sheet.cols);
+        self.record(Change::Formats {
+            sheet: self.active,
+            cells,
+            before_bounds,
+            after_bounds,
+        });
+        Ok(true)
     }
 
     pub fn copy_tsv(&self, range: CellRange) -> Result<String, ClipboardError> {
@@ -287,6 +327,25 @@ impl Workbook {
 
     fn apply(&mut self, change: &Change, forward: bool) {
         match change {
+            Change::Formats {
+                sheet,
+                cells,
+                before_bounds,
+                after_bounds,
+            } => {
+                self.active = *sheet;
+                for (addr, before, after) in cells {
+                    self.active_sheet_mut()
+                        .set_format(*addr, if forward { after } else { before }.clone());
+                }
+                let (rows, cols) = if forward {
+                    *after_bounds
+                } else {
+                    *before_bounds
+                };
+                self.active_sheet_mut().rows = rows;
+                self.active_sheet_mut().cols = cols;
+            }
             Change::Cells {
                 sheet,
                 cells,
@@ -459,6 +518,101 @@ impl Workbook {
 mod tests {
     use super::*;
     use crate::{MAX_SHEET_COLS, MAX_SHEET_ROWS};
+
+    #[test]
+    fn formatting_is_one_edit_and_never_changes_values_or_formula_results() {
+        let mut book = Workbook::new();
+        book.paste_tsv(CellAddr::new(0, 0), "0.125\t=A1*2").unwrap();
+        book.mark_clean();
+        book.clear_history();
+        let range = CellRange {
+            start: CellAddr::new(0, 0),
+            end: CellAddr::new(1, 0),
+        };
+        book.format_range(range, crate::FormatChange::Number("0.00%".into()))
+            .unwrap();
+        assert_eq!(book.active_sheet().display(range.start), "12.50%");
+        assert_eq!(book.active_sheet().display(range.end), "25.00%");
+        assert_eq!(
+            book.active_sheet().evaluate(range.end),
+            crate::Value::Number(0.25)
+        );
+        assert_eq!(book.copy_tsv(range).unwrap(), "0.125\t=A1*2\n");
+        assert!(book.undo());
+        assert!(!book.is_dirty() && !book.can_undo());
+        assert_eq!(book.active_sheet().display(range.end), "0.25");
+        book.redo();
+        book.format_range(range, crate::FormatChange::Bold(true))
+            .unwrap();
+        book.set_cell(range.start, "0.5");
+        assert_eq!(book.active_sheet().display(range.start), "50.00%");
+        assert!(book.active_sheet().format(range.start).bold);
+        book.clear_range(range);
+        assert!(book.active_sheet().format(range.start).bold);
+        assert!(book.active_sheet().has_formatting());
+        book.undo();
+        assert_eq!(book.active_sheet().display(range.start), "50.00%");
+    }
+
+    #[test]
+    fn formatting_blank_cells_restores_bounds_and_survives_sheet_deletion_undo() {
+        let mut book = Workbook::new();
+        let before = (book.active_sheet().rows, book.active_sheet().cols);
+        let addr = CellAddr::new(40, 100);
+        let range = CellRange {
+            start: addr,
+            end: addr,
+        };
+        book.format_range(range, crate::FormatChange::Italic(true))
+            .unwrap();
+        assert_eq!(
+            (book.active_sheet().rows, book.active_sheet().cols),
+            (101, 41)
+        );
+        book.undo();
+        assert_eq!((book.active_sheet().rows, book.active_sheet().cols), before);
+        assert!(!book.active_sheet().has_formatting());
+        book.redo();
+        book.add_sheet("Other");
+        book.delete_sheet(0).unwrap();
+        book.undo();
+        assert!(book.sheets[0].format(addr).italic);
+    }
+
+    #[test]
+    fn invalid_or_unchanged_formatting_preserves_redo_and_clean_state() {
+        let mut book = Workbook::new();
+        let addr = CellAddr::new(0, 0);
+        let range = CellRange {
+            start: addr,
+            end: addr,
+        };
+        book.format_range(range, crate::FormatChange::Bold(true))
+            .unwrap();
+        book.undo();
+        assert!(!book
+            .format_range(range, crate::FormatChange::Bold(false))
+            .unwrap());
+        for end in [
+            CellAddr::new(MAX_SHEET_COLS, 0),
+            CellAddr::new(0, MAX_SHEET_ROWS),
+            CellAddr::new(1000, 1000),
+        ] {
+            assert!(book
+                .format_range(
+                    CellRange { start: addr, end },
+                    crate::FormatChange::Bold(true)
+                )
+                .is_err());
+        }
+        assert!(!book.is_dirty() && book.can_redo() && !book.can_undo());
+        book.redo();
+        book.format_range(range, crate::FormatChange::Clear)
+            .unwrap();
+        assert!(!book.active_sheet().has_formatting());
+        book.undo();
+        assert!(book.active_sheet().format(addr).bold);
+    }
 
     #[test]
     fn rename_validation_preserves_redo_and_saved_state() {
